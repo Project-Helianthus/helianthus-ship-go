@@ -3,6 +3,10 @@ name: Default
 env:
   ACTION_ENVIRONMENT: CI
 
+permissions:
+  contents: read
+  security-events: write
+
 on:
   push:
     branches:
