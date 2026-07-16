@@ -7,11 +7,14 @@ import (
 	"go/parser"
 	"go/token"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"testing"
+
+	"golang.org/x/mod/modfile"
 )
 
 type productionFile struct {
@@ -24,6 +27,12 @@ func TestOutgoingAttemptAPIIsClosedAndAdditive(t *testing.T) {
 
 	assertInterfaceMethods(t, root, fset, files, "api", "OutgoingAttemptGate", []string{
 		"AbortPrepared", "AuthorizeLaunch", "Prepare",
+	})
+	assertInterfaceMethods(t, root, fset, files, "api", "OutgoingAttemptGateSetter", []string{
+		"SetOutgoingAttemptGate",
+	})
+	assertInterfaceMethodTypes(t, root, fset, files, "api", "OutgoingAttemptGateSetter", map[string]string{
+		"SetOutgoingAttemptGate": "func(OutgoingAttemptGate) error",
 	})
 	assertInterfaceMethodTypes(t, root, fset, files, "api", "OutgoingAttemptGate", map[string]string{
 		"Prepare":         "func(OutgoingAttemptRequest) (OutgoingAttemptHandle, error)",
@@ -59,6 +68,13 @@ func TestOutgoingAttemptAPIIsClosedAndAdditive(t *testing.T) {
 	assertInterfaceMethods(t, root, fset, files, "api", "OutgoingAttemptHubReaderInterface", []string{
 		"OutgoingAttemptConnectionClosed", "OutgoingAttemptHandshakeStateUpdate",
 	})
+	assertStructFields(t, root, fset, files, "ship", "OutgoingAttemptConnectionConfiguration", []string{
+		"Context", "Metadata",
+	})
+	assertFunctionType(t, root, fset, files, "ship", "NewConnectionHandler",
+		"func(dataProvider api.ShipConnectionInfoProviderInterface, dataHandler api.WebsocketDataWriterInterface, role shipRole, localShipID, remoteSki, remoteShipId string) *ShipConnection")
+	assertFunctionType(t, root, fset, files, "ship", "NewOutgoingConnectionHandler",
+		"func(dataProvider api.ShipConnectionInfoProviderInterface, dataHandler api.WebsocketDataWriterInterface, role shipRole, localShipID, remoteSki, remoteShipId string, configuration OutgoingAttemptConnectionConfiguration) (*ShipConnection, error)")
 
 	// The fork extensions are separate optional interfaces. These upstream
 	// interfaces stay byte-for-byte source compatible, so existing mocks and
@@ -81,6 +97,62 @@ func TestOutgoingAttemptAPIIsClosedAndAdditive(t *testing.T) {
 	})
 }
 
+func TestCanonicalModuleIdentityAndSelfImports(t *testing.T) {
+	root, _, _ := loadProductionFiles(t)
+	goModPath := filepath.Join(root, "go.mod")
+	goMod, err := os.ReadFile(goModPath)
+	if err != nil {
+		t.Fatalf("read go.mod: %v", err)
+	}
+	parsed, err := modfile.Parse(goModPath, goMod, nil)
+	if err != nil {
+		t.Fatalf("parse go.mod: %v", err)
+	}
+	const canonicalModule = "github.com/Project-Helianthus/helianthus-ship-go"
+	if parsed.Module == nil || parsed.Module.Mod.Path != canonicalModule {
+		got := "<missing>"
+		if parsed.Module != nil {
+			got = parsed.Module.Mod.Path
+		}
+		t.Errorf("module path = %q, want %q", got, canonicalModule)
+	}
+
+	fset := token.NewFileSet()
+	var upstreamImports []string
+	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			if entry.Name() == ".git" || entry.Name() == "vendor" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(entry.Name(), ".go") {
+			return nil
+		}
+		file, parseErr := parser.ParseFile(fset, path, nil, parser.ImportsOnly)
+		if parseErr != nil {
+			return parseErr
+		}
+		for _, imported := range file.Imports {
+			pathValue := strings.Trim(imported.Path.Value, `"`)
+			if pathValue == "github.com/enbility/ship-go" || strings.HasPrefix(pathValue, "github.com/enbility/ship-go/") {
+				position := fset.Position(imported.Pos()).String()
+				upstreamImports = append(upstreamImports, position+" -> "+pathValue)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scan self-imports: %v", err)
+	}
+	if len(upstreamImports) != 0 {
+		t.Errorf("upstream self-imports remain: %v", upstreamImports)
+	}
+}
+
 func TestProductionDialInventoryAndAttemptPropagation(t *testing.T) {
 	_, fset, files := loadProductionFiles(t)
 
@@ -90,7 +162,10 @@ func TestProductionDialInventoryAndAttemptPropagation(t *testing.T) {
 	var hiddenSelectors []string
 	var helperDecls []*ast.FuncDecl
 	var helperCalls []*ast.CallExpr
-	constructorCalls := make(map[string][]*ast.CallExpr)
+	var directAuthorize []string
+	var authorizeCalls []*ast.CallExpr
+	legacyConstructorCalls := make(map[string][]*ast.CallExpr)
+	outgoingConstructorCalls := make(map[string][]*ast.CallExpr)
 
 	for _, parsed := range files {
 		parents := parentMap(parsed.file)
@@ -101,6 +176,10 @@ func TestProductionDialInventoryAndAttemptPropagation(t *testing.T) {
 					helperDecls = append(helperDecls, item)
 				}
 			case *ast.SelectorExpr:
+				if item.Sel.Name == "AuthorizeLaunch" {
+					directAuthorize = append(directAuthorize, fset.Position(item.Pos()).String()+" in "+enclosingFunction(parents, item))
+					return true
+				}
 				if item.Sel.Name != "Dial" && item.Sel.Name != "DialContext" {
 					return true
 				}
@@ -120,6 +199,10 @@ func TestProductionDialInventoryAndAttemptPropagation(t *testing.T) {
 					dialContextCalls = append(dialContextCalls, call)
 				}
 			case *ast.CallExpr:
+				if identifier, ok := item.Fun.(*ast.Ident); ok && identifier.Name == "authorizeOutgoingAttempt" {
+					authorizeCalls = append(authorizeCalls, item)
+					return true
+				}
 				selector, ok := item.Fun.(*ast.SelectorExpr)
 				if !ok {
 					return true
@@ -129,7 +212,10 @@ func TestProductionDialInventoryAndAttemptPropagation(t *testing.T) {
 					helperCalls = append(helperCalls, item)
 				}
 				if selector.Sel.Name == "NewConnectionHandler" && rendered(fset, selector.X) == "ship" {
-					constructorCalls[owner] = append(constructorCalls[owner], item)
+					legacyConstructorCalls[owner] = append(legacyConstructorCalls[owner], item)
+				}
+				if selector.Sel.Name == "NewOutgoingConnectionHandler" && rendered(fset, selector.X) == "ship" {
+					outgoingConstructorCalls[owner] = append(outgoingConstructorCalls[owner], item)
 				}
 			}
 			return true
@@ -155,6 +241,18 @@ func TestProductionDialInventoryAndAttemptPropagation(t *testing.T) {
 	}
 	if len(helperDecls) != 1 || receiverName(helperDecls[0]) != "Hub" {
 		t.Errorf("gatedDialContext declarations = %d with receivers %v, want one Hub method", len(helperDecls), receiverNames(helperDecls))
+	} else {
+		assertGateBranchImmediatelyPrecedesDial(t, fset, helperDecls[0])
+	}
+	if len(directAuthorize) != 1 || !strings.HasSuffix(directAuthorize[0], " in authorizeOutgoingAttempt") {
+		t.Errorf("AuthorizeLaunch inventory = %v, want one direct call in authorizeOutgoingAttempt", directAuthorize)
+	}
+	if len(authorizeCalls) != 1 || len(helperDecls) != 1 {
+		t.Errorf("authorizeOutgoingAttempt call count = %d, want one in gatedDialContext", len(authorizeCalls))
+	} else if enclosingFunction(parentMap(helperDecls[0]), authorizeCalls[0]) != "gatedDialContext" {
+		t.Error("authorizeOutgoingAttempt is not called from gatedDialContext")
+	} else if len(dialContextCalls) == 1 && authorizeCalls[0].Pos() >= dialContextCalls[0].Pos() {
+		t.Error("AuthorizeLaunch path does not precede the sole DialContext call")
 	}
 
 	sort.Slice(helperCalls, func(i, j int) bool { return helperCalls[i].Pos() < helperCalls[j].Pos() })
@@ -168,21 +266,51 @@ func TestProductionDialInventoryAndAttemptPropagation(t *testing.T) {
 		}
 	}
 
-	assertConnectionConstructor(t, fset, constructorCalls["ServeHTTP"], 6, "ship.ShipRoleServer")
-	assertConnectionConstructor(t, fset, constructorCalls["connectFoundService"], 7, "ship.ShipRoleClient")
+	assertConnectionConstructor(t, fset, "NewConnectionHandler", legacyConstructorCalls["ServeHTTP"], 6, "ship.ShipRoleServer")
+	if len(legacyConstructorCalls["connectFoundService"]) != 1 {
+		t.Errorf("ungated NewConnectionHandler calls in connectFoundService = %d, want one", len(legacyConstructorCalls["connectFoundService"]))
+	}
+	assertConnectionConstructor(t, fset, "NewOutgoingConnectionHandler", outgoingConstructorCalls["connectFoundService"], 7, "ship.ShipRoleClient")
 }
 
-func assertConnectionConstructor(t *testing.T, fset *token.FileSet, calls []*ast.CallExpr, argCount int, role string) {
+func assertGateBranchImmediatelyPrecedesDial(t *testing.T, fset *token.FileSet, declaration *ast.FuncDecl) {
+	t.Helper()
+	for index, statement := range declaration.Body.List {
+		conditional, ok := statement.(*ast.IfStmt)
+		if !ok || rendered(fset, conditional.Cond) != "gate != nil" {
+			continue
+		}
+		if index+1 >= len(declaration.Body.List) {
+			t.Fatal("gated authorization branch has no immediate DialContext successor")
+		}
+		assignment, ok := declaration.Body.List[index+1].(*ast.AssignStmt)
+		if !ok || len(assignment.Rhs) != 1 {
+			t.Fatalf("statement immediately after gated authorization = %T, want DialContext assignment", declaration.Body.List[index+1])
+		}
+		call, ok := assignment.Rhs[0].(*ast.CallExpr)
+		if !ok {
+			t.Fatalf("statement immediately after gated authorization = %q, want DialContext call", rendered(fset, assignment))
+		}
+		selector, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || selector.Sel.Name != "DialContext" {
+			t.Fatalf("statement immediately after gated authorization = %q, want sole DialContext", rendered(fset, assignment))
+		}
+		return
+	}
+	t.Fatal("gatedDialContext is missing its top-level gate authorization branch")
+}
+
+func assertConnectionConstructor(t *testing.T, fset *token.FileSet, name string, calls []*ast.CallExpr, argCount int, role string) {
 	t.Helper()
 	if len(calls) != 1 {
-		t.Errorf("NewConnectionHandler calls for %s = %d, want one", role, len(calls))
+		t.Errorf("%s calls for %s = %d, want one", name, role, len(calls))
 		return
 	}
 	if len(calls[0].Args) != argCount {
-		t.Errorf("%s NewConnectionHandler argument count = %d, want %d", role, len(calls[0].Args), argCount)
+		t.Errorf("%s %s argument count = %d, want %d", role, name, len(calls[0].Args), argCount)
 	}
 	if len(calls[0].Args) < 3 || rendered(fset, calls[0].Args[2]) != role {
-		t.Errorf("NewConnectionHandler role = %q, want %q", rendered(fset, calls[0].Args[2]), role)
+		t.Errorf("%s role = %q, want %q", name, rendered(fset, calls[0].Args[2]), role)
 	}
 }
 
@@ -190,6 +318,28 @@ func assertNamedType(t *testing.T, root string, files []productionFile, packageD
 	t.Helper()
 	if findType(root, files, packageDir, name) == nil {
 		t.Errorf("%s.%s is missing", packageDir, name)
+	}
+}
+
+func assertFunctionType(
+	t *testing.T,
+	root string,
+	fset *token.FileSet,
+	files []productionFile,
+	packageDir,
+	name,
+	want string,
+) {
+	t.Helper()
+	declaration := findFunction(root, files, packageDir, name)
+	if declaration == nil {
+		t.Errorf("%s.%s is missing", packageDir, name)
+		return
+	}
+	got := strings.Join(strings.Fields(rendered(fset, declaration.Type)), " ")
+	got = strings.Replace(got, "func( ", "func(", 1)
+	if got != want {
+		t.Errorf("%s.%s type = %q, want %q", packageDir, name, got, want)
 	}
 }
 
@@ -275,6 +425,22 @@ func findType(root string, files []productionFile, packageDir, name string) ast.
 				if typeSpec.Name.Name == name {
 					return typeSpec.Type
 				}
+			}
+		}
+	}
+	return nil
+}
+
+func findFunction(root string, files []productionFile, packageDir, name string) *ast.FuncDecl {
+	for _, parsed := range files {
+		rel, err := filepath.Rel(root, filepath.Dir(parsed.path))
+		if err != nil || rel != packageDir {
+			continue
+		}
+		for _, declaration := range parsed.file.Decls {
+			function, ok := declaration.(*ast.FuncDecl)
+			if ok && function.Recv == nil && function.Name.Name == name {
+				return function
 			}
 		}
 	}

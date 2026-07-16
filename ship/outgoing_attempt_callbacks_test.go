@@ -1,9 +1,11 @@
 package ship
 
 import (
+	"context"
 	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/enbility/ship-go/api"
 	"github.com/enbility/ship-go/model"
@@ -66,6 +68,7 @@ func (p *attemptCallbackProvider) snapshot() (int, int, []attemptCallbackRecord)
 
 var _ api.ShipConnectionInfoProviderInterface = (*attemptCallbackProvider)(nil)
 var _ api.OutgoingAttemptShipConnectionInfoProviderInterface = (*attemptCallbackProvider)(nil)
+var _ func(api.ShipConnectionInfoProviderInterface, api.WebsocketDataWriterInterface, shipRole, string, string, string) *ShipConnection = NewConnectionHandler
 
 type attemptCallbackWriter struct {
 	reader api.WebsocketDataReaderInterface
@@ -78,6 +81,32 @@ func (*attemptCallbackWriter) WriteMessageToWebsocketConnection([]byte) error { 
 func (*attemptCallbackWriter) CloseDataConnection(int, string)                {}
 func (*attemptCallbackWriter) IsDataConnectionClosed() (bool, error)          { return false, nil }
 
+type typedNilAttemptContext struct{}
+
+func (*typedNilAttemptContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (*typedNilAttemptContext) Done() <-chan struct{}       { return nil }
+func (*typedNilAttemptContext) Err() error                  { return nil }
+func (*typedNilAttemptContext) Value(any) any               { return nil }
+
+func TestOutgoingConstructorRejectsTypedNilContext(t *testing.T) {
+	var attemptContext *typedNilAttemptContext
+	connection, err := NewOutgoingConnectionHandler(
+		&attemptCallbackProvider{},
+		&attemptCallbackWriter{},
+		ShipRoleClient,
+		"local-ship-id",
+		"remote-ski",
+		"remote-ship-id",
+		OutgoingAttemptConnectionConfiguration{
+			Metadata: api.OutgoingAttemptMetadata{AttemptID: "attempt", Scope: "scope", ControlEpoch: 1},
+			Context:  attemptContext,
+		},
+	)
+	if connection != nil || !errors.Is(err, ErrInvalidOutgoingAttemptConnectionConfiguration) {
+		t.Fatalf("typed-nil context result = connection:%#v error:%v", connection, err)
+	}
+}
+
 func TestOutgoingConnectionCarriesAttemptMetadataIntoOptionalCallbacks(t *testing.T) {
 	provider := &attemptCallbackProvider{}
 	writer := &attemptCallbackWriter{}
@@ -86,15 +115,18 @@ func TestOutgoingConnectionCarriesAttemptMetadataIntoOptionalCallbacks(t *testin
 		Scope:        "peer-scope",
 		ControlEpoch: 23,
 	}
-	connection := NewConnectionHandler(
+	connection, err := NewOutgoingConnectionHandler(
 		provider,
 		writer,
 		ShipRoleClient,
 		"local-ship-id",
 		"remote-ski",
 		"remote-ship-id",
-		metadata,
+		OutgoingAttemptConnectionConfiguration{Metadata: metadata, Context: context.Background()},
 	)
+	if err != nil {
+		t.Fatalf("create outgoing connection: %v", err)
+	}
 
 	attemptConnection, ok := any(connection).(api.OutgoingAttemptConnectionInterface)
 	if !ok {
@@ -107,11 +139,11 @@ func TestOutgoingConnectionCarriesAttemptMetadataIntoOptionalCallbacks(t *testin
 
 	connection.ReportConnectionError(errors.New("synthetic terminal failure"))
 	baseClosed, baseHandshake, events := provider.snapshot()
-	if baseClosed != 1 || baseHandshake != 1 {
-		t.Fatalf("legacy callback counts = closed:%d handshake:%d, want 1/1", baseClosed, baseHandshake)
+	if baseClosed != 0 || baseHandshake != 0 {
+		t.Fatalf("legacy callback counts = closed:%d handshake:%d, want 0/0", baseClosed, baseHandshake)
 	}
-	if len(events) != 2 {
-		t.Fatalf("attempt callback count = %d, want terminal and handshake callbacks", len(events))
+	if len(events) != 3 {
+		t.Fatalf("attempt callback count = %d, want terminal and upstream-compatible handshake callbacks", len(events))
 	}
 	for _, event := range events {
 		if event.ski != "remote-ski" || event.metadata != metadata {
@@ -142,8 +174,8 @@ func TestIncomingConnectionKeepsLegacyCallbacksOnly(t *testing.T) {
 
 	connection.ReportConnectionError(errors.New("synthetic incoming failure"))
 	baseClosed, baseHandshake, events := provider.snapshot()
-	if baseClosed != 1 || baseHandshake != 1 {
-		t.Fatalf("incoming legacy callback counts = closed:%d handshake:%d, want 1/1", baseClosed, baseHandshake)
+	if baseClosed != 1 || baseHandshake != 2 {
+		t.Fatalf("incoming legacy callback counts = closed:%d handshake:%d, want 1/2", baseClosed, baseHandshake)
 	}
 	if len(events) != 0 {
 		t.Fatalf("incoming connection emitted %d outgoing attempt callbacks", len(events))
@@ -154,20 +186,28 @@ func TestAttemptIdentityMakesStaleCallbacksDiscardable(t *testing.T) {
 	provider := &attemptCallbackProvider{}
 	oldMetadata := api.OutgoingAttemptMetadata{AttemptID: "attempt-old", Scope: "peer-scope", ControlEpoch: 4}
 	activeMetadata := api.OutgoingAttemptMetadata{AttemptID: "attempt-active", Scope: "peer-scope", ControlEpoch: 4}
-	oldConnection := NewConnectionHandler(
+	oldConnection, err := NewOutgoingConnectionHandler(
 		provider, &attemptCallbackWriter{}, ShipRoleClient,
-		"local-ship-id", "remote-ski", "remote-ship-id", oldMetadata,
+		"local-ship-id", "remote-ski", "remote-ship-id",
+		OutgoingAttemptConnectionConfiguration{Metadata: oldMetadata, Context: context.Background()},
 	)
-	activeConnection := NewConnectionHandler(
+	if err != nil {
+		t.Fatalf("create old outgoing connection: %v", err)
+	}
+	activeConnection, err := NewOutgoingConnectionHandler(
 		provider, &attemptCallbackWriter{}, ShipRoleClient,
-		"local-ship-id", "remote-ski", "remote-ship-id", activeMetadata,
+		"local-ship-id", "remote-ski", "remote-ship-id",
+		OutgoingAttemptConnectionConfiguration{Metadata: activeMetadata, Context: context.Background()},
 	)
+	if err != nil {
+		t.Fatalf("create active outgoing connection: %v", err)
+	}
 
 	oldConnection.ReportConnectionError(errors.New("delayed old callback"))
 	activeConnection.ReportConnectionError(errors.New("active callback"))
 	_, _, events := provider.snapshot()
-	if len(events) != 4 {
-		t.Fatalf("attempt callback count = %d, want two callbacks per attempt", len(events))
+	if len(events) != 6 {
+		t.Fatalf("attempt callback count = %d, want three callbacks per attempt", len(events))
 	}
 	var stale, active int
 	for _, event := range events {
@@ -180,7 +220,7 @@ func TestAttemptIdentityMakesStaleCallbacksDiscardable(t *testing.T) {
 			t.Errorf("callback carried unknown attempt identity %q", event.metadata.AttemptID)
 		}
 	}
-	if stale != 2 || active != 2 {
-		t.Fatalf("stale/active callback identities = %d/%d, want 2/2", stale, active)
+	if stale != 3 || active != 3 {
+		t.Fatalf("stale/active callback identities = %d/%d, want 3/3", stale, active)
 	}
 }

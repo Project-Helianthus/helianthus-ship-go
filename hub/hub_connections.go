@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/enbility/ship-go/api"
@@ -31,6 +32,35 @@ type outgoingAttemptDeniedError struct{}
 
 func (outgoingAttemptDeniedError) Error() string       { return "outgoing attempt denied" }
 func (outgoingAttemptDeniedError) AttemptDenied() bool { return true }
+
+var errOutgoingAttemptFailed = errors.New("outgoing attempt failed")
+
+type authorizedOutgoingAttempt struct {
+	remoteSKI string
+	metadata  api.OutgoingAttemptMetadata
+	context   context.Context
+	terminal  sync.Once
+}
+
+func (a *authorizedOutgoingAttempt) terminalFailure(h *Hub) {
+	if a == nil {
+		return
+	}
+	a.terminal.Do(func() {
+		h.reportOutgoingAttemptTerminalFailure(a.remoteSKI, a.metadata)
+	})
+}
+
+func (h *Hub) reportOutgoingAttemptTerminalFailure(remoteSKI string, metadata api.OutgoingAttemptMetadata) {
+	reader, ok := h.hubReader.(api.OutgoingAttemptHubReaderInterface)
+	if !ok {
+		return
+	}
+	defer func() {
+		_ = recover()
+	}()
+	reader.OutgoingAttemptConnectionClosed(remoteSKI, false, metadata)
+}
 
 func newOutgoingAttemptDialer(certificate tls.Certificate) outgoingAttemptDialer {
 	return &websocket.Dialer{
@@ -182,7 +212,7 @@ func (h *Hub) connectFoundService(remoteService *api.ServiceDetails, host, port,
 
 	logging.Log().Debugf("initiating connection to %s at %s:%s%s", remoteService.SKI(), host, port, path)
 
-	conn, resp, attemptMetadata, err := h.gatedDialContext(remoteService, host, port, path)
+	conn, resp, attempt, err := h.gatedDialContext(remoteService, host, port, path)
 	if err == nil {
 		if resp != nil && resp.Body != nil {
 			defer resp.Body.Close()
@@ -191,7 +221,10 @@ func (h *Hub) connectFoundService(remoteService *api.ServiceDetails, host, port,
 		if isOutgoingAttemptDenied(err) {
 			return err
 		}
-		conn, resp, attemptMetadata, err = h.gatedDialContext(remoteService, host, port, "")
+		if attempt != nil && resp != nil && resp.Body != nil {
+			_ = resp.Body.Close()
+		}
+		conn, resp, attempt, err = h.gatedDialContext(remoteService, host, port, "")
 		if err != nil {
 			return err
 		}
@@ -200,42 +233,89 @@ func (h *Hub) connectFoundService(remoteService *api.ServiceDetails, host, port,
 		}
 	}
 
-	tlsConn := conn.UnderlyingConn().(*tls.Conn)
-	remoteCerts := tlsConn.ConnectionState().PeerCertificates
+	failBeforeConnection := func(connectionErr error) error {
+		if conn != nil {
+			_ = conn.Close()
+		}
+		attempt.terminalFailure(h)
+		return connectionErr
+	}
+
+	if attempt != nil && attempt.context.Err() != nil {
+		return failBeforeConnection(outgoingAttemptDeniedError{})
+	}
+
+	var remoteCerts []*x509.Certificate
+	if attempt == nil {
+		tlsConn := conn.UnderlyingConn().(*tls.Conn)
+		remoteCerts = tlsConn.ConnectionState().PeerCertificates
+	} else {
+		tlsConn, ok := conn.UnderlyingConn().(*tls.Conn)
+		if !ok {
+			return failBeforeConnection(errOutgoingAttemptFailed)
+		}
+		remoteCerts = tlsConn.ConnectionState().PeerCertificates
+	}
 
 	if len(remoteCerts) == 0 || remoteCerts[0].SubjectKeyId == nil {
 		// Close connection as we couldn't get the remote SKI
 		errorString := fmt.Sprintf("closing connection to %s: could not get remote SKI from certificate", remoteService.SKI())
-		_ = conn.Close()
-		return errors.New(errorString)
+		return failBeforeConnection(errors.New(errorString))
 	}
 
 	if _, err := cert.SkiFromCertificate(remoteCerts[0]); err != nil {
 		// Close connection as the remote SKI can't be correct
 		errorString := fmt.Sprintf("closing connection to %s: %s", remoteService.SKI(), err)
-		_ = conn.Close()
-		return errors.New(errorString)
+		return failBeforeConnection(errors.New(errorString))
 	}
 
 	remoteSKI := fmt.Sprintf("%0x", remoteCerts[0].SubjectKeyId)
 
 	if remoteSKI != remoteService.SKI() {
 		errorString := fmt.Sprintf("closing connection to %s: SKI does not match %s", remoteService.SKI(), remoteSKI)
-		_ = conn.Close()
-		return errors.New(errorString)
+		return failBeforeConnection(errors.New(errorString))
 	}
 
 	if !h.keepThisConnection(conn, false, remoteService) {
 		errorString := fmt.Sprintf("closing connection to %s: ignoring this connection", remoteService.SKI())
+		attempt.terminalFailure(h)
 		return errors.New(errorString)
 	}
 
 	dataHandler := ws.NewWebsocketConnection(conn, remoteService.SKI())
-	shipConnection := ship.NewConnectionHandler(h, dataHandler, ship.ShipRoleClient,
-		h.localService.ShipID(), remoteService.SKI(), remoteService.ShipID(), attemptMetadata)
-	shipConnection.Run()
+	if attempt == nil {
+		shipConnection := ship.NewConnectionHandler(h, dataHandler, ship.ShipRoleClient,
+			h.localService.ShipID(), remoteService.SKI(), remoteService.ShipID())
+		shipConnection.Run()
 
-	h.registerConnection(shipConnection)
+		h.registerConnection(shipConnection)
+		return nil
+	}
+
+	if attempt.context.Err() != nil {
+		return failBeforeConnection(outgoingAttemptDeniedError{})
+	}
+	shipConnection, configurationErr := ship.NewOutgoingConnectionHandler(
+		h,
+		dataHandler,
+		ship.ShipRoleClient,
+		h.localService.ShipID(),
+		remoteService.SKI(),
+		remoteService.ShipID(),
+		ship.OutgoingAttemptConnectionConfiguration{
+			Metadata: attempt.metadata,
+			Context:  attempt.context,
+		},
+	)
+	if configurationErr != nil {
+		return failBeforeConnection(errOutgoingAttemptFailed)
+	}
+
+	registered := h.registerOutgoingConnection(shipConnection, attempt.context)
+	shipConnection.Run()
+	if !registered || attempt.context.Err() != nil {
+		return outgoingAttemptDeniedError{}
+	}
 
 	return nil
 }
@@ -245,21 +325,39 @@ func (h *Hub) gatedDialContext(
 	host,
 	port,
 	path string,
-) (connection *websocket.Conn, response *http.Response, metadata api.OutgoingAttemptMetadata, err error) {
+) (connection *websocket.Conn, response *http.Response, attempt *authorizedOutgoingAttempt, err error) {
 	if remoteService == nil {
-		return nil, nil, api.OutgoingAttemptMetadata{}, outgoingAttemptDeniedError{}
+		return nil, nil, nil, outgoingAttemptDeniedError{}
 	}
 
-	host = normalizeOutgoingAttemptHost(host)
-	address := "wss://" + net.JoinHostPort(host, port) + path
 	gate := h.configuredOutgoingAttemptGate()
 	permit := api.OutgoingAttemptPermit{Context: context.Background()}
-
+	address := fmt.Sprintf("wss://%s:%s%s", host, port, path)
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if attempt == nil {
+				panic(recovered)
+			}
+			if connection != nil {
+				_ = connection.Close()
+			}
+			attempt.terminalFailure(h)
+			connection = nil
+			response = nil
+			err = errOutgoingAttemptFailed
+		}
+	}()
 	if gate != nil {
+		if isNilOutgoingAttemptValue(gate) {
+			return nil, nil, nil, outgoingAttemptDeniedError{}
+		}
+
+		host = normalizeOutgoingAttemptHost(host)
 		parsedPort, parseErr := strconv.ParseUint(port, 10, 16)
 		if parseErr != nil || parsedPort == 0 || host == "" {
-			return nil, nil, api.OutgoingAttemptMetadata{}, outgoingAttemptDeniedError{}
+			return nil, nil, nil, outgoingAttemptDeniedError{}
 		}
+		address = "wss://" + net.JoinHostPort(host, port) + path
 
 		request := api.OutgoingAttemptRequest{
 			RemoteSKI: remoteService.SKI(),
@@ -274,57 +372,68 @@ func (h *Hub) gatedDialContext(
 			if !isNilOutgoingAttemptValue(handle) {
 				abortOutgoingAttempt(gate, handle)
 			}
-			return nil, nil, api.OutgoingAttemptMetadata{}, outgoingAttemptDeniedError{}
+			return nil, nil, nil, outgoingAttemptDeniedError{}
 		}
 		if isNilOutgoingAttemptValue(handle) {
-			return nil, nil, api.OutgoingAttemptMetadata{}, outgoingAttemptDeniedError{}
+			return nil, nil, nil, outgoingAttemptDeniedError{}
 		}
 
 		expectedMetadata, expectedContext, validHandle := outgoingAttemptHandleSnapshot(handle)
 		if !validHandle {
 			abortOutgoingAttempt(gate, handle)
-			return nil, nil, api.OutgoingAttemptMetadata{}, outgoingAttemptDeniedError{}
+			return nil, nil, nil, outgoingAttemptDeniedError{}
 		}
 
-		permit, err = authorizeOutgoingAttempt(gate, handle)
-		if err != nil {
+		var authorizeErr error
+		permit, authorizeErr = authorizeOutgoingAttempt(gate, handle)
+		if authorizeErr != nil {
 			abortOutgoingAttempt(gate, handle)
-			return nil, nil, api.OutgoingAttemptMetadata{}, outgoingAttemptDeniedError{}
+			return nil, nil, nil, outgoingAttemptDeniedError{}
 		}
 		switch permit.Decision {
 		case api.OutgoingAttemptDecisionDeny:
-			return nil, nil, api.OutgoingAttemptMetadata{}, outgoingAttemptDeniedError{}
+			return nil, nil, nil, outgoingAttemptDeniedError{}
 		case api.OutgoingAttemptDecisionPermit:
+			attempt = &authorizedOutgoingAttempt{
+				remoteSKI: remoteService.SKI(),
+				metadata:  expectedMetadata,
+				context:   expectedContext,
+			}
 			if permit.Reason != api.OutgoingAttemptReasonAuthorized ||
 				permit.Metadata != expectedMetadata ||
 				!sameOutgoingAttemptContext(permit.Context, expectedContext) {
-				return nil, nil, api.OutgoingAttemptMetadata{}, outgoingAttemptDeniedError{}
+				attempt.terminalFailure(h)
+				return nil, nil, attempt, outgoingAttemptDeniedError{}
 			}
 		default:
 			abortOutgoingAttempt(gate, handle)
-			return nil, nil, api.OutgoingAttemptMetadata{}, outgoingAttemptDeniedError{}
+			return nil, nil, nil, outgoingAttemptDeniedError{}
 		}
 	}
 
-	metadata = permit.Metadata
-	defer func() {
-		if recover() != nil {
-			connection = nil
-			response = nil
-			err = outgoingAttemptDeniedError{}
-		}
-	}()
 	connection, response, err = h.dialer.DialContext(permit.Context, address, nil)
-	if gate != nil && permit.Context.Err() != nil {
+	if attempt == nil {
+		return connection, response, nil, err
+	}
+	if permit.Context.Err() != nil {
 		if connection != nil {
 			_ = connection.Close()
 		}
-		return nil, response, metadata, outgoingAttemptDeniedError{}
+		attempt.terminalFailure(h)
+		return nil, response, attempt, outgoingAttemptDeniedError{}
 	}
-	if err == nil && connection == nil {
-		return nil, response, metadata, outgoingAttemptDeniedError{}
+	if err != nil {
+		if connection != nil {
+			_ = connection.Close()
+		}
+		attempt.terminalFailure(h)
+		return nil, response, attempt, err
 	}
-	return connection, response, metadata, err
+	if connection == nil {
+		attempt.terminalFailure(h)
+		return nil, response, attempt, errOutgoingAttemptFailed
+	}
+	return connection, response, attempt, nil
 }
 
 func prepareOutgoingAttempt(
@@ -559,8 +668,7 @@ func (h *Hub) initateConnectionWithError(remoteService *api.ServiceDetails, entr
 	}
 
 	// try IPv4 addresses before IPv6 addresses
-	addresses := slices.Clone(entry.Addresses)
-	slices.SortFunc(addresses, func(a, b net.IP) int {
+	slices.SortFunc(entry.Addresses, func(a, b net.IP) int {
 		if a.To4() != nil && b.To4() == nil {
 			return -1
 		}
@@ -571,9 +679,12 @@ func (h *Hub) initateConnectionWithError(remoteService *api.ServiceDetails, entr
 	})
 
 	// try connecting via the provided IP addresses
-	for _, address := range addresses {
+	for _, address := range entry.Addresses {
 		logging.Log().Debug("trying to connect to", remoteService.SKI(), "at", address)
 		addressValue := address.String()
+		if address.To4() == nil {
+			addressValue = "[" + address.String() + "]"
+		}
 		if err = h.connectFoundService(remoteService, addressValue, strconv.Itoa(entry.Port), entry.Path); err != nil {
 			if isOutgoingAttemptDenied(err) {
 				return false, err
@@ -673,6 +784,17 @@ func (h *Hub) registerConnection(connection api.ShipConnectionInterface) {
 	defer h.muxCon.Unlock()
 
 	h.connections[connection.RemoteSKI()] = connection
+}
+
+func (h *Hub) registerOutgoingConnection(connection api.ShipConnectionInterface, attemptContext context.Context) bool {
+	h.muxCon.Lock()
+	defer h.muxCon.Unlock()
+
+	if attemptContext.Err() != nil {
+		return false
+	}
+	h.connections[connection.RemoteSKI()] = connection
+	return true
 }
 
 // return the connection for a specific SKI

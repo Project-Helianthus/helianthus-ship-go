@@ -217,6 +217,12 @@ func (c *ShipConnection) endHandshakeWithError(err error) {
 	logging.Log().Debug(c.RemoteSKI(), "SHIP handshake error:", err)
 
 	c.CloseConnection(true, 0, err.Error())
+
+	state := model.ShipState{
+		State: model.SmeStateError,
+		Error: err,
+	}
+	c.reportShipHandshakeStateUpdate(state)
 }
 
 // set the handshake timer to a new duration and start the channel

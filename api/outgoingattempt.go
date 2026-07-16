@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"errors"
 
 	"github.com/enbility/ship-go/model"
 )
@@ -69,6 +70,13 @@ type OutgoingAttemptGate interface {
 	Prepare(OutgoingAttemptRequest) (OutgoingAttemptHandle, error)
 	AuthorizeLaunch(OutgoingAttemptHandle) (OutgoingAttemptPermit, error)
 	AbortPrepared(OutgoingAttemptHandle) (OutgoingAttemptAbortResult, error)
+}
+
+var ErrInvalidOutgoingAttemptGate = errors.New("invalid outgoing attempt gate")
+
+// OutgoingAttemptGateSetter is the optional configuration surface exposed by a hub.
+type OutgoingAttemptGateSetter interface {
+	SetOutgoingAttemptGate(OutgoingAttemptGate) error
 }
 
 // OutgoingAttemptConnectionInterface exposes metadata only for outgoing attempts.

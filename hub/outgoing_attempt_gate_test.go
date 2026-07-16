@@ -350,6 +350,39 @@ func TestOutgoingAttemptGateDenialsFailClosed(t *testing.T) {
 	}
 }
 
+func TestOutgoingAttemptGateSetterRejectsTypedNil(t *testing.T) {
+	hub, _, _ := newAttemptTestHub(t, nil, &fakePeerDialer{err: errAttemptTestDial})
+	setter, ok := any(hub).(api.OutgoingAttemptGateSetter)
+	if !ok {
+		t.Fatal("hub does not expose the optional outgoing attempt gate setter")
+	}
+
+	var typedNil *scriptedAttemptGate
+	if err := setter.SetOutgoingAttemptGate(typedNil); !errors.Is(err, api.ErrInvalidOutgoingAttemptGate) {
+		t.Fatalf("typed-nil installation error = %v, want %v", err, api.ErrInvalidOutgoingAttemptGate)
+	}
+	if hub.configuredOutgoingAttemptGate() != nil {
+		t.Fatal("typed-nil installation changed the configured gate")
+	}
+
+	valid := newScriptedAttemptGate(gatePermit)
+	if err := setter.SetOutgoingAttemptGate(valid); err != nil {
+		t.Fatalf("install valid gate: %v", err)
+	}
+	if err := setter.SetOutgoingAttemptGate(typedNil); !errors.Is(err, api.ErrInvalidOutgoingAttemptGate) {
+		t.Fatalf("typed-nil replacement error = %v, want %v", err, api.ErrInvalidOutgoingAttemptGate)
+	}
+	if got := hub.configuredOutgoingAttemptGate(); got != valid {
+		t.Fatal("typed-nil replacement displaced the valid gate")
+	}
+	if err := setter.SetOutgoingAttemptGate(nil); err != nil {
+		t.Fatalf("remove optional gate: %v", err)
+	}
+	if hub.configuredOutgoingAttemptGate() != nil {
+		t.Fatal("nil removal left a configured gate")
+	}
+}
+
 func TestTypedDenialSuppressesAddressRetryAndAutoReannounce(t *testing.T) {
 	tests := []struct {
 		name string
@@ -473,6 +506,29 @@ func TestNoGatePreservesUpstreamRetryFallbackAndReannounce(t *testing.T) {
 	}
 }
 
+func TestNoGatePreservesUpstreamRawIPv6URLConstruction(t *testing.T) {
+	dialer := &fakePeerDialer{err: errAttemptTestDial}
+	hub, _, remote := newAttemptTestHub(t, nil, dialer)
+
+	err := hub.connectFoundService(remote, "2001:db8::77", "4712", "/ship/")
+	if !errors.Is(err, errAttemptTestDial) {
+		t.Fatalf("ungated IPv6 error = %v, want %v", err, errAttemptTestDial)
+	}
+	calls, _ := dialer.snapshot()
+	want := []string{
+		"wss://2001:db8::77:4712/ship/",
+		"wss://2001:db8::77:4712",
+	}
+	if len(calls) != len(want) {
+		t.Fatalf("ungated raw IPv6 dial count = %d, want %d", len(calls), len(want))
+	}
+	for index := range want {
+		if calls[index].url != want[index] {
+			t.Errorf("ungated raw IPv6 URL %d = %q, want upstream %q", index, calls[index].url, want[index])
+		}
+	}
+}
+
 func TestPreparedHandlesAreSingleUseAcrossFallback(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -525,13 +581,13 @@ func TestAbortPreparedOnlyCleansUnlaunchedReservation(t *testing.T) {
 		dialer := &fakePeerDialer{err: errAttemptTestDial}
 		hub, _, remote := newAttemptTestHub(t, gate, dialer)
 
-		_, _, metadata, err := hub.gatedDialContext(remote, "peer.local", "4712", "/ship/")
+		_, _, attempt, err := hub.gatedDialContext(remote, "peer.local", "4712", "/ship/")
 		if !errors.Is(err, errAttemptTestDial) {
 			t.Fatalf("dial error = %v, want %v", err, errAttemptTestDial)
 		}
 		_, _, permits, aborted := gate.snapshot()
-		if len(permits) != 1 || metadata != permits[0].Metadata {
-			t.Fatalf("helper metadata = %#v, permit metadata = %#v", metadata, permits)
+		if len(permits) != 1 || attempt == nil || attempt.metadata != permits[0].Metadata {
+			t.Fatalf("helper attempt = %#v, permit metadata = %#v", attempt, permits)
 		}
 		calls, peerEffects := dialer.snapshot()
 		if len(aborted) != 0 || len(calls) != 1 || peerEffects != 1 {
@@ -619,7 +675,9 @@ func newAttemptTestHub(t *testing.T, gate api.OutgoingAttemptGate, dialer *fakeP
 	hub := NewHub(&attemptTestHubReader{}, mdns, 0, tls.Certificate{}, api.NewServiceDetails("local-ski"))
 	hub.dialer = dialer
 	if gate != nil {
-		hub.SetOutgoingAttemptGate(gate)
+		if err := hub.SetOutgoingAttemptGate(gate); err != nil {
+			t.Fatalf("install outgoing attempt gate: %v", err)
+		}
 	}
 	remote := hub.ServiceForSKI("remote-ski")
 	return hub, mdns, remote

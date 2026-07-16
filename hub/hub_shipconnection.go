@@ -54,8 +54,22 @@ func (h *Hub) HandleConnectionClosedWithAttempt(
 	metadata api.OutgoingAttemptMetadata,
 ) {
 	if reader, ok := h.hubReader.(api.OutgoingAttemptHubReaderInterface); ok {
+		h.removeExactConnection(connection)
 		reader.OutgoingAttemptConnectionClosed(connection.RemoteSKI(), handshakeCompleted, metadata)
+		return
 	}
+	h.HandleConnectionClosed(connection, handshakeCompleted)
+}
+
+func (h *Hub) removeExactConnection(connection api.ShipConnectionInterface) {
+	h.muxCon.Lock()
+	existing := h.connections[connection.RemoteSKI()]
+	if existing != connection {
+		h.muxCon.Unlock()
+		return
+	}
+	delete(h.connections, connection.RemoteSKI())
+	h.muxCon.Unlock()
 }
 
 // report the ship ID provided during the handshake
@@ -115,7 +129,9 @@ func (h *Hub) HandleShipHandshakeStateUpdateWithAttempt(
 ) {
 	if reader, ok := h.hubReader.(api.OutgoingAttemptHubReaderInterface); ok {
 		reader.OutgoingAttemptHandshakeStateUpdate(ski, state, metadata)
+		return
 	}
+	h.HandleShipHandshakeStateUpdate(ski, state)
 }
 
 // report an approved handshake by a remote device

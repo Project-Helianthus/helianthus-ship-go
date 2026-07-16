@@ -82,3 +82,62 @@ func TestHubForwardsOutgoingAttemptTerminalAndHandshakeMetadata(t *testing.T) {
 		t.Fatalf("handshake attempt metadata = %#v, want [%#v]", handshake, metadata)
 	}
 }
+
+func TestAttemptAwareHandshakeDoesNotFallThroughToLegacyTrust(t *testing.T) {
+	reader := &attemptAwareHubReader{}
+	hub := NewHub(reader, &attemptTestMdns{}, 0, tls.Certificate{}, api.NewServiceDetails("local-ski"))
+	metadata := api.OutgoingAttemptMetadata{AttemptID: "stale-attempt", Scope: "remote-scope", ControlEpoch: 31}
+
+	hub.HandleShipHandshakeStateUpdateWithAttempt(
+		"remote-ski",
+		model.ShipState{State: model.SmeHelloStateOk},
+		metadata,
+	)
+
+	if hub.ServiceForSKI("remote-ski").Trusted() {
+		t.Fatal("attempt-aware callback fell through to legacy SetTrusted(true)")
+	}
+	_, handshake := reader.snapshot()
+	if len(handshake) != 1 || handshake[0] != metadata {
+		t.Fatalf("attempt-aware handshake callbacks = %#v, want exact stale metadata once", handshake)
+	}
+}
+
+func TestAttemptAwareCloseRemovesOnlyExactRegisteredConnection(t *testing.T) {
+	reader := &attemptAwareHubReader{}
+	hub := NewHub(reader, &attemptTestMdns{}, 0, tls.Certificate{}, api.NewServiceDetails("local-ski"))
+	oldConnection := &attemptCallbackConnection{ski: "remote-ski"}
+	newConnection := &attemptCallbackConnection{ski: "remote-ski"}
+	oldMetadata := api.OutgoingAttemptMetadata{AttemptID: "old", Scope: "remote-scope", ControlEpoch: 1}
+	newMetadata := api.OutgoingAttemptMetadata{AttemptID: "new", Scope: "remote-scope", ControlEpoch: 1}
+
+	hub.registerConnection(newConnection)
+	hub.HandleConnectionClosedWithAttempt(oldConnection, false, oldMetadata)
+	if got := hub.connectionForSKI("remote-ski"); got != newConnection {
+		t.Fatalf("stale close changed active connection: got %#v, want %#v", got, newConnection)
+	}
+
+	hub.HandleConnectionClosedWithAttempt(newConnection, false, newMetadata)
+	if got := hub.connectionForSKI("remote-ski"); got != nil {
+		t.Fatalf("exact close left registered connection %#v", got)
+	}
+	closed, _ := reader.snapshot()
+	if len(closed) != 2 || closed[0] != oldMetadata || closed[1] != newMetadata {
+		t.Fatalf("close metadata = %#v, want stale then active", closed)
+	}
+}
+
+func TestAttemptCallbacksFallBackToLegacyWhenReaderIsNotAware(t *testing.T) {
+	hub := NewHub(&attemptTestHubReader{}, &attemptTestMdns{}, 0, tls.Certificate{}, api.NewServiceDetails("local-ski"))
+	metadata := api.OutgoingAttemptMetadata{AttemptID: "attempt", Scope: "remote-scope", ControlEpoch: 3}
+
+	hub.HandleShipHandshakeStateUpdateWithAttempt(
+		"remote-ski",
+		model.ShipState{State: model.SmeHelloStateOk},
+		metadata,
+	)
+
+	if !hub.ServiceForSKI("remote-ski").Trusted() {
+		t.Fatal("reader without optional interface did not receive legacy trust behavior")
+	}
+}
