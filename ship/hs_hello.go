@@ -3,9 +3,9 @@ package ship
 import (
 	"time"
 
-	"github.com/enbility/ship-go/logging"
-	"github.com/enbility/ship-go/model"
-	"github.com/enbility/ship-go/util"
+	"github.com/Project-Helianthus/helianthus-ship-go/logging"
+	"github.com/Project-Helianthus/helianthus-ship-go/model"
+	"github.com/Project-Helianthus/helianthus-ship-go/util"
 )
 
 // Handshake Hello covers the states smeHello...

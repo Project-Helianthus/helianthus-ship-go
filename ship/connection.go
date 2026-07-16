@@ -2,16 +2,18 @@ package ship
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/enbility/ship-go/api"
-	"github.com/enbility/ship-go/logging"
-	"github.com/enbility/ship-go/model"
-	"github.com/enbility/ship-go/util"
+	"github.com/Project-Helianthus/helianthus-ship-go/api"
+	"github.com/Project-Helianthus/helianthus-ship-go/logging"
+	"github.com/Project-Helianthus/helianthus-ship-go/model"
+	"github.com/Project-Helianthus/helianthus-ship-go/util"
 )
 
 // A ShipConnection handles the data connection and coordinates SHIP and SPINE messages i/o
@@ -30,6 +32,10 @@ type ShipConnection struct {
 
 	// data provider
 	infoProvider api.ShipConnectionInfoProviderInterface
+
+	outgoingAttemptMetadata api.OutgoingAttemptMetadata
+	outgoingAttemptContext  context.Context
+	hasOutgoingAttempt      bool
 
 	// Where to pass incoming SPINE messages to
 	dataReader api.ShipConnectionDataReaderInterface
@@ -59,6 +65,12 @@ type ShipConnection struct {
 
 	shutdownOnce sync.Once
 
+	dataHandlerInitOnce        sync.Once
+	outgoingAttemptTerminal    sync.Once
+	attemptCancellationMux     sync.Mutex
+	stopAttemptCancellation    func() bool
+	initializeDataHandlerOnRun bool
+
 	// buffer for SPINE messages that came in before the handshake was completed
 	spineBuffer [][]byte
 
@@ -67,6 +79,15 @@ type ShipConnection struct {
 }
 
 var _ api.ShipConnectionInterface = (*ShipConnection)(nil)
+var _ api.OutgoingAttemptConnectionInterface = (*ShipConnection)(nil)
+
+var ErrInvalidOutgoingAttemptConnectionConfiguration = errors.New("invalid outgoing attempt connection configuration")
+
+// OutgoingAttemptConnectionConfiguration binds an outgoing connection to its launch.
+type OutgoingAttemptConnectionConfiguration struct {
+	Metadata api.OutgoingAttemptMetadata
+	Context  context.Context
+}
 
 func NewConnectionHandler(
 	dataProvider api.ShipConnectionInfoProviderInterface,
@@ -75,6 +96,52 @@ func NewConnectionHandler(
 	localShipID,
 	remoteSki,
 	remoteShipId string) *ShipConnection {
+	return newConnectionHandler(dataProvider, dataHandler, role, localShipID, remoteSki, remoteShipId, true)
+}
+
+// NewOutgoingConnectionHandler creates a connection carrying one exact authorized attempt.
+func NewOutgoingConnectionHandler(
+	dataProvider api.ShipConnectionInfoProviderInterface,
+	dataHandler api.WebsocketDataWriterInterface,
+	role shipRole,
+	localShipID,
+	remoteSki,
+	remoteShipId string,
+	configuration OutgoingAttemptConnectionConfiguration) (*ShipConnection, error) {
+	if configuration.Metadata.AttemptID == "" ||
+		configuration.Metadata.Scope == "" ||
+		isNilOutgoingAttemptContext(configuration.Context) {
+		return nil, ErrInvalidOutgoingAttemptConnectionConfiguration
+	}
+
+	connection := newConnectionHandler(
+		dataProvider,
+		dataHandler,
+		role,
+		localShipID,
+		remoteSki,
+		remoteShipId,
+		false,
+	)
+	connection.outgoingAttemptMetadata = configuration.Metadata
+	connection.outgoingAttemptContext = configuration.Context
+	connection.hasOutgoingAttempt = true
+	connection.initializeDataHandlerOnRun = true
+	connection.setAttemptCancellationStop(context.AfterFunc(configuration.Context, func() {
+		connection.initializeDataProcessing()
+		connection.CloseConnection(false, 0, "outgoing attempt canceled")
+	}))
+	return connection, nil
+}
+
+func newConnectionHandler(
+	dataProvider api.ShipConnectionInfoProviderInterface,
+	dataHandler api.WebsocketDataWriterInterface,
+	role shipRole,
+	localShipID,
+	remoteSki,
+	remoteShipId string,
+	initializeDataHandler bool) *ShipConnection {
 	ship := &ShipConnection{
 		infoProvider: dataProvider,
 		dataWriter:   dataHandler,
@@ -88,11 +155,48 @@ func NewConnectionHandler(
 
 	ship.handshakeTimerStopChan = make(chan struct{})
 
-	if dataHandler != nil {
-		dataHandler.InitDataProcessing(ship)
+	if initializeDataHandler {
+		ship.initializeDataProcessing()
 	}
 
 	return ship
+}
+
+func isNilOutgoingAttemptContext(attemptContext context.Context) bool {
+	if attemptContext == nil {
+		return true
+	}
+	value := reflect.ValueOf(attemptContext)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func (c *ShipConnection) initializeDataProcessing() {
+	c.dataHandlerInitOnce.Do(func() {
+		if c.dataWriter != nil {
+			c.dataWriter.InitDataProcessing(c)
+		}
+	})
+}
+
+func (c *ShipConnection) setAttemptCancellationStop(stop func() bool) {
+	c.attemptCancellationMux.Lock()
+	c.stopAttemptCancellation = stop
+	c.attemptCancellationMux.Unlock()
+}
+
+func (c *ShipConnection) stopOutgoingAttemptCancellation() {
+	c.attemptCancellationMux.Lock()
+	stop := c.stopAttemptCancellation
+	c.stopAttemptCancellation = nil
+	c.attemptCancellationMux.Unlock()
+	if stop != nil {
+		stop()
+	}
 }
 
 func (c *ShipConnection) RemoteSKI() string {
@@ -103,8 +207,42 @@ func (c *ShipConnection) DataHandler() api.WebsocketDataWriterInterface {
 	return c.dataWriter
 }
 
+func (c *ShipConnection) OutgoingAttemptMetadata() (api.OutgoingAttemptMetadata, bool) {
+	return c.outgoingAttemptMetadata, c.hasOutgoingAttempt
+}
+
+func (c *ShipConnection) reportConnectionClosed(handshakeCompleted bool) {
+	if c.hasOutgoingAttempt {
+		if provider, ok := c.infoProvider.(api.OutgoingAttemptShipConnectionInfoProviderInterface); ok {
+			c.outgoingAttemptTerminal.Do(func() {
+				c.stopOutgoingAttemptCancellation()
+				provider.HandleConnectionClosedWithAttempt(c, handshakeCompleted, c.outgoingAttemptMetadata)
+			})
+			return
+		}
+	}
+	c.infoProvider.HandleConnectionClosed(c, handshakeCompleted)
+}
+
+func (c *ShipConnection) reportShipHandshakeStateUpdate(state model.ShipState) {
+	if c.hasOutgoingAttempt {
+		if provider, ok := c.infoProvider.(api.OutgoingAttemptShipConnectionInfoProviderInterface); ok {
+			provider.HandleShipHandshakeStateUpdateWithAttempt(c.remoteSKI, state, c.outgoingAttemptMetadata)
+			return
+		}
+	}
+	c.infoProvider.HandleShipHandshakeStateUpdate(c.remoteSKI, state)
+}
+
 // start SHIP communication
 func (c *ShipConnection) Run() {
+	if c.initializeDataHandlerOnRun {
+		c.initializeDataProcessing()
+		if c.outgoingAttemptContext.Err() != nil {
+			c.CloseConnection(false, 0, "outgoing attempt canceled")
+			return
+		}
+	}
 	c.handleShipMessage(false, nil)
 }
 
@@ -150,6 +288,7 @@ func (c *ShipConnection) AbortPendingHandshake() {
 // close this ship connection
 func (c *ShipConnection) CloseConnection(safe bool, code int, reason string) {
 	c.shutdownOnce.Do(func() {
+		c.stopOutgoingAttemptCancellation()
 		c.stopHandshakeTimer()
 
 		// handshake is completed if approved or aborted
@@ -178,7 +317,7 @@ func (c *ShipConnection) CloseConnection(safe bool, code int, reason string) {
 
 				//
 				c.dataWriter.CloseDataConnection(4001, "close")
-				c.infoProvider.HandleConnectionClosed(c, handshakeEnd)
+				c.reportConnectionClosed(handshakeEnd)
 			}()
 			return
 		}
@@ -189,7 +328,7 @@ func (c *ShipConnection) CloseConnection(safe bool, code int, reason string) {
 		}
 		c.dataWriter.CloseDataConnection(closeCode, reason)
 
-		c.infoProvider.HandleConnectionClosed(c, handshakeEnd)
+		c.reportConnectionClosed(handshakeEnd)
 	})
 }
 
@@ -303,7 +442,7 @@ func (c *ShipConnection) ReportConnectionError(err error) {
 		State: model.SmeStateError,
 		Error: err,
 	}
-	c.infoProvider.HandleShipHandshakeStateUpdate(c.remoteSKI, state)
+	c.reportShipHandshakeStateUpdate(state)
 }
 
 const payloadPlaceholder = `{"place":"holder"}`

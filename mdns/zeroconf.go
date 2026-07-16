@@ -5,8 +5,8 @@ import (
 	"net"
 	"sync"
 
-	"github.com/enbility/ship-go/api"
-	"github.com/enbility/ship-go/logging"
+	"github.com/Project-Helianthus/helianthus-ship-go/api"
+	"github.com/Project-Helianthus/helianthus-ship-go/logging"
 	"github.com/enbility/zeroconf/v2"
 )
 

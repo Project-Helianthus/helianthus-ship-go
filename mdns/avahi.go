@@ -6,9 +6,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Project-Helianthus/helianthus-ship-go/api"
+	"github.com/Project-Helianthus/helianthus-ship-go/logging"
 	"github.com/enbility/go-avahi"
-	"github.com/enbility/ship-go/api"
-	"github.com/enbility/ship-go/logging"
 )
 
 type mdnsServiceData struct {

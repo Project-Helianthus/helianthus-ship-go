@@ -9,10 +9,10 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/Project-Helianthus/helianthus-ship-go/api"
+	"github.com/Project-Helianthus/helianthus-ship-go/logging"
+	"github.com/Project-Helianthus/helianthus-ship-go/util"
 	"github.com/enbility/go-avahi"
-	"github.com/enbility/ship-go/api"
-	"github.com/enbility/ship-go/logging"
-	"github.com/enbility/ship-go/util"
 )
 
 const shipWebsocketPath = "/ship/"

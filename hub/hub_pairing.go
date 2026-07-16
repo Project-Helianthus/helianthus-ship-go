@@ -1,9 +1,9 @@
 package hub
 
 import (
-	"github.com/enbility/ship-go/api"
-	"github.com/enbility/ship-go/model"
-	"github.com/enbility/ship-go/util"
+	"github.com/Project-Helianthus/helianthus-ship-go/api"
+	"github.com/Project-Helianthus/helianthus-ship-go/model"
+	"github.com/Project-Helianthus/helianthus-ship-go/util"
 )
 
 // Provide the current pairing state for a SKI

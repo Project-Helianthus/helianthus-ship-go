@@ -9,8 +9,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/enbility/ship-go/mocks"
-	util "github.com/enbility/ship-go/util"
+	"github.com/Project-Helianthus/helianthus-ship-go/mocks"
+	util "github.com/Project-Helianthus/helianthus-ship-go/util"
 	"github.com/gorilla/websocket"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"

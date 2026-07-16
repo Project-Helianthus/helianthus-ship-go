@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/enbility/ship-go/model"
+	"github.com/Project-Helianthus/helianthus-ship-go/model"
 )
 
 // Handshake Access covers the states smeAccess...

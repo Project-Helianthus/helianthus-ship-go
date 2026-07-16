@@ -6,9 +6,9 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/enbility/ship-go/api"
-	"github.com/enbility/ship-go/logging"
-	"github.com/enbility/ship-go/util"
+	"github.com/Project-Helianthus/helianthus-ship-go/api"
+	"github.com/Project-Helianthus/helianthus-ship-go/logging"
+	"github.com/Project-Helianthus/helianthus-ship-go/util"
 )
 
 // used for randomizing the connection initiation delay
@@ -41,6 +41,9 @@ type Hub struct {
 
 	hubReader api.HubReaderInterface
 
+	dialer              outgoingAttemptDialer
+	outgoingAttemptGate api.OutgoingAttemptGate
+
 	autoaccept bool
 
 	// The list of known remote services
@@ -57,11 +60,12 @@ type Hub struct {
 
 	hasStarted bool
 
-	muxCon        sync.Mutex
-	muxConAttempt sync.Mutex
-	muxReg        sync.Mutex
-	muxMdns       sync.Mutex
-	muxStarted    sync.Mutex
+	muxCon         sync.Mutex
+	muxConAttempt  sync.Mutex
+	muxReg         sync.Mutex
+	muxMdns        sync.Mutex
+	muxStarted     sync.Mutex
+	muxAttemptGate sync.RWMutex
 }
 
 func NewHub(hubReader api.HubReaderInterface,
@@ -80,12 +84,39 @@ func NewHub(hubReader api.HubReaderInterface,
 		certifciate:              certificate,
 		localService:             localService,
 		mdns:                     mdns,
+		dialer:                   newOutgoingAttemptDialer(certificate),
 	}
 
 	return hub
 }
 
 var _ api.HubInterface = (*Hub)(nil)
+var _ api.OutgoingAttemptGateSetter = (*Hub)(nil)
+
+// SetOutgoingAttemptGate installs or removes the optional outgoing dial gate.
+func (h *Hub) SetOutgoingAttemptGate(gate api.OutgoingAttemptGate) error {
+	if gate != nil {
+		if isNilOutgoingAttemptValue(gate) {
+			return api.ErrInvalidOutgoingAttemptGate
+		}
+		reader, ok := h.hubReader.(api.OutgoingAttemptHubReaderInterface)
+		if !ok || isNilOutgoingAttemptValue(reader) {
+			return api.ErrInvalidOutgoingAttemptGate
+		}
+	}
+
+	h.muxAttemptGate.Lock()
+	h.outgoingAttemptGate = gate
+	h.muxAttemptGate.Unlock()
+	return nil
+}
+
+func (h *Hub) configuredOutgoingAttemptGate() api.OutgoingAttemptGate {
+	h.muxAttemptGate.RLock()
+	defer h.muxAttemptGate.RUnlock()
+
+	return h.outgoingAttemptGate
+}
 
 // Start the ConnectionsHub with all its services
 func (h *Hub) Start() {

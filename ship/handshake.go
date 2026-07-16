@@ -4,8 +4,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/enbility/ship-go/logging"
-	"github.com/enbility/ship-go/model"
+	"github.com/Project-Helianthus/helianthus-ship-go/logging"
+	"github.com/Project-Helianthus/helianthus-ship-go/model"
 )
 
 // handle incoming SHIP messages and coordinate Handshake States
@@ -30,11 +30,11 @@ func (c *ShipConnection) handleShipMessage(timeout bool, message []byte) {
 
 				//
 				c.dataWriter.CloseDataConnection(4001, "close")
-				c.infoProvider.HandleConnectionClosed(c, c.getState() == model.SmeStateComplete)
+				c.reportConnectionClosed(c.getState() == model.SmeStateComplete)
 			case model.ConnectionClosePhaseTypeConfirm:
 				// we got a confirmation so close this connection
 				c.dataWriter.CloseDataConnection(4001, "close")
-				c.infoProvider.HandleConnectionClosed(c, c.getState() == model.SmeStateComplete)
+				c.reportConnectionClosed(c.getState() == model.SmeStateComplete)
 			}
 
 			return
@@ -76,7 +76,7 @@ func (c *ShipConnection) setState(newState model.ShipMessageExchangeState, err e
 			Error: err,
 		}
 		c.mux.Unlock()
-		c.infoProvider.HandleShipHandshakeStateUpdate(c.remoteSKI, state)
+		c.reportShipHandshakeStateUpdate(state)
 		return
 	}
 	c.mux.Unlock()
@@ -222,7 +222,7 @@ func (c *ShipConnection) endHandshakeWithError(err error) {
 		State: model.SmeStateError,
 		Error: err,
 	}
-	c.infoProvider.HandleShipHandshakeStateUpdate(c.remoteSKI, state)
+	c.reportShipHandshakeStateUpdate(state)
 }
 
 // set the handshake timer to a new duration and start the channel

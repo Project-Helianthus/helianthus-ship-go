@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 
-	"github.com/enbility/ship-go/model"
+	"github.com/Project-Helianthus/helianthus-ship-go/model"
 )
 
 // Handshake Pin covers the states smePin...

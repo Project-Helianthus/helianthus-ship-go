@@ -12,7 +12,7 @@ package mocks
 import (
 	reflect "reflect"
 
-	api "github.com/enbility/ship-go/api"
+	api "github.com/Project-Helianthus/helianthus-ship-go/api"
 	gomock "go.uber.org/mock/gomock"
 )
 

@@ -1,7 +1,7 @@
 package api
 
 //go:generate mockery
-//go:generate mockgen -destination=../mocks/mockgen_api.go -package=mocks github.com/enbility/ship-go/api MdnsInterface,HubReaderInterface
+//go:generate mockgen -destination=../mocks/mockgen_api.go -package=mocks github.com/Project-Helianthus/helianthus-ship-go/api MdnsInterface,HubReaderInterface
 
 /* Hub */
 
