@@ -1,0 +1,26 @@
+{
+  "schema": "helianthus.provenance.closure-manifest.v1",
+  "module": "github.com/Project-Helianthus/helianthus-ship-go",
+  "fork": {
+    "origin": "https://github.com/Project-Helianthus/helianthus-ship-go.git",
+    "lifecycle": "temporary_downstream_patch_carrier"
+  },
+  "upstream": {
+    "remote": "https://github.com/enbility/ship-go.git",
+    "tag": "v0.6.0",
+    "tag_object_sha": "c2b94943a0106e90f603a2ee0e155c1f6ac0b54b",
+    "peeled_commit_sha": "760c312bf723d726d8882af3bb06650ddcd11ca9",
+    "tree_sha": "958ddf185fc09dd4d3b382fc108641513412d927"
+  },
+  "license": {
+    "path": "LICENSE",
+    "sha256": "c853996135802c50b3048937e48022bc00b41ff5f56a31cebe7d686bf91f87db"
+  },
+  "notice_inventory": [],
+  "source_header_inventory": {
+    "globs": [
+      "**/*.go"
+    ],
+    "headers": []
+  }
+}
