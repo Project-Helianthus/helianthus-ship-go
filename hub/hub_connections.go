@@ -36,30 +36,35 @@ func (outgoingAttemptDeniedError) AttemptDenied() bool { return true }
 var errOutgoingAttemptFailed = errors.New("outgoing attempt failed")
 
 type authorizedOutgoingAttempt struct {
-	remoteSKI string
-	metadata  api.OutgoingAttemptMetadata
-	context   context.Context
-	terminal  sync.Once
+	remoteSKI         string
+	metadata          api.OutgoingAttemptMetadata
+	context           context.Context
+	terminal          sync.Once
+	terminalSucceeded bool
 }
 
-func (a *authorizedOutgoingAttempt) terminalFailure(h *Hub) {
+func (a *authorizedOutgoingAttempt) terminalFailure(h *Hub) bool {
 	if a == nil {
-		return
+		return true
 	}
 	a.terminal.Do(func() {
-		h.reportOutgoingAttemptTerminalFailure(a.remoteSKI, a.metadata)
+		a.terminalSucceeded = h.reportOutgoingAttemptTerminalFailure(a.remoteSKI, a.metadata)
 	})
+	return a.terminalSucceeded
 }
 
-func (h *Hub) reportOutgoingAttemptTerminalFailure(remoteSKI string, metadata api.OutgoingAttemptMetadata) {
+func (h *Hub) reportOutgoingAttemptTerminalFailure(remoteSKI string, metadata api.OutgoingAttemptMetadata) (reported bool) {
 	reader, ok := h.hubReader.(api.OutgoingAttemptHubReaderInterface)
-	if !ok {
-		return
+	if !ok || isNilOutgoingAttemptValue(reader) {
+		return false
 	}
 	defer func() {
-		_ = recover()
+		if recover() != nil {
+			reported = false
+		}
 	}()
 	reader.OutgoingAttemptConnectionClosed(remoteSKI, false, metadata)
+	return true
 }
 
 func newOutgoingAttemptDialer(certificate tls.Certificate) outgoingAttemptDialer {
@@ -237,7 +242,9 @@ func (h *Hub) connectFoundService(remoteService *api.ServiceDetails, host, port,
 		if conn != nil {
 			_ = conn.Close()
 		}
-		attempt.terminalFailure(h)
+		if !attempt.terminalFailure(h) {
+			return outgoingAttemptDeniedError{}
+		}
 		return connectionErr
 	}
 
@@ -278,7 +285,9 @@ func (h *Hub) connectFoundService(remoteService *api.ServiceDetails, host, port,
 
 	if !h.keepThisConnection(conn, false, remoteService) {
 		errorString := fmt.Sprintf("closing connection to %s: ignoring this connection", remoteService.SKI())
-		attempt.terminalFailure(h)
+		if !attempt.terminalFailure(h) {
+			return outgoingAttemptDeniedError{}
+		}
 		return errors.New(errorString)
 	}
 
@@ -341,10 +350,14 @@ func (h *Hub) gatedDialContext(
 			if connection != nil {
 				_ = connection.Close()
 			}
-			attempt.terminalFailure(h)
+			terminalReported := attempt.terminalFailure(h)
 			connection = nil
 			response = nil
-			err = errOutgoingAttemptFailed
+			if terminalReported {
+				err = errOutgoingAttemptFailed
+			} else {
+				err = outgoingAttemptDeniedError{}
+			}
 		}
 	}()
 	if gate != nil {
@@ -426,11 +439,15 @@ func (h *Hub) gatedDialContext(
 		if connection != nil {
 			_ = connection.Close()
 		}
-		attempt.terminalFailure(h)
+		if !attempt.terminalFailure(h) {
+			return nil, response, attempt, outgoingAttemptDeniedError{}
+		}
 		return nil, response, attempt, err
 	}
 	if connection == nil {
-		attempt.terminalFailure(h)
+		if !attempt.terminalFailure(h) {
+			return nil, response, attempt, outgoingAttemptDeniedError{}
+		}
 		return nil, response, attempt, errOutgoingAttemptFailed
 	}
 	return connection, response, attempt, nil

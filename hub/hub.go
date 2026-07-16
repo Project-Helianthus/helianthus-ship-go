@@ -95,8 +95,14 @@ var _ api.OutgoingAttemptGateSetter = (*Hub)(nil)
 
 // SetOutgoingAttemptGate installs or removes the optional outgoing dial gate.
 func (h *Hub) SetOutgoingAttemptGate(gate api.OutgoingAttemptGate) error {
-	if gate != nil && isNilOutgoingAttemptValue(gate) {
-		return api.ErrInvalidOutgoingAttemptGate
+	if gate != nil {
+		if isNilOutgoingAttemptValue(gate) {
+			return api.ErrInvalidOutgoingAttemptGate
+		}
+		reader, ok := h.hubReader.(api.OutgoingAttemptHubReaderInterface)
+		if !ok || isNilOutgoingAttemptValue(reader) {
+			return api.ErrInvalidOutgoingAttemptGate
+		}
 	}
 
 	h.muxAttemptGate.Lock()

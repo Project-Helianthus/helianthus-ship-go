@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
+	"github.com/Project-Helianthus/helianthus-ship-go/model"
 	"github.com/gorilla/websocket"
 )
 
@@ -305,6 +306,13 @@ func (*attemptTestHubReader) ServicePairingDetailUpdate(string, *api.ConnectionS
 }
 func (*attemptTestHubReader) AllowWaitingForTrust(string) bool { return false }
 
+type attemptAwareGateTestHubReader struct{ attemptTestHubReader }
+
+func (*attemptAwareGateTestHubReader) OutgoingAttemptConnectionClosed(string, bool, api.OutgoingAttemptMetadata) {
+}
+func (*attemptAwareGateTestHubReader) OutgoingAttemptHandshakeStateUpdate(string, model.ShipState, api.OutgoingAttemptMetadata) {
+}
+
 func TestOutgoingAttemptGateDenialsFailClosed(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -380,6 +388,18 @@ func TestOutgoingAttemptGateSetterRejectsTypedNil(t *testing.T) {
 	}
 	if hub.configuredOutgoingAttemptGate() != nil {
 		t.Fatal("nil removal left a configured gate")
+	}
+}
+
+func TestOutgoingAttemptGateSetterRejectsReaderWithoutAttemptCallbacks(t *testing.T) {
+	hub := NewHub(&attemptTestHubReader{}, &attemptTestMdns{}, 0, tls.Certificate{}, api.NewServiceDetails("local-ski"))
+	gate := newScriptedAttemptGate(gatePermit)
+
+	if err := hub.SetOutgoingAttemptGate(gate); !errors.Is(err, api.ErrInvalidOutgoingAttemptGate) {
+		t.Fatalf("legacy-only reader installation error = %v, want %v", err, api.ErrInvalidOutgoingAttemptGate)
+	}
+	if hub.configuredOutgoingAttemptGate() != nil {
+		t.Fatal("legacy-only reader installation changed the configured gate")
 	}
 }
 
@@ -672,7 +692,7 @@ func TestCancellationAroundAuthorizeAndDialIsRaceSafe(t *testing.T) {
 func newAttemptTestHub(t *testing.T, gate api.OutgoingAttemptGate, dialer *fakePeerDialer) (*Hub, *attemptTestMdns, *api.ServiceDetails) {
 	t.Helper()
 	mdns := &attemptTestMdns{}
-	hub := NewHub(&attemptTestHubReader{}, mdns, 0, tls.Certificate{}, api.NewServiceDetails("local-ski"))
+	hub := NewHub(&attemptAwareGateTestHubReader{}, mdns, 0, tls.Certificate{}, api.NewServiceDetails("local-ski"))
 	hub.dialer = dialer
 	if gate != nil {
 		if err := hub.SetOutgoingAttemptGate(gate); err != nil {

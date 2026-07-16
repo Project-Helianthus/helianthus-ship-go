@@ -41,6 +41,7 @@ type durableReservationGateReader struct {
 	terminals      []api.OutgoingAttemptMetadata
 	terminalCounts map[string]int
 	terminalSignal chan api.OutgoingAttemptMetadata
+	panicTerminal  bool
 }
 
 func newDurableReservationGateReader() *durableReservationGateReader {
@@ -132,6 +133,9 @@ func (r *durableReservationGateReader) OutgoingAttemptConnectionClosed(
 	_ bool,
 	metadata api.OutgoingAttemptMetadata,
 ) {
+	if r.panicTerminal {
+		panic("private terminal callback panic")
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -143,6 +147,24 @@ func (r *durableReservationGateReader) OutgoingAttemptConnectionClosed(
 		delete(r.active, remoteSKI)
 	}
 	r.terminalSignal <- metadata
+}
+
+func TestTerminalCallbackPanicSuppressesFallbackAndKeepsReservationForRecovery(t *testing.T) {
+	model := newDurableReservationGateReader()
+	model.panicTerminal = true
+	dialer := &lifecycleDialer{outcomes: []scriptedDialOutcome{dialOutcomeError, dialOutcomeError}}
+	hub := NewHub(model, &attemptTestMdns{}, 0, tls.Certificate{}, api.NewServiceDetails("local-ski"))
+	hub.dialer = dialer
+	if err := hub.SetOutgoingAttemptGate(model); err != nil {
+		t.Fatalf("install durable gate: %v", err)
+	}
+
+	err := hub.connectFoundService(hub.ServiceForSKI("remote-ski"), "peer.local", "4712", "/ship/")
+	assertTypedAttemptDenial(t, err)
+	requests, terminals, _, active := model.snapshotLifecycle()
+	if len(requests) != 1 || len(terminals) != 0 || active != 1 || dialer.count() != 1 {
+		t.Fatalf("prepare/terminal/active/dial = %d/%d/%d/%d, want 1/0/1/1", len(requests), len(terminals), active, dialer.count())
+	}
 }
 
 func (r *durableReservationGateReader) snapshotLifecycle() (
