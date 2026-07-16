@@ -9,7 +9,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/enbility/ship-go/api"
+	"github.com/Project-Helianthus/helianthus-ship-go/api"
 	"github.com/gorilla/websocket"
 )
 

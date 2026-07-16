@@ -13,10 +13,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/enbility/ship-go/api"
-	"github.com/enbility/ship-go/cert"
-	"github.com/enbility/ship-go/model"
-	"github.com/enbility/ship-go/ship"
+	"github.com/Project-Helianthus/helianthus-ship-go/api"
+	"github.com/Project-Helianthus/helianthus-ship-go/cert"
+	"github.com/Project-Helianthus/helianthus-ship-go/model"
+	"github.com/Project-Helianthus/helianthus-ship-go/ship"
 	"github.com/gorilla/websocket"
 )
 

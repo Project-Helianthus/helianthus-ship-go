@@ -6,9 +6,9 @@ import (
 	"net/http"
 	"sync"
 
-	"github.com/enbility/ship-go/api"
-	"github.com/enbility/ship-go/logging"
-	"github.com/enbility/ship-go/util"
+	"github.com/Project-Helianthus/helianthus-ship-go/api"
+	"github.com/Project-Helianthus/helianthus-ship-go/logging"
+	"github.com/Project-Helianthus/helianthus-ship-go/util"
 )
 
 // used for randomizing the connection initiation delay

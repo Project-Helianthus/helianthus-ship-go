@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"errors"
 
-	"github.com/enbility/ship-go/logging"
-	"github.com/enbility/ship-go/model"
+	"github.com/Project-Helianthus/helianthus-ship-go/logging"
+	"github.com/Project-Helianthus/helianthus-ship-go/model"
 )
 
 // Handshake Prot covers the states smeProt...

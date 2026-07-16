@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/enbility/ship-go/api"
+	"github.com/Project-Helianthus/helianthus-ship-go/api"
 )
 
 var _ api.MdnsReportInterface = (*Hub)(nil)

@@ -1,7 +1,7 @@
 package api
 
 import (
-	"github.com/enbility/ship-go/model"
+	"github.com/Project-Helianthus/helianthus-ship-go/model"
 )
 
 /* ShipConnection */

@@ -3,7 +3,7 @@ package ship
 import (
 	"fmt"
 
-	"github.com/enbility/ship-go/model"
+	"github.com/Project-Helianthus/helianthus-ship-go/model"
 )
 
 // Handshake initialization covers the states cmiState...

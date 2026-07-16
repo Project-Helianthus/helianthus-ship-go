@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/enbility/ship-go/mocks"
-	"github.com/enbility/ship-go/model"
+	"github.com/Project-Helianthus/helianthus-ship-go/mocks"
+	"github.com/Project-Helianthus/helianthus-ship-go/model"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"

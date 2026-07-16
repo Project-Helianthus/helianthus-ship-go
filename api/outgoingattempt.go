@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 
-	"github.com/enbility/ship-go/model"
+	"github.com/Project-Helianthus/helianthus-ship-go/model"
 )
 
 // OutgoingAttemptEndpoint identifies one concrete network endpoint.

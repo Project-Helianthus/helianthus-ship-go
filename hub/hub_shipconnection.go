@@ -4,8 +4,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/enbility/ship-go/api"
-	"github.com/enbility/ship-go/model"
+	"github.com/Project-Helianthus/helianthus-ship-go/api"
+	"github.com/Project-Helianthus/helianthus-ship-go/model"
 )
 
 var _ api.ShipConnectionInfoProviderInterface = (*Hub)(nil)

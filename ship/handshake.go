@@ -4,8 +4,8 @@ import (
 	"errors"
 	"time"
 
-	"github.com/enbility/ship-go/logging"
-	"github.com/enbility/ship-go/model"
+	"github.com/Project-Helianthus/helianthus-ship-go/logging"
+	"github.com/Project-Helianthus/helianthus-ship-go/model"
 )
 
 // handle incoming SHIP messages and coordinate Handshake States

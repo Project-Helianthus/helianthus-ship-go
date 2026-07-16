@@ -16,11 +16,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/enbility/ship-go/api"
-	"github.com/enbility/ship-go/cert"
-	"github.com/enbility/ship-go/logging"
-	"github.com/enbility/ship-go/ship"
-	"github.com/enbility/ship-go/ws"
+	"github.com/Project-Helianthus/helianthus-ship-go/api"
+	"github.com/Project-Helianthus/helianthus-ship-go/cert"
+	"github.com/Project-Helianthus/helianthus-ship-go/logging"
+	"github.com/Project-Helianthus/helianthus-ship-go/ship"
+	"github.com/Project-Helianthus/helianthus-ship-go/ws"
 	"github.com/gorilla/websocket"
 )
 

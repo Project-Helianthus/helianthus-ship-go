@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/enbility/ship-go/api"
-	"github.com/enbility/ship-go/model"
+	"github.com/Project-Helianthus/helianthus-ship-go/api"
+	"github.com/Project-Helianthus/helianthus-ship-go/model"
 )
 
 type attemptCallbackRecord struct {

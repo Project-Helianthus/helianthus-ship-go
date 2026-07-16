@@ -3,7 +3,7 @@
 package mocks
 
 import (
-	api "github.com/enbility/ship-go/api"
+	api "github.com/Project-Helianthus/helianthus-ship-go/api"
 	mock "github.com/stretchr/testify/mock"
 )
 
