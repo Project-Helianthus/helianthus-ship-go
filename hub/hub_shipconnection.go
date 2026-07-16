@@ -9,6 +9,7 @@ import (
 )
 
 var _ api.ShipConnectionInfoProviderInterface = (*Hub)(nil)
+var _ api.OutgoingAttemptShipConnectionInfoProviderInterface = (*Hub)(nil)
 
 // check if the SKI is paired
 func (h *Hub) IsRemoteServiceForSKIPaired(ski string) bool {
@@ -45,6 +46,16 @@ func (h *Hub) HandleConnectionClosed(connection api.ShipConnectionInterface, han
 	}
 
 	h.checkAutoReannounce()
+}
+
+func (h *Hub) HandleConnectionClosedWithAttempt(
+	connection api.ShipConnectionInterface,
+	handshakeCompleted bool,
+	metadata api.OutgoingAttemptMetadata,
+) {
+	if reader, ok := h.hubReader.(api.OutgoingAttemptHubReaderInterface); ok {
+		reader.OutgoingAttemptConnectionClosed(connection.RemoteSKI(), handshakeCompleted, metadata)
+	}
 }
 
 // report the ship ID provided during the handshake
@@ -94,6 +105,16 @@ func (h *Hub) HandleShipHandshakeStateUpdate(ski string, state model.ShipState) 
 			<-time.After(time.Millisecond * 500)
 			h.hubReader.ServicePairingDetailUpdate(ski, pairingDetail)
 		}()
+	}
+}
+
+func (h *Hub) HandleShipHandshakeStateUpdateWithAttempt(
+	ski string,
+	state model.ShipState,
+	metadata api.OutgoingAttemptMetadata,
+) {
+	if reader, ok := h.hubReader.(api.OutgoingAttemptHubReaderInterface); ok {
+		reader.OutgoingAttemptHandshakeStateUpdate(ski, state, metadata)
 	}
 }
 
