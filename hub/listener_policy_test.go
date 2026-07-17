@@ -137,6 +137,28 @@ func TestNewHubWithListenerPolicyIsValidationOnlyAndOccupiedBindFailsSynchronous
 	}
 }
 
+func TestNewHubWithListenerPolicyRejectsPortMismatchWithoutEffects(t *testing.T) {
+	endpoint := listenerPolicyAvailableEndpoint(t, netip.MustParseAddr("127.0.0.1"))
+	mdns := &listenerPolicyMDNS{}
+	hub, err := NewHubWithListenerPolicy(
+		nil,
+		mdns,
+		int(endpoint.Port())+1,
+		tls.Certificate{},
+		api.NewServiceDetails("local-ski"),
+		api.ListenerPolicy{ListenAddress: endpoint, DiscoveryEnabled: true},
+	)
+	if err == nil {
+		t.Fatal("NewHubWithListenerPolicy accepted conflicting ports")
+	}
+	if hub != nil {
+		t.Error("NewHubWithListenerPolicy returned a Hub for conflicting ports")
+	}
+	if calls, _ := mdns.snapshot(); len(calls) != 0 {
+		t.Errorf("port validation caused mDNS effects: %v", calls)
+	}
+}
+
 func TestStartWithPolicyBindsExactIPv4WithoutDiscovery(t *testing.T) {
 	endpoint := listenerPolicyAvailableEndpoint(t, netip.MustParseAddr("127.0.0.1"))
 	mdns := &listenerPolicyMDNS{}
@@ -162,8 +184,8 @@ func TestStartWithPolicyBindsExactIPv4WithoutDiscovery(t *testing.T) {
 	if err := rebound.Close(); err != nil {
 		t.Fatalf("close rebound listener: %v", err)
 	}
-	if calls, _ := mdns.snapshot(); listenerPolicyCount(calls, "start") != 0 || listenerPolicyCount(calls, "announce") != 0 {
-		t.Errorf("discovery-disabled lifecycle started or announced mDNS: %v", calls)
+	if calls, _ := mdns.snapshot(); len(calls) != 0 {
+		t.Errorf("discovery-disabled lifecycle caused mDNS effects: %v", calls)
 	}
 }
 
