@@ -323,6 +323,9 @@ func (h *Hub) connectFoundService(remoteService *api.ServiceDetails, host, port,
 	registered := h.registerOutgoingConnection(shipConnection, attempt.context)
 	shipConnection.Run()
 	if !registered || attempt.context.Err() != nil {
+		if !registered {
+			shipConnection.CloseConnection(false, 0, "connection registration rejected")
+		}
 		return outgoingAttemptDeniedError{}
 	}
 
@@ -797,20 +800,28 @@ func (h *Hub) isConnectionAttemptRunning(ski string) bool {
 
 // register a new ship Connection
 func (h *Hub) registerConnection(connection api.ShipConnectionInterface) {
-	h.muxCon.Lock()
-	defer h.muxCon.Unlock()
+	remoteSKI := connection.RemoteSKI()
 
-	h.connections[connection.RemoteSKI()] = connection
+	h.muxCon.Lock()
+	if h.hasShutdown {
+		h.muxCon.Unlock()
+		connection.CloseConnection(false, 0, "hub shutdown")
+		return
+	}
+	h.connections[remoteSKI] = connection
+	h.muxCon.Unlock()
 }
 
 func (h *Hub) registerOutgoingConnection(connection api.ShipConnectionInterface, attemptContext context.Context) bool {
+	remoteSKI := connection.RemoteSKI()
+
 	h.muxCon.Lock()
 	defer h.muxCon.Unlock()
 
-	if attemptContext.Err() != nil {
+	if h.hasShutdown || attemptContext.Err() != nil {
 		return false
 	}
-	h.connections[connection.RemoteSKI()] = connection
+	h.connections[remoteSKI] = connection
 	return true
 }
 
