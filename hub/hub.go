@@ -29,6 +29,7 @@ var connectionInitiationDelayTimeRanges = []connectionInitiationDelayTimeRange{
 // handling the server and all connections to remote services
 type Hub struct {
 	connections map[string]api.ShipConnectionInterface
+	hasShutdown bool
 
 	// which attempt is it to initate an connection to the remote SKI
 	connectionAttemptCounter map[string]int
@@ -138,8 +139,13 @@ func (h *Hub) Start() {
 
 // close all connections
 func (h *Hub) Shutdown() {
+	connections, started := h.beginShutdown()
+	if !started {
+		return
+	}
+
 	h.mdns.Shutdown()
-	for _, c := range h.connections {
+	for _, c := range connections {
 		c.CloseConnection(false, 0, "")
 	}
 	if h.httpServer == nil {
@@ -148,6 +154,23 @@ func (h *Hub) Shutdown() {
 	if err := h.httpServer.Shutdown(context.Background()); err != nil {
 		logging.Log().Error("HTTP server shutdown:", err)
 	}
+}
+
+func (h *Hub) beginShutdown() ([]api.ShipConnectionInterface, bool) {
+	h.muxCon.Lock()
+	defer h.muxCon.Unlock()
+
+	if h.hasShutdown {
+		return nil, false
+	}
+	h.hasShutdown = true
+
+	connections := make([]api.ShipConnectionInterface, 0, len(h.connections))
+	for ski, connection := range h.connections {
+		connections = append(connections, connection)
+		delete(h.connections, ski)
+	}
+	return connections, true
 }
 
 // return the service for a SKI

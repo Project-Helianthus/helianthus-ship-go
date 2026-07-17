@@ -24,23 +24,17 @@ func (h *Hub) HandleConnectionClosed(connection api.ShipConnectionInterface, han
 
 	// only remove this connection if it is the registered one for the ski!
 	// as we can have double connections but only one can be registered
-	if existingC := h.connectionForSKI(remoteSki); existingC != nil {
-		if existingC.DataHandler() == connection.DataHandler() {
-			h.muxCon.Lock()
-			delete(h.connections, connection.RemoteSKI())
-			h.muxCon.Unlock()
-		}
-
+	if h.removeConnectionWithDataHandler(connection) {
 		// connection close was after a completed handshake, so we can reset the attetmpt counter
 		if handshakeCompleted {
-			h.removeConnectionAttemptCounter(connection.RemoteSKI())
+			h.removeConnectionAttemptCounter(remoteSki)
 		}
 	}
 
-	h.hubReader.RemoteSKIDisconnected(connection.RemoteSKI())
+	h.hubReader.RemoteSKIDisconnected(remoteSki)
 
 	// Do not automatically reconnect if handshake failed and not already paired
-	remoteService := h.ServiceForSKI(connection.RemoteSKI())
+	remoteService := h.ServiceForSKI(remoteSki)
 	if !handshakeCompleted && !remoteService.Trusted() {
 		return
 	}
@@ -62,14 +56,33 @@ func (h *Hub) HandleConnectionClosedWithAttempt(
 }
 
 func (h *Hub) removeExactConnection(connection api.ShipConnectionInterface) {
+	remoteSKI := connection.RemoteSKI()
+
 	h.muxCon.Lock()
-	existing := h.connections[connection.RemoteSKI()]
+	existing := h.connections[remoteSKI]
 	if existing != connection {
 		h.muxCon.Unlock()
 		return
 	}
-	delete(h.connections, connection.RemoteSKI())
+	delete(h.connections, remoteSKI)
 	h.muxCon.Unlock()
+}
+
+func (h *Hub) removeConnectionWithDataHandler(connection api.ShipConnectionInterface) bool {
+	remoteSKI := connection.RemoteSKI()
+	dataHandler := connection.DataHandler()
+
+	h.muxCon.Lock()
+	defer h.muxCon.Unlock()
+
+	existing := h.connections[remoteSKI]
+	if existing == nil {
+		return false
+	}
+	if existing.DataHandler() == dataHandler {
+		delete(h.connections, remoteSKI)
+	}
+	return true
 }
 
 // report the ship ID provided during the handshake
