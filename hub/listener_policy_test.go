@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"net/netip"
 	"sync"
 	"syscall"
@@ -13,6 +14,8 @@ import (
 	"time"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
+	"github.com/Project-Helianthus/helianthus-ship-go/cert"
+	"github.com/Project-Helianthus/helianthus-ship-go/mocks"
 )
 
 const listenerPolicyTestTimeout = 2 * time.Second
@@ -35,9 +38,19 @@ type listenerPolicyMDNS struct {
 	mu               sync.Mutex
 	calls            []string
 	startErr         error
+	configureErr     error
+	configuredPolicy *api.ListenerPolicy
 	onStart          func() error
 	onShutdown       func() error
 	shutdownCheckErr error
+}
+
+func (m *listenerPolicyMDNS) ConfigureListenerPolicy(policy api.ListenerPolicy) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	configured := policy
+	m.configuredPolicy = &configured
+	return m.configureErr
 }
 
 func (m *listenerPolicyMDNS) Start(api.MdnsReportInterface) error {
@@ -82,15 +95,29 @@ func (m *listenerPolicyMDNS) snapshot() ([]string, error) {
 	return append([]string(nil), m.calls...), m.shutdownCheckErr
 }
 
+func (m *listenerPolicyMDNS) configured() *api.ListenerPolicy {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.configuredPolicy == nil {
+		return nil
+	}
+	configured := *m.configuredPolicy
+	return &configured
+}
+
 func TestNewHubWithListenerPolicyRejectsUnsafeEndpointsWithoutEffects(t *testing.T) {
 	port := listenerPolicyAvailableEndpoint(t, netip.MustParseAddr("127.0.0.1")).Port()
 	tests := map[string]netip.AddrPort{
-		"invalid":          netip.AddrPortFrom(netip.Addr{}, port),
-		"zero port":        netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), 0),
-		"IPv4 unspecified": netip.AddrPortFrom(netip.IPv4Unspecified(), port),
-		"IPv6 unspecified": netip.AddrPortFrom(netip.IPv6Unspecified(), port),
-		"IPv4 multicast":   netip.AddrPortFrom(netip.MustParseAddr("224.0.0.251"), port),
-		"IPv6 multicast":   netip.AddrPortFrom(netip.MustParseAddr("ff02::fb"), port),
+		"invalid":           netip.AddrPortFrom(netip.Addr{}, port),
+		"zero port":         netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), 0),
+		"IPv4 unspecified":  netip.AddrPortFrom(netip.IPv4Unspecified(), port),
+		"IPv6 unspecified":  netip.AddrPortFrom(netip.IPv6Unspecified(), port),
+		"IPv4 multicast":    netip.AddrPortFrom(netip.MustParseAddr("224.0.0.251"), port),
+		"IPv6 multicast":    netip.AddrPortFrom(netip.MustParseAddr("ff02::fb"), port),
+		"IPv4 mapped":       netip.AddrPortFrom(netip.MustParseAddr("::ffff:127.0.0.1"), port),
+		"mapped wildcard":   netip.AddrPortFrom(netip.MustParseAddr("::ffff:0.0.0.0"), port),
+		"limited broadcast": netip.AddrPortFrom(netip.MustParseAddr("255.255.255.255"), port),
+		"this network":      netip.AddrPortFrom(netip.MustParseAddr("0.0.0.1"), port),
 	}
 
 	for name, endpoint := range tests {
@@ -117,9 +144,69 @@ func TestNewHubWithListenerPolicyRejectsUnsafeEndpointsWithoutEffects(t *testing
 	}
 }
 
+func TestNewHubWithListenerPolicyRejectsTypedNilMDNSWithoutEffects(t *testing.T) {
+	endpoint := listenerPolicyAvailableEndpoint(t, netip.MustParseAddr("127.0.0.1"))
+	var mdns *listenerPolicyMDNS
+	hub, err := NewHubWithListenerPolicy(
+		nil,
+		mdns,
+		int(endpoint.Port()),
+		tls.Certificate{},
+		api.NewServiceDetails("local-ski"),
+		api.ListenerPolicy{ListenAddress: endpoint, DiscoveryEnabled: true},
+	)
+	if err == nil {
+		t.Fatal("NewHubWithListenerPolicy accepted typed-nil mDNS")
+	}
+	if hub != nil {
+		t.Fatal("NewHubWithListenerPolicy returned a Hub for typed-nil mDNS")
+	}
+
+	listener := listenerPolicyListen(t, endpoint)
+	if err := listener.Close(); err != nil {
+		t.Fatalf("close typed-nil bind probe: %v", err)
+	}
+}
+
+func TestNewHubWithListenerPolicyRequiresScopedMDNSCapability(t *testing.T) {
+	endpoint := listenerPolicyAvailableEndpoint(t, netip.MustParseAddr("127.0.0.1"))
+	hub, err := NewHubWithListenerPolicy(
+		nil,
+		listenerPolicyNoDiscoveryMDNS{},
+		int(endpoint.Port()),
+		tls.Certificate{},
+		api.NewServiceDetails("local-ski"),
+		api.ListenerPolicy{ListenAddress: endpoint, DiscoveryEnabled: true},
+	)
+	if err == nil {
+		t.Fatal("NewHubWithListenerPolicy accepted mDNS without scoped capability")
+	}
+	if hub != nil {
+		t.Fatal("NewHubWithListenerPolicy returned a Hub without scoped mDNS capability")
+	}
+}
+
+func TestNewHubWithListenerPolicyConfiguresScopedMDNSWithoutRuntimeEffects(t *testing.T) {
+	endpoint := listenerPolicyAvailableEndpoint(t, netip.MustParseAddr("127.0.0.1"))
+	policy := api.ListenerPolicy{ListenAddress: endpoint, DiscoveryEnabled: true}
+	mdns := &listenerPolicyMDNS{}
+	hub := listenerPolicyNewHub(t, endpoint, true, mdns)
+	if configured := mdns.configured(); configured == nil || *configured != policy {
+		t.Fatalf("configured listener policy = %#v, want %#v", configured, policy)
+	}
+	if calls, _ := mdns.snapshot(); len(calls) != 0 {
+		t.Fatalf("constructor caused mDNS runtime effects: %v", calls)
+	}
+
+	hub.Shutdown()
+	if calls, _ := mdns.snapshot(); len(calls) != 0 {
+		t.Fatalf("shutdown before startup caused mDNS effects: %v", calls)
+	}
+}
+
 func TestNewHubWithListenerPolicyIsValidationOnlyAndOccupiedBindFailsSynchronously(t *testing.T) {
 	held := listenerPolicyListen(t, netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), 0))
-	defer held.Close()
+	defer func() { _ = held.Close() }()
 	endpoint := held.Addr().(*net.TCPAddr).AddrPort()
 	mdns := &listenerPolicyMDNS{}
 	hub := listenerPolicyNewHub(t, endpoint, true, mdns)
@@ -169,14 +256,11 @@ func TestStartWithPolicyBindsExactIPv4WithoutDiscovery(t *testing.T) {
 	t.Cleanup(hub.Shutdown)
 
 	listenerPolicyDial(t, endpoint)
+	if bound := listenerPolicyBoundEndpoint(t, hub); bound != endpoint {
+		t.Fatalf("bound listener endpoint = %s, want %s", bound, endpoint)
+	}
 	if calls, _ := mdns.snapshot(); len(calls) != 0 {
 		t.Fatalf("discovery-disabled startup caused mDNS effects: %v", calls)
-	}
-
-	alternate := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.2"), endpoint.Port())
-	alternateListener := listenerPolicyListen(t, alternate)
-	if err := alternateListener.Close(); err != nil {
-		t.Fatalf("close alternate listener: %v", err)
 	}
 
 	listenerPolicyShutdown(t, hub)
@@ -206,6 +290,9 @@ func TestStartWithPolicyBindsExactIPv6WhenSupported(t *testing.T) {
 	}
 	t.Cleanup(hub.Shutdown)
 	listenerPolicyDial(t, endpoint)
+	if bound := listenerPolicyBoundEndpoint(t, hub); bound != endpoint {
+		t.Fatalf("bound IPv6 listener endpoint = %s, want %s", bound, endpoint)
+	}
 	listenerPolicyShutdown(t, hub)
 
 	rebound := listenerPolicyListen(t, endpoint)
@@ -256,6 +343,10 @@ func TestStartWithPolicyRollsBackListenerOnInitialDiscoveryFailure(t *testing.T)
 	if !errors.Is(err, discoveryErr) {
 		t.Fatalf("StartWithPolicy error = %v, want discovery failure", err)
 	}
+	if retryErr := listenerPolicyStart(t, hub); !errors.Is(retryErr, errListenerPolicyHubTerminal) {
+		t.Fatalf("StartWithPolicy retry error = %v, want terminal error", retryErr)
+	}
+	hub.Start()
 	hub.Shutdown()
 	hub.Shutdown()
 
@@ -273,6 +364,113 @@ func TestStartWithPolicyRollsBackListenerOnInitialDiscoveryFailure(t *testing.T)
 	if err := rebound.Close(); err != nil {
 		t.Fatalf("close rebound listener: %v", err)
 	}
+}
+
+func TestUnexpectedServeTLSExitTerminalizesAndDoesNotDeadlockShutdown(t *testing.T) {
+	endpoint := listenerPolicyAvailableEndpoint(t, netip.MustParseAddr("127.0.0.1"))
+	serveStarted := make(chan struct{})
+	serveRelease := make(chan struct{})
+	mdnsShutdownStarted := make(chan struct{})
+	mdnsShutdownRelease := make(chan struct{})
+	mdns := &listenerPolicyMDNS{
+		onShutdown: func() error {
+			close(mdnsShutdownStarted)
+			<-mdnsShutdownRelease
+			return listenerPolicyRequireBound(endpoint)
+		},
+	}
+	hub := listenerPolicyNewHub(t, endpoint, true, mdns)
+	hub.listenerPolicyLifecycle.mu.Lock()
+	hub.listenerPolicyLifecycle.serveTLS = func(*http.Server, net.Listener) error {
+		close(serveStarted)
+		<-serveRelease
+		return errors.New("forced ServeTLS exit")
+	}
+	hub.listenerPolicyLifecycle.mu.Unlock()
+
+	if err := listenerPolicyStart(t, hub); err != nil {
+		t.Fatalf("StartWithPolicy() error = %v", err)
+	}
+	listenerPolicyWait(t, serveStarted, "ServeTLS start")
+
+	connection := mocks.NewShipConnectionInterface(t)
+	connection.EXPECT().RemoteSKI().Return("remote-ski").Once()
+	connection.EXPECT().CloseConnection(false, 0, "").Once()
+	hub.registerConnection(connection)
+
+	close(serveRelease)
+	listenerPolicyWait(t, mdnsShutdownStarted, "unexpected-exit mDNS withdrawal")
+	shutdownDone := make(chan struct{})
+	go func() {
+		hub.Shutdown()
+		close(shutdownDone)
+	}()
+	listenerPolicyWait(t, shutdownDone, "concurrent Shutdown")
+	close(mdnsShutdownRelease)
+	listenerPolicyWait(t, hub.listenerPolicyLifecycle.terminalDone, "terminal cleanup")
+
+	calls, shutdownCheckErr := mdns.snapshot()
+	if shutdownCheckErr != nil {
+		t.Errorf("listener closed before mDNS withdrawal: %v", shutdownCheckErr)
+	}
+	if got := listenerPolicyCount(calls, "shutdown"); got != 1 {
+		t.Errorf("mDNS Shutdown calls = %d, want 1; calls: %v", got, calls)
+	}
+	if retryErr := listenerPolicyStart(t, hub); !errors.Is(retryErr, errListenerPolicyHubTerminal) {
+		t.Fatalf("StartWithPolicy after ServeTLS exit = %v, want terminal error", retryErr)
+	}
+	rebound := listenerPolicyListen(t, endpoint)
+	if err := rebound.Close(); err != nil {
+		t.Fatalf("close rebound listener: %v", err)
+	}
+}
+
+func TestStartWithPolicyServesTLSOnExactListener(t *testing.T) {
+	endpoint := listenerPolicyAvailableEndpoint(t, netip.MustParseAddr("127.0.0.1"))
+	serverCertificate, err := cert.CreateCertificate("test-unit", "test-org", "DE", "listener-server")
+	if err != nil {
+		t.Fatalf("create server certificate: %v", err)
+	}
+	clientCertificate, err := cert.CreateCertificate("test-unit", "test-org", "DE", "listener-client")
+	if err != nil {
+		t.Fatalf("create client certificate: %v", err)
+	}
+	hub, err := NewHubWithListenerPolicy(
+		nil,
+		nil,
+		int(endpoint.Port()),
+		serverCertificate,
+		api.NewServiceDetails("local-ski"),
+		api.ListenerPolicy{ListenAddress: endpoint, DiscoveryEnabled: false},
+	)
+	if err != nil {
+		t.Fatalf("NewHubWithListenerPolicy() error = %v", err)
+	}
+	if err := listenerPolicyStart(t, hub); err != nil {
+		t.Fatalf("StartWithPolicy() error = %v", err)
+	}
+	t.Cleanup(hub.Shutdown)
+
+	ctx, cancel := context.WithTimeout(context.Background(), listenerPolicyTestTimeout)
+	defer cancel()
+	raw, err := (&net.Dialer{}).DialContext(ctx, "tcp4", endpoint.String())
+	if err != nil {
+		t.Fatalf("dial TLS listener: %v", err)
+	}
+	tlsConnection := tls.Client(raw, &tls.Config{
+		Certificates:       []tls.Certificate{clientCertificate},
+		InsecureSkipVerify: true,              // #nosec G402 -- self-signed SHIP test certificate
+		CipherSuites:       cert.CipherSuites, // #nosec G402 -- required by SHIP 9.1
+		MinVersion:         tls.VersionTLS12,
+	})
+	if err := tlsConnection.HandshakeContext(ctx); err != nil {
+		_ = tlsConnection.Close()
+		t.Fatalf("TLS handshake: %v", err)
+	}
+	if err := tlsConnection.Close(); err != nil {
+		t.Fatalf("close TLS connection: %v", err)
+	}
+	listenerPolicyShutdown(t, hub)
 }
 
 func TestLegacyNewHubAndStartRemainSourceCompatible(t *testing.T) {
@@ -337,6 +535,20 @@ func listenerPolicyDial(t *testing.T, endpoint netip.AddrPort) {
 	}
 }
 
+func listenerPolicyBoundEndpoint(t *testing.T, hub *Hub) netip.AddrPort {
+	t.Helper()
+	hub.listenerPolicyLifecycle.mu.Lock()
+	defer hub.listenerPolicyLifecycle.mu.Unlock()
+	if hub.listenerPolicyLifecycle.listener == nil {
+		t.Fatal("listener policy has no bound listener")
+	}
+	address, ok := hub.listenerPolicyLifecycle.listener.Addr().(*net.TCPAddr)
+	if !ok {
+		t.Fatalf("listener address type = %T, want *net.TCPAddr", hub.listenerPolicyLifecycle.listener.Addr())
+	}
+	return address.AddrPort()
+}
+
 func listenerPolicyRequireBound(endpoint netip.AddrPort) error {
 	listener, err := net.ListenTCP(listenerPolicyNetwork(endpoint.Addr()), net.TCPAddrFromAddrPort(endpoint))
 	if err == nil {
@@ -380,6 +592,15 @@ func listenerPolicyShutdown(t *testing.T, hub *Hub) {
 	case <-done:
 	case <-time.After(listenerPolicyTestTimeout):
 		t.Fatal("Shutdown did not return")
+	}
+}
+
+func listenerPolicyWait(t *testing.T, signal <-chan struct{}, operation string) {
+	t.Helper()
+	select {
+	case <-signal:
+	case <-time.After(listenerPolicyTestTimeout):
+		t.Fatalf("timed out waiting for %s", operation)
 	}
 }
 

@@ -33,6 +33,14 @@ type MdnsInterface interface {
 	RequestMdnsEntries()
 }
 
+// ListenerPolicyMdnsInterface is the optional mDNS capability required by
+// discovery-enabled listener policies. Configuration must not perform network,
+// filesystem, or goroutine work.
+type ListenerPolicyMdnsInterface interface {
+	MdnsInterface
+	ConfigureListenerPolicy(ListenerPolicy) error
+}
+
 // implemented by mdns, used by Providers
 type MdnsResolveCB func(elements map[string]string, name, host string, addresses []net.IP, port int, remove bool)
 

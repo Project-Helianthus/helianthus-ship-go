@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"reflect"
 	"sync"
 	"time"
 
@@ -15,14 +16,26 @@ import (
 	"github.com/Project-Helianthus/helianthus-ship-go/logging"
 )
 
+var errListenerPolicyHubTerminal = errors.New("listener policy hub is terminal")
+
 type listenerPolicyLifecycle struct {
 	mu sync.Mutex
 
 	listener       *listenerPolicyListener
 	server         *http.Server
 	serveDone      chan struct{}
+	terminalDone   chan struct{}
 	discoveryOwned bool
 	started        bool
+	finishOnce     sync.Once
+	serveTLS       func(*http.Server, net.Listener) error
+}
+
+type listenerPolicyResources struct {
+	listener       *listenerPolicyListener
+	server         *http.Server
+	serveDone      <-chan struct{}
+	discoveryOwned bool
 }
 
 type listenerPolicyListener struct {
@@ -61,8 +74,17 @@ func NewHubWithListenerPolicy(
 	if err := validateListenerPolicy(port, policy); err != nil {
 		return nil, err
 	}
-	if policy.DiscoveryEnabled && mdns == nil {
-		return nil, errors.New("listener policy requires mDNS when discovery is enabled")
+	if mdns != nil && isNilListenerPolicyMDNS(mdns) {
+		return nil, errors.New("listener policy mDNS is a typed nil")
+	}
+	if policy.DiscoveryEnabled {
+		policyMDNS, ok := mdns.(api.ListenerPolicyMdnsInterface)
+		if mdns == nil || !ok || isNilListenerPolicyMDNS(policyMDNS) {
+			return nil, errors.New("listener policy discovery requires scoped mDNS support")
+		}
+		if err := policyMDNS.ConfigureListenerPolicy(policy); err != nil {
+			return nil, fmt.Errorf("configure scoped mDNS: %w", err)
+		}
 	}
 	if !policy.DiscoveryEnabled {
 		mdns = listenerPolicyNoDiscoveryMDNS{}
@@ -70,6 +92,12 @@ func NewHubWithListenerPolicy(
 
 	hub := NewHub(hubReader, mdns, port, certificate, localService)
 	hub.listenerPolicy = &policy
+	hub.listenerPolicyLifecycle = listenerPolicyLifecycle{
+		terminalDone: make(chan struct{}),
+		serveTLS: func(server *http.Server, listener net.Listener) error {
+			return server.ServeTLS(listener, "", "")
+		},
+	}
 	return hub, nil
 }
 
@@ -82,11 +110,17 @@ func validateListenerPolicy(port int, policy api.ListenerPolicy) error {
 		return errors.New("listener policy port must be non-zero")
 	}
 	address := endpoint.Addr()
+	if address.Is4In6() {
+		return errors.New("listener policy address must not be IPv4-mapped IPv6")
+	}
 	if address.IsUnspecified() {
 		return errors.New("listener policy address must be specified")
 	}
 	if address.IsMulticast() {
 		return errors.New("listener policy address must not be multicast")
+	}
+	if !listenerPolicyAddressIsUnicast(address) {
+		return errors.New("listener policy address must be unicast")
 	}
 	if port != int(endpoint.Port()) {
 		return fmt.Errorf("listener policy port %d does not match legacy port %d", endpoint.Port(), port)
@@ -102,12 +136,13 @@ func (h *Hub) StartWithPolicy() error {
 
 	lifecycle := &h.listenerPolicyLifecycle
 	lifecycle.mu.Lock()
-	defer lifecycle.mu.Unlock()
 
 	if h.listenerPolicyShutdownClaimed() {
-		return errors.New("hub is shut down")
+		lifecycle.mu.Unlock()
+		return errListenerPolicyHubTerminal
 	}
 	if lifecycle.started {
+		lifecycle.mu.Unlock()
 		return nil
 	}
 
@@ -117,6 +152,7 @@ func (h *Hub) StartWithPolicy() error {
 		net.TCPAddrFromAddrPort(endpoint),
 	)
 	if err != nil {
+		lifecycle.mu.Unlock()
 		return fmt.Errorf("bind SHIP listener on %s: %w", endpoint, err)
 	}
 
@@ -128,13 +164,10 @@ func (h *Hub) StartWithPolicy() error {
 	if h.listenerPolicy.DiscoveryEnabled {
 		lifecycle.discoveryOwned = true
 		if err := h.mdns.Start(h); err != nil {
-			h.mdns.Shutdown()
-			lifecycle.discoveryOwned = false
-			if closeErr := listener.Close(); closeErr != nil && !errors.Is(closeErr, net.ErrClosed) {
-				logging.Log().Error("SHIP listener rollback:", closeErr)
-			}
-			lifecycle.listener = nil
-			lifecycle.server = nil
+			resources, connections, _ := h.claimListenerPolicyTerminationLocked()
+			lifecycle.mu.Unlock()
+			h.cleanupListenerPolicy(resources, connections)
+			h.finishListenerPolicyTermination()
 			return fmt.Errorf("start mDNS discovery: %w", err)
 		}
 	}
@@ -146,7 +179,10 @@ func (h *Hub) StartWithPolicy() error {
 	h.hasStarted = true
 	h.muxStarted.Unlock()
 
-	go h.serveListenerPolicy(server, listener, serveDone)
+	serveTLS := lifecycle.serveTLS
+	lifecycle.mu.Unlock()
+
+	go h.serveListenerPolicy(server, listener, serveDone, serveTLS)
 	return nil
 }
 
@@ -166,50 +202,104 @@ func (h *Hub) newListenerPolicyHTTPServer(endpoint netip.AddrPort) *http.Server 
 	}
 }
 
-func (h *Hub) serveListenerPolicy(server *http.Server, listener net.Listener, done chan<- struct{}) {
-	defer close(done)
-	if err := server.ServeTLS(listener, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		logging.Log().Error("websocket server error:", err)
+func (h *Hub) serveListenerPolicy(
+	server *http.Server,
+	listener net.Listener,
+	done chan<- struct{},
+	serveTLS func(*http.Server, net.Listener) error,
+) {
+	err := serveTLS(server, listener)
+	close(done)
+
+	if h.listenerPolicyShutdownClaimed() {
+		return
 	}
+	if err != nil && !errors.Is(err, http.ErrServerClosed) {
+		logging.Log().Error("websocket server error:", err)
+	} else {
+		logging.Log().Error("websocket server stopped unexpectedly")
+	}
+	h.terminateListenerPolicy()
 }
 
 func (h *Hub) shutdownWithListenerPolicy() {
+	h.terminateListenerPolicy()
+}
+
+func (h *Hub) terminateListenerPolicy() {
 	lifecycle := &h.listenerPolicyLifecycle
 	lifecycle.mu.Lock()
-	defer lifecycle.mu.Unlock()
-
-	connections, claimed := h.beginShutdown()
+	resources, connections, claimed := h.claimListenerPolicyTerminationLocked()
+	lifecycle.mu.Unlock()
 	if !claimed {
 		return
 	}
 
-	if lifecycle.discoveryOwned {
+	h.cleanupListenerPolicy(resources, connections)
+	h.finishListenerPolicyTermination()
+}
+
+func (h *Hub) claimListenerPolicyTerminationLocked() (
+	listenerPolicyResources,
+	[]api.ShipConnectionInterface,
+	bool,
+) {
+	connections, claimed := h.beginShutdown()
+	if !claimed {
+		return listenerPolicyResources{}, nil, false
+	}
+
+	lifecycle := &h.listenerPolicyLifecycle
+	resources := listenerPolicyResources{
+		listener:       lifecycle.listener,
+		server:         lifecycle.server,
+		serveDone:      lifecycle.serveDone,
+		discoveryOwned: lifecycle.discoveryOwned,
+	}
+	lifecycle.listener = nil
+	lifecycle.server = nil
+	lifecycle.serveDone = nil
+	lifecycle.discoveryOwned = false
+	lifecycle.started = false
+	return resources, connections, true
+}
+
+func (h *Hub) cleanupListenerPolicy(
+	resources listenerPolicyResources,
+	connections []api.ShipConnectionInterface,
+) {
+	if resources.discoveryOwned {
 		h.mdns.Shutdown()
-		lifecycle.discoveryOwned = false
 	}
 	for _, connection := range connections {
 		connection.CloseConnection(false, 0, "")
 	}
 
-	if lifecycle.server != nil {
-		if err := lifecycle.server.Close(); err != nil &&
+	if resources.server != nil {
+		if err := resources.server.Close(); err != nil &&
 			!errors.Is(err, http.ErrServerClosed) && !errors.Is(err, net.ErrClosed) {
 			logging.Log().Error("HTTP server close:", err)
 		}
 	}
-	if lifecycle.listener != nil {
-		if err := lifecycle.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+	if resources.listener != nil {
+		if err := resources.listener.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			logging.Log().Error("SHIP listener close:", err)
 		}
 	}
-	if lifecycle.serveDone != nil {
-		<-lifecycle.serveDone
+	if resources.serveDone != nil {
+		<-resources.serveDone
 	}
+}
 
-	lifecycle.listener = nil
-	lifecycle.server = nil
-	lifecycle.serveDone = nil
-	lifecycle.started = false
+func (h *Hub) finishListenerPolicyTermination() {
+	h.muxStarted.Lock()
+	h.hasStarted = false
+	h.muxStarted.Unlock()
+
+	lifecycle := &h.listenerPolicyLifecycle
+	lifecycle.finishOnce.Do(func() {
+		close(lifecycle.terminalDone)
+	})
 }
 
 func (h *Hub) listenerPolicyShutdownClaimed() bool {
@@ -223,4 +313,24 @@ func listenerPolicyTCPNetwork(address netip.Addr) string {
 		return "tcp4"
 	}
 	return "tcp6"
+}
+
+func listenerPolicyAddressIsUnicast(address netip.Addr) bool {
+	if address.Is4() {
+		value := address.As4()
+		if value[0] == 0 || value == [4]byte{255, 255, 255, 255} {
+			return false
+		}
+	}
+	return address.IsGlobalUnicast() || address.IsLoopback() || address.IsLinkLocalUnicast()
+}
+
+func isNilListenerPolicyMDNS(value any) bool {
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
 }

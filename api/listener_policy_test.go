@@ -29,3 +29,25 @@ func TestListenerPolicyHasMinimalDependencyFreeShape(t *testing.T) {
 		}
 	}
 }
+
+func TestListenerPolicyMdnsInterfaceIsAdditive(t *testing.T) {
+	legacy := reflect.TypeOf((*api.MdnsInterface)(nil)).Elem()
+	scoped := reflect.TypeOf((*api.ListenerPolicyMdnsInterface)(nil)).Elem()
+	if scoped.NumMethod() != legacy.NumMethod()+1 {
+		t.Fatalf("ListenerPolicyMdnsInterface has %d methods, want %d", scoped.NumMethod(), legacy.NumMethod()+1)
+	}
+	for index := range legacy.NumMethod() {
+		method := legacy.Method(index)
+		if _, ok := scoped.MethodByName(method.Name); !ok {
+			t.Errorf("ListenerPolicyMdnsInterface does not embed MdnsInterface.%s", method.Name)
+		}
+	}
+	configure, ok := scoped.MethodByName("ConfigureListenerPolicy")
+	if !ok {
+		t.Fatal("ListenerPolicyMdnsInterface is missing ConfigureListenerPolicy")
+	}
+	want := reflect.TypeOf(func(api.ListenerPolicy) error { return nil })
+	if configure.Type != want {
+		t.Fatalf("ConfigureListenerPolicy type = %v, want %v", configure.Type, want)
+	}
+}
