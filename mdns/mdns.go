@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"sync"
@@ -64,6 +65,19 @@ type MdnsManager struct {
 	mdnsProvider api.MdnsProviderInterface
 
 	shutdownOnce sync.Once
+	lifecycleMu  sync.Mutex
+	startClaimed bool
+	terminal     bool
+
+	listenerPolicy *api.ListenerPolicy
+	signalC        chan os.Signal
+	signalStop     chan struct{}
+	signalDone     chan struct{}
+
+	newAvahiProvider          func([]int32) api.MdnsProviderInterface
+	newZeroconfProvider       func([]net.Interface) api.MdnsProviderInterface
+	newScopedZeroconfProvider func([]net.Interface, string, netip.Addr) api.MdnsProviderInterface
+	hostname                  func() (string, error)
 
 	providerSelection MdnsProviderSelection
 
@@ -87,6 +101,16 @@ func NewMDNS(
 		ifaces:            ifaces,
 		providerSelection: providerSelection,
 		entries:           make(map[string]*api.MdnsEntry),
+		newAvahiProvider: func(indexes []int32) api.MdnsProviderInterface {
+			return NewAvahiProvider(indexes)
+		},
+		newZeroconfProvider: func(ifaces []net.Interface) api.MdnsProviderInterface {
+			return NewZeroconfProvider(ifaces)
+		},
+		newScopedZeroconfProvider: func(ifaces []net.Interface, host string, address netip.Addr) api.MdnsProviderInterface {
+			return newScopedZeroconfProvider(ifaces, host, address)
+		},
+		hostname: os.Hostname,
 	}
 
 	return m
@@ -120,36 +144,21 @@ func (m *MdnsManager) interfaces() ([]net.Interface, []int32, error) {
 }
 
 var _ api.MdnsInterface = (*MdnsManager)(nil)
+var _ api.ListenerPolicyMdnsInterface = (*MdnsManager)(nil)
 
 func (m *MdnsManager) Start(cb api.MdnsReportInterface) error {
-	ifaces, ifaceIndexes, err := m.interfaces()
+	policy, scoped, err := m.claimStart(cb)
 	if err != nil {
 		return err
 	}
 
-	switch m.providerSelection {
-	case MdnsProviderSelectionAll:
-		// First try avahi, if not available use zerconf
-		provider := NewAvahiProvider(ifaceIndexes)
-		if provider.Start(false, m.processMdnsEntry) {
-			m.mdnsProvider = provider
-		} else {
-			provider.Shutdown()
-
-			// Avahi is not availble, use Zeroconf
-			m.mdnsProvider = NewZeroconfProvider(ifaces)
-			if !m.mdnsProvider.Start(false, m.processMdnsEntry) {
-				return errors.New("No mDNS provider available")
-			}
-		}
-	case MdnsProviderSelectionAvahiOnly:
-		// Only use Avahi
-		m.mdnsProvider = NewAvahiProvider(ifaceIndexes)
-		_ = m.mdnsProvider.Start(true, m.processMdnsEntry)
-	case MdnsProviderSelectionGoZeroConfOnly:
-		// Only use Zeroconf
-		m.mdnsProvider = NewZeroconfProvider(ifaces)
-		_ = m.mdnsProvider.Start(true, m.processMdnsEntry)
+	provider, err := m.startProvider(policy, scoped)
+	if err != nil {
+		return err
+	}
+	if err := m.installProvider(provider); err != nil {
+		provider.Shutdown()
+		return err
 	}
 
 	// on startup always start mDNS announcement
@@ -157,39 +166,176 @@ func (m *MdnsManager) Start(cb api.MdnsReportInterface) error {
 		return err
 	}
 
+	if err := m.installSignalHandler(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (m *MdnsManager) claimStart(cb api.MdnsReportInterface) (api.ListenerPolicy, bool, error) {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+
+	if m.terminal || m.startClaimed {
+		return api.ListenerPolicy{}, false, errors.New("mDNS manager is one-shot and already used")
+	}
+	m.startClaimed = true
 	m.report = cb
+	if m.listenerPolicy == nil {
+		return api.ListenerPolicy{}, false, nil
+	}
+	policy := *m.listenerPolicy
+	return policy, true, nil
+}
 
-	// catch signals
-	go func() {
-		signalC := make(chan os.Signal, 1)
-		signal.Notify(signalC, os.Interrupt, syscall.SIGTERM)
+func (m *MdnsManager) startProvider(policy api.ListenerPolicy, scoped bool) (api.MdnsProviderInterface, error) {
+	if scoped {
+		if m.providerSelection == MdnsProviderSelectionAvahiOnly {
+			return nil, errors.New("scoped listener discovery is unsupported by AvahiOnly")
+		}
+		iface, err := m.listenerPolicyInterface(policy.ListenAddress.Addr())
+		if err != nil {
+			return nil, err
+		}
+		host, err := m.hostname()
+		if err != nil {
+			return nil, fmt.Errorf("resolve mDNS hostname: %w", err)
+		}
+		provider := m.newScopedZeroconfProvider(
+			[]net.Interface{iface},
+			host,
+			policy.ListenAddress.Addr().WithZone(""),
+		)
+		if !provider.Start(true, m.processMdnsEntry) {
+			provider.Shutdown()
+			return nil, errors.New("scoped Zeroconf provider unavailable")
+		}
+		return provider, nil
+	}
 
-		<-signalC // wait for signal
+	ifaces, ifaceIndexes, err := m.interfaces()
+	if err != nil {
+		return nil, err
+	}
 
-		m.Shutdown()
-	}()
+	switch m.providerSelection {
+	case MdnsProviderSelectionAll:
+		provider := m.newAvahiProvider(ifaceIndexes)
+		if provider.Start(false, m.processMdnsEntry) {
+			return provider, nil
+		}
+		provider.Shutdown()
 
+		provider = m.newZeroconfProvider(ifaces)
+		if !provider.Start(false, m.processMdnsEntry) {
+			provider.Shutdown()
+			return nil, errors.New("no mDNS provider available")
+		}
+		return provider, nil
+	case MdnsProviderSelectionAvahiOnly:
+		provider := m.newAvahiProvider(ifaceIndexes)
+		if !provider.Start(true, m.processMdnsEntry) {
+			provider.Shutdown()
+			return nil, errors.New("avahi mDNS provider is unavailable")
+		}
+		return provider, nil
+	case MdnsProviderSelectionGoZeroConfOnly:
+		provider := m.newZeroconfProvider(ifaces)
+		if !provider.Start(true, m.processMdnsEntry) {
+			provider.Shutdown()
+			return nil, errors.New("zeroconf mDNS provider is unavailable")
+		}
+		return provider, nil
+	default:
+		return nil, fmt.Errorf("unknown mDNS provider selection %d", m.providerSelection)
+	}
+}
+
+func (m *MdnsManager) installProvider(provider api.MdnsProviderInterface) error {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	if m.terminal {
+		return errors.New("mDNS manager is shut down")
+	}
+	m.mdnsProvider = provider
 	return nil
 }
 
 // Shutdown all of mDNS
 func (m *MdnsManager) Shutdown() {
 	m.shutdownOnce.Do(func() {
-		m.UnannounceMdnsEntry()
+		m.lifecycleMu.Lock()
+		m.terminal = true
+		provider := m.mdnsProvider
+		m.mdnsProvider = nil
+		signalC := m.signalC
+		signalStop := m.signalStop
+		signalDone := m.signalDone
+		m.signalC = nil
+		m.signalStop = nil
+		m.signalDone = nil
+		m.lifecycleMu.Unlock()
 
-		if m.mdnsProvider == nil {
-			return
+		if signalC != nil {
+			signal.Stop(signalC)
+		}
+		if signalStop != nil {
+			close(signalStop)
+		}
+		if signalDone != nil {
+			<-signalDone
 		}
 
-		m.mdnsProvider.Shutdown()
-		m.mdnsProvider = nil
+		if provider == nil {
+			return
+		}
+		if m.isServiceAnnounced() {
+			provider.Unannounce()
+			m.setIsServiceAnnounce(false)
+		}
+		provider.Shutdown()
 	})
+}
+
+func (m *MdnsManager) installSignalHandler() error {
+	signalC := make(chan os.Signal, 1)
+	signalStop := make(chan struct{})
+	signalDone := make(chan struct{})
+	signal.Notify(signalC, os.Interrupt, syscall.SIGTERM)
+
+	m.lifecycleMu.Lock()
+	if m.terminal {
+		m.lifecycleMu.Unlock()
+		signal.Stop(signalC)
+		return errors.New("mDNS manager is shut down")
+	}
+	m.signalC = signalC
+	m.signalStop = signalStop
+	m.signalDone = signalDone
+	m.lifecycleMu.Unlock()
+
+	go m.runSignalHandler(signalC, signalStop, signalDone)
+	return nil
+}
+
+func (m *MdnsManager) runSignalHandler(signalC <-chan os.Signal, stop <-chan struct{}, done chan<- struct{}) {
+	select {
+	case <-signalC:
+		close(done)
+		m.Shutdown()
+	case <-stop:
+		close(done)
+	}
 }
 
 // Announces the service to the network via mDNS
 // A CEM service should always invoke this on startup
 // Any other service should only invoke this whenever it is not connected to a CEM service
 func (m *MdnsManager) AnnounceMdnsEntry() error {
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+
 	if m.mdnsProvider == nil {
 		return nil
 	}
@@ -226,7 +372,12 @@ func (m *MdnsManager) AnnounceMdnsEntry() error {
 
 // Stop the mDNS announcement on the network
 func (m *MdnsManager) UnannounceMdnsEntry() {
-	if !m.isServiceAnnounced() || m.mdnsProvider == nil {
+	if !m.isServiceAnnounced() {
+		return
+	}
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	if m.mdnsProvider == nil {
 		return
 	}
 

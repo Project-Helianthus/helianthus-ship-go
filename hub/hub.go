@@ -53,6 +53,9 @@ type Hub struct {
 	// The web server for handling incoming websocket connections
 	httpServer *http.Server
 
+	listenerPolicy          *api.ListenerPolicy
+	listenerPolicyLifecycle listenerPolicyLifecycle
+
 	// Handling mDNS related tasks
 	mdns api.MdnsInterface
 
@@ -121,6 +124,13 @@ func (h *Hub) configuredOutgoingAttemptGate() api.OutgoingAttemptGate {
 
 // Start the ConnectionsHub with all its services
 func (h *Hub) Start() {
+	if h.listenerPolicy != nil {
+		if err := h.StartWithPolicy(); err != nil {
+			logging.Log().Debug("error during listener policy startup:", err)
+		}
+		return
+	}
+
 	h.muxStarted.Lock()
 	h.hasStarted = true
 	h.muxStarted.Unlock()
@@ -139,6 +149,11 @@ func (h *Hub) Start() {
 
 // close all connections
 func (h *Hub) Shutdown() {
+	if h.listenerPolicy != nil {
+		h.shutdownWithListenerPolicy()
+		return
+	}
+
 	connections, started := h.beginShutdown()
 	if !started {
 		return
