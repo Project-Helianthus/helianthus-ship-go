@@ -14,6 +14,7 @@ var (
 	errInvalidRemoteSKI      = errors.New("remote SKI must contain 40 hexadecimal characters")
 	errInvalidRemoteEndpoint = errors.New("remote endpoint is invalid")
 	errRemoteNotAdmitted     = errors.New("remote is neither queued nor trusted")
+	errOutboundGateRequired  = errors.New("outbound pairing requires an attempt gate")
 )
 
 var _ api.OutboundPairingController = (*Hub)(nil)
@@ -21,6 +22,9 @@ var _ api.OutboundPairingController = (*Hub)(nil)
 // QueueRemoteSKI admits one untrusted peer for a locally initiated pairing
 // attempt. Durable trust remains owned by RegisterRemoteSKI.
 func (h *Hub) QueueRemoteSKI(ski string) error {
+	if h.configuredOutgoingAttemptGate() == nil {
+		return errOutboundGateRequired
+	}
 	normalized, err := validOutboundSKI(ski)
 	if err != nil {
 		return err
@@ -42,6 +46,9 @@ func (h *Hub) QueueRemoteSKI(ski string) error {
 // ReportRemoteEndpoint provides endpoint evidence without changing pairing or
 // trust state. Existing admission checks still gate connection initiation.
 func (h *Hub) ReportRemoteEndpoint(ski string, endpoint api.RemoteEndpoint) error {
+	if h.configuredOutgoingAttemptGate() == nil {
+		return errOutboundGateRequired
+	}
 	normalized, err := validOutboundSKI(ski)
 	if err != nil {
 		return err

@@ -158,6 +158,9 @@ func (s *HubSuite) Test_PairingRegistrationDoesNotEnableAutoAccept() {
 func (s *HubSuite) Test_QueueRemoteSKILeavesTrustFalseAndRequestsDiscovery() {
 	const remoteSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
 
+	s.sut.muxAttemptGate.Lock()
+	s.sut.outgoingAttemptGate = newScriptedAttemptGate(gateAuthorizeDeny)
+	s.sut.muxAttemptGate.Unlock()
 	s.sut.muxStarted.Lock()
 	s.sut.hasStarted = true
 	s.sut.muxStarted.Unlock()
@@ -176,6 +179,9 @@ func (s *HubSuite) Test_ReportRemoteEndpointDoesNotGrantTrust() {
 	const remoteSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
 	endpoint := api.RemoteEndpoint{Host: "192.168.100.21", Port: 12480, Path: "/ship/"}
 
+	s.sut.muxAttemptGate.Lock()
+	s.sut.outgoingAttemptGate = newScriptedAttemptGate(gateAuthorizeDeny)
+	s.sut.muxAttemptGate.Unlock()
 	assert.NoError(s.T(), s.sut.QueueRemoteSKI(remoteSKI))
 	s.sut.setConnectionAttemptRunning(remoteSKI, true)
 	err := s.sut.ReportRemoteEndpoint(remoteSKI, endpoint)
@@ -197,6 +203,9 @@ func (s *HubSuite) Test_ReportRemoteEndpointRejectsUnqueuedRemote() {
 	const remoteSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
 	endpoint := api.RemoteEndpoint{Host: "192.168.100.21", Port: 12480, Path: "/ship/"}
 
+	s.sut.muxAttemptGate.Lock()
+	s.sut.outgoingAttemptGate = newScriptedAttemptGate(gateAuthorizeDeny)
+	s.sut.muxAttemptGate.Unlock()
 	assert.ErrorIs(s.T(), s.sut.ReportRemoteEndpoint(remoteSKI, endpoint), errRemoteNotAdmitted)
 	assert.False(s.T(), s.sut.ServiceForSKI(remoteSKI).Trusted())
 }
@@ -205,10 +214,22 @@ func (s *HubSuite) Test_QueueRemoteSKIRejectsTrustedRemoteWithoutDowngrade() {
 	const remoteSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
 	remote := s.sut.ServiceForSKI(remoteSKI)
 	remote.SetTrusted(true)
+	s.sut.muxAttemptGate.Lock()
+	s.sut.outgoingAttemptGate = newScriptedAttemptGate(gateAuthorizeDeny)
+	s.sut.muxAttemptGate.Unlock()
 
 	assert.Error(s.T(), s.sut.QueueRemoteSKI(remoteSKI))
 	assert.True(s.T(), remote.Trusted())
 	assert.NotEqual(s.T(), api.ConnectionStateQueued, remote.ConnectionStateDetail().State())
+}
+
+func (s *HubSuite) Test_OutboundPairingRequiresAttemptGate() {
+	const remoteSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
+	endpoint := api.RemoteEndpoint{Host: "192.168.100.21", Port: 12480, Path: "/ship/"}
+
+	assert.ErrorIs(s.T(), s.sut.QueueRemoteSKI(remoteSKI), errOutboundGateRequired)
+	assert.ErrorIs(s.T(), s.sut.ReportRemoteEndpoint(remoteSKI, endpoint), errOutboundGateRequired)
+	assert.False(s.T(), s.sut.ServiceForSKI(remoteSKI).Trusted())
 }
 
 type requestRecordingMDNS struct {
@@ -222,6 +243,9 @@ func (m *requestRecordingMDNS) RequestMdnsEntries() {
 
 func (s *HubSuite) Test_ReportRemoteEndpointRejectsInvalidInput() {
 	const remoteSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
+	s.sut.muxAttemptGate.Lock()
+	s.sut.outgoingAttemptGate = newScriptedAttemptGate(gateAuthorizeDeny)
+	s.sut.muxAttemptGate.Unlock()
 	tests := []struct {
 		name     string
 		ski      string
