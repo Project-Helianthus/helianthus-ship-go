@@ -2,7 +2,6 @@ package hub
 
 import (
 	"testing"
-	"time"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
 	"github.com/Project-Helianthus/helianthus-ship-go/model"
@@ -81,39 +80,116 @@ func TestOutboundPairingPermitCarriesExactEndpointWithoutTrustPromotion(t *testi
 }
 
 func TestOutboundPairingCancellationBeforeLaunchPreventsDial(t *testing.T) {
-	gate := newScriptedAttemptGate(gatePermit)
-	gate.authorizeEntered = make(chan struct{})
-	gate.authorizeRelease = make(chan struct{})
-	dialer := &fakePeerDialer{err: errAttemptTestDial}
-	hub, _, _ := newAttemptTestHub(t, gate, dialer)
+	tests := []struct {
+		name       string
+		invalidate func(*Hub)
+	}{
+		{
+			name: "cancel pairing",
+			invalidate: func(hub *Hub) {
+				hub.CancelPairingWithSKI(outboundPairingTestSKI)
+			},
+		},
+		{
+			name: "unregister remote",
+			invalidate: func(hub *Hub) {
+				hub.UnregisterRemoteSKI(outboundPairingTestSKI)
+			},
+		},
+	}
 
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gate := newScriptedAttemptGate(gatePermit)
+			gate.authorizeEntered = make(chan struct{})
+			gate.authorizeRelease = make(chan struct{})
+			t.Cleanup(func() {
+				select {
+				case <-gate.authorizeRelease:
+				default:
+					close(gate.authorizeRelease)
+				}
+			})
+			dialer := &fakePeerDialer{err: errAttemptTestDial}
+			hub, _, remote := newAttemptTestHub(t, gate, dialer)
+			queueOutboundPairingWithoutBackgroundDial(t, hub)
+
+			result := make(chan error, 1)
+			go func() {
+				result <- hub.connectFoundService(remote, outboundPairingTestEndpoint.Host, "54321", outboundPairingTestEndpoint.Path)
+			}()
+
+			waitForSignal(t, gate.authorizeEntered)
+			test.invalidate(hub)
+			close(gate.authorizeRelease)
+			assertTypedAttemptDenial(t, waitForError(t, result))
+
+			calls, peerEffects := dialer.snapshot()
+			if len(calls) != 0 || peerEffects != 0 {
+				t.Fatalf("invalidated endpoint dial/peer effects = %d/%d, want 0/0", len(calls), peerEffects)
+			}
+			if remote.Trusted() || remote.ConnectionStateDetail().State() == api.ConnectionStateQueued {
+				t.Fatal("invalidation retained trust or queued admission")
+			}
+		})
+	}
+}
+
+func TestOutboundPairingGateLifecycleChangeBeforeAuthorizationPreventsDial(t *testing.T) {
+	tests := []struct {
+		name        string
+		reconfigure func(*testing.T, *Hub)
+	}{
+		{
+			name: "gate removed",
+			reconfigure: func(t *testing.T, hub *Hub) {
+				t.Helper()
+				if err := hub.SetOutgoingAttemptGate(nil); err != nil {
+					t.Fatalf("remove outgoing attempt gate: %v", err)
+				}
+			},
+		},
+		{
+			name: "gate replaced",
+			reconfigure: func(t *testing.T, hub *Hub) {
+				t.Helper()
+				if err := hub.SetOutgoingAttemptGate(newScriptedAttemptGate(gatePermit)); err != nil {
+					t.Fatalf("replace outgoing attempt gate: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			gate := newScriptedAttemptGate(gatePermit)
+			dialer := &fakePeerDialer{err: errAttemptTestDial}
+			hub, _, remote := newAttemptTestHub(t, gate, dialer)
+			queueOutboundPairingWithoutBackgroundDial(t, hub)
+
+			test.reconfigure(t, hub)
+			err := hub.connectFoundService(remote, outboundPairingTestEndpoint.Host, "54321", outboundPairingTestEndpoint.Path)
+			assertTypedAttemptDenial(t, err)
+
+			calls, peerEffects := dialer.snapshot()
+			if len(calls) != 0 || peerEffects != 0 {
+				t.Fatalf("stale admission dial/peer effects = %d/%d, want 0/0", len(calls), peerEffects)
+			}
+			if remote.Trusted() {
+				t.Fatal("stale admission promoted trust")
+			}
+		})
+	}
+}
+
+func queueOutboundPairingWithoutBackgroundDial(t *testing.T, hub *Hub) {
+	t.Helper()
 	if err := hub.QueueRemoteSKI(outboundPairingTestSKI); err != nil {
 		t.Fatalf("queue remote: %v", err)
 	}
+	hub.setConnectionAttemptRunning(outboundPairingTestSKI, true)
 	if err := hub.ReportRemoteEndpoint(outboundPairingTestSKI, outboundPairingTestEndpoint); err != nil {
 		t.Fatalf("report endpoint: %v", err)
-	}
-	waitForSignal(t, gate.authorizeEntered)
-	hub.CancelPairingWithSKI(outboundPairingTestSKI)
-	gate.cancelLatest(t)
-	close(gate.authorizeRelease)
-
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		_, authorized, _, _ := gate.snapshot()
-		if len(authorized) > 0 {
-			break
-		}
-		time.Sleep(time.Millisecond)
-	}
-	time.Sleep(10 * time.Millisecond)
-	calls, peerEffects := dialer.snapshot()
-	if len(calls) != 0 || peerEffects != 0 {
-		t.Fatalf("canceled endpoint dial/peer effects = %d/%d, want 0/0", len(calls), peerEffects)
-	}
-	remote := hub.ServiceForSKI(outboundPairingTestSKI)
-	if remote.Trusted() || remote.ConnectionStateDetail().State() == api.ConnectionStateQueued {
-		t.Fatal("cancellation retained trust or queued admission")
 	}
 }
 
