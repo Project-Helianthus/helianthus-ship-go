@@ -118,13 +118,13 @@ func TestScopedZeroconfReannounceShutsDownPreviousServer(t *testing.T) {
 	provider := newScopedZeroconfProvider([]net.Interface{iface}, "repeat-test-host", address)
 	defer provider.Shutdown()
 
-	if err := provider.Announce("repeat-test", 4712, []string{"register=false"}); err != nil {
+	if err := provider.Announce("repeat-test", 4712, []string{"register=true"}); err != nil {
 		t.Fatalf("first Announce() error = %v", err)
 	}
 	first := provider.zc
 	defer first.Shutdown()
 
-	if err := provider.Announce("repeat-test", 4712, []string{"register=true"}); err != nil {
+	if err := provider.Announce("repeat-test", 4712, []string{"register=false"}); err != nil {
 		t.Fatalf("second Announce() error = %v", err)
 	}
 	if first == provider.zc {
