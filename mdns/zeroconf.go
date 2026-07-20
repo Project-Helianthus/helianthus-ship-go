@@ -110,9 +110,13 @@ func (z *ZeroconfProvider) Announce(serviceName string, port int, txt []string) 
 	}
 
 	z.mux.Lock()
-	defer z.mux.Unlock()
-
+	previousServer := z.zc
 	z.zc = mDNSServer
+	z.mux.Unlock()
+
+	if previousServer != nil {
+		previousServer.Shutdown()
+	}
 
 	return nil
 }

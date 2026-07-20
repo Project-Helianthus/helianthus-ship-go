@@ -39,6 +39,7 @@ type authorizedOutgoingAttempt struct {
 	remoteSKI         string
 	metadata          api.OutgoingAttemptMetadata
 	context           context.Context
+	registration      *outboundAttemptRegistration
 	terminal          sync.Once
 	terminalSucceeded bool
 }
@@ -48,6 +49,7 @@ func (a *authorizedOutgoingAttempt) terminalFailure(h *Hub) bool {
 		return true
 	}
 	a.terminal.Do(func() {
+		h.releaseOutboundAttemptRegistration(a.remoteSKI, a.registration)
 		a.terminalSucceeded = h.reportOutgoingAttemptTerminalFailure(a.remoteSKI, a.metadata)
 	})
 	return a.terminalSucceeded
@@ -211,8 +213,27 @@ func (h *Hub) isSkiConnected(ski string) bool {
 //
 // returns error contains a reason for failing the connection or nil if no further tries should be processed
 func (h *Hub) connectFoundService(remoteService *api.ServiceDetails, host, port, path string) error {
-	if h.isSkiConnected(remoteService.SKI()) {
-		return nil
+	if ski := remoteService.SKI(); ski != "" {
+		h.muxCon.Lock()
+		if h.hasShutdown {
+			h.muxCon.Unlock()
+			return outgoingAttemptDeniedError{}
+		}
+		if _, connected := h.connections[ski]; connected || h.connectionsInitiating[ski] {
+			h.muxCon.Unlock()
+			return nil
+		}
+		if h.connectionsInitiating == nil {
+			h.connectionsInitiating = make(map[string]bool)
+		}
+		h.connectionsInitiating[ski] = true
+		h.muxCon.Unlock()
+
+		defer func() {
+			h.muxCon.Lock()
+			delete(h.connectionsInitiating, ski)
+			h.muxCon.Unlock()
+		}()
 	}
 
 	logging.Log().Debugf("initiating connection to %s at %s:%s%s", remoteService.SKI(), host, port, path)
@@ -319,6 +340,9 @@ func (h *Hub) connectFoundService(remoteService *api.ServiceDetails, host, port,
 	if configurationErr != nil {
 		return failBeforeConnection(errOutgoingAttemptFailed)
 	}
+	if !h.bindOutboundAttemptConnection(remoteService.SKI(), attempt.registration, shipConnection) {
+		return failBeforeConnection(outgoingAttemptDeniedError{})
+	}
 
 	registered := h.registerOutgoingConnection(shipConnection, attempt.context)
 	shipConnection.Run()
@@ -342,7 +366,10 @@ func (h *Hub) gatedDialContext(
 		return nil, nil, nil, outgoingAttemptDeniedError{}
 	}
 
-	gate := h.configuredOutgoingAttemptGate()
+	gate, gateGeneration, authority, admission, requireAdmission, admissionValid := h.outgoingAttemptGateSnapshot(remoteService)
+	if !admissionValid {
+		return nil, nil, nil, outgoingAttemptDeniedError{}
+	}
 	permit := api.OutgoingAttemptPermit{Context: context.Background()}
 	address := fmt.Sprintf("wss://%s:%s%s", host, port, path)
 	defer func() {
@@ -425,6 +452,22 @@ func (h *Hub) gatedDialContext(
 			abortOutgoingAttempt(gate, handle)
 			return nil, nil, nil, outgoingAttemptDeniedError{}
 		}
+		registration, registered := h.registerOutboundAttemptForLaunch(
+			remoteService.SKI(),
+			gateGeneration,
+			authority,
+			admission,
+			requireAdmission,
+			expectedMetadata,
+			permit.Context,
+		)
+		if !registered {
+			attempt.terminalFailure(h)
+			return nil, nil, attempt, outgoingAttemptDeniedError{}
+		}
+		attempt.context = registration.context
+		attempt.registration = registration
+		permit.Context = registration.context
 	}
 
 	connection, response, err = h.dialer.DialContext(permit.Context, address, nil)

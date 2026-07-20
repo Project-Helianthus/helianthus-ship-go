@@ -47,6 +47,7 @@ func (h *Hub) HandleConnectionClosedWithAttempt(
 	handshakeCompleted bool,
 	metadata api.OutgoingAttemptMetadata,
 ) {
+	h.releaseOutboundAttemptForConnection(connection.RemoteSKI(), connection, metadata)
 	if reader, ok := h.hubReader.(api.OutgoingAttemptHubReaderInterface); ok {
 		h.removeExactConnection(connection)
 		reader.OutgoingAttemptConnectionClosed(connection.RemoteSKI(), handshakeCompleted, metadata)

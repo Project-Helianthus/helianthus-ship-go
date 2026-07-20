@@ -22,7 +22,8 @@ func TestMdnsSuite(t *testing.T) {
 type MdnsSuite struct {
 	suite.Suite
 
-	sut *MdnsManager
+	sut           *MdnsManager
+	announcements [][]string
 
 	mdnsService  *mocks.MdnsInterface
 	mdnsSearch   *mocks.MdnsReportInterface
@@ -38,7 +39,13 @@ func (s *MdnsSuite) BeforeTest(suiteName, testName string) {
 	s.mdnsProvider = mocks.NewMdnsProviderInterface(s.T())
 	s.mdnsProvider.On("ResolveEntries", mock.Anything, mock.Anything).Maybe().Return()
 	s.mdnsProvider.On("Start", mock.Anything, mock.Anything).Maybe().Return(true)
-	s.mdnsProvider.On("Announce", mock.Anything, mock.Anything, mock.Anything).Maybe().Return(nil)
+	s.mdnsProvider.On("Announce", mock.Anything, mock.Anything, mock.Anything).
+		Run(func(args mock.Arguments) {
+			txt := append([]string(nil), args.Get(2).([]string)...)
+			s.announcements = append(s.announcements, txt)
+		}).
+		Maybe().
+		Return(nil)
 	s.mdnsProvider.On("Unannounce").Maybe().Return()
 	s.mdnsProvider.On("Shutdown").Maybe().Return()
 
@@ -82,6 +89,27 @@ func (s *MdnsSuite) Test_GoZeroConfOnly() {
 
 	s.sut.SetAutoAccept(true)
 	assert.True(s.T(), s.sut.autoaccept)
+}
+
+func (s *MdnsSuite) Test_PairingRegistrationComposesWithAutoAccept() {
+	err := s.sut.Start(s.mdnsSearch)
+	assert.NoError(s.T(), err)
+	assert.Contains(s.T(), s.announcements[len(s.announcements)-1], "register=false")
+
+	err = s.sut.SetPairingRegistration(true)
+	assert.NoError(s.T(), err)
+	assert.Contains(s.T(), s.announcements[len(s.announcements)-1], "register=true")
+
+	s.sut.SetAutoAccept(false)
+	assert.Contains(s.T(), s.announcements[len(s.announcements)-1], "register=true")
+
+	s.sut.SetAutoAccept(true)
+	err = s.sut.SetPairingRegistration(false)
+	assert.NoError(s.T(), err)
+	assert.Contains(s.T(), s.announcements[len(s.announcements)-1], "register=true")
+
+	s.sut.SetAutoAccept(false)
+	assert.Contains(s.T(), s.announcements[len(s.announcements)-1], "register=false")
 }
 
 func TestMdnsManagerScopedPolicyUsesOneExactInterfaceAndAddress(t *testing.T) {

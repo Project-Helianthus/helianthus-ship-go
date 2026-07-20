@@ -54,6 +54,9 @@ type MdnsManager struct {
 	// Wether remote devices should be automatically accepted
 	autoaccept bool
 
+	// Whether a bounded, user-mediated pairing flow is currently available.
+	pairingRegistration bool
+
 	isAnnounced bool
 
 	// the currently available mDNS entries with the SKI as the key in the map
@@ -82,7 +85,8 @@ type MdnsManager struct {
 	providerSelection MdnsProviderSelection
 
 	mux,
-	muxAnnounced sync.Mutex
+	muxAnnounced,
+	muxRegistration sync.Mutex
 }
 
 func NewMDNS(
@@ -145,6 +149,7 @@ func (m *MdnsManager) interfaces() ([]net.Interface, []int32, error) {
 
 var _ api.MdnsInterface = (*MdnsManager)(nil)
 var _ api.ListenerPolicyMdnsInterface = (*MdnsManager)(nil)
+var _ api.PairingRegistrationSetter = (*MdnsManager)(nil)
 
 func (m *MdnsManager) Start(cb api.MdnsReportInterface) error {
 	policy, scoped, err := m.claimStart(cb)
@@ -350,7 +355,7 @@ func (m *MdnsManager) AnnounceMdnsEntry() error {
 		"brand=" + m.deviceBrand,
 		"model=" + m.deviceModel,
 		"type=" + m.deviceType,
-		"register=" + fmt.Sprintf("%v", m.autoaccept),
+		"register=" + fmt.Sprintf("%v", m.registrationAvailable()),
 	}
 
 	logging.Log().Debug("mdns: announce")
@@ -402,7 +407,9 @@ func (m *MdnsManager) setIsServiceAnnounce(value bool) {
 }
 
 func (m *MdnsManager) SetAutoAccept(accept bool) {
+	m.muxRegistration.Lock()
 	m.autoaccept = accept
+	m.muxRegistration.Unlock()
 
 	// if announcement is off, don't enforce a new announcement
 	if !m.isServiceAnnounced() {
@@ -413,6 +420,26 @@ func (m *MdnsManager) SetAutoAccept(accept bool) {
 	if err := m.AnnounceMdnsEntry(); err != nil {
 		logging.Log().Debug("mdns: changing mdns entry failed", err)
 	}
+}
+
+// SetPairingRegistration updates only user-mediated pairing availability and
+// reports whether the effective TXT record was republished successfully.
+func (m *MdnsManager) SetPairingRegistration(available bool) error {
+	m.muxRegistration.Lock()
+	m.pairingRegistration = available
+	m.muxRegistration.Unlock()
+
+	if !m.isServiceAnnounced() {
+		return nil
+	}
+
+	return m.AnnounceMdnsEntry()
+}
+
+func (m *MdnsManager) registrationAvailable() bool {
+	m.muxRegistration.Lock()
+	defer m.muxRegistration.Unlock()
+	return m.autoaccept || m.pairingRegistration
 }
 
 func (m *MdnsManager) mdnsEntries() map[string]*api.MdnsEntry {

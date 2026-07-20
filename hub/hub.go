@@ -18,6 +18,24 @@ type connectionInitiationDelayTimeRange struct {
 	min, max int
 }
 
+type outboundPairingAdmission struct {
+	gateGeneration uint64
+	context        context.Context
+	cancel         context.CancelFunc
+}
+
+type outboundAttemptAuthority struct {
+	epoch uint64
+}
+
+type outboundAttemptRegistration struct {
+	authority  *outboundAttemptAuthority
+	metadata   api.OutgoingAttemptMetadata
+	context    context.Context
+	cancel     context.CancelFunc
+	connection api.ShipConnectionInterface
+}
+
 // defines the delay timeframes in seconds depening on the connection attempt counter
 // the last item will be re-used for higher attempt counter values
 var connectionInitiationDelayTimeRanges = []connectionInitiationDelayTimeRange{
@@ -34,6 +52,8 @@ type Hub struct {
 	// which attempt is it to initate an connection to the remote SKI
 	connectionAttemptCounter map[string]int
 	connectionAttemptRunning map[string]bool
+	// SKIs with an outgoing dial in flight but not yet registered.
+	connectionsInitiating map[string]bool
 
 	port        int
 	certifciate tls.Certificate
@@ -44,6 +64,12 @@ type Hub struct {
 
 	dialer              outgoingAttemptDialer
 	outgoingAttemptGate api.OutgoingAttemptGate
+	outgoingGateEpoch   uint64
+	outboundAdmissions  map[string]*outboundPairingAdmission
+	outboundEpoch       uint64
+	outboundAuthorities map[string]*outboundAttemptAuthority
+	outboundAttempts    map[string]map[*outboundAttemptRegistration]struct{}
+	outboundShutdown    bool
 
 	autoaccept bool
 
@@ -81,6 +107,7 @@ func NewHub(hubReader api.HubReaderInterface,
 		connections:              make(map[string]api.ShipConnectionInterface),
 		connectionAttemptCounter: make(map[string]int),
 		connectionAttemptRunning: make(map[string]bool),
+		connectionsInitiating:    make(map[string]bool),
 		remoteServices:           make(map[string]*api.ServiceDetails),
 		knownMdnsEntries:         make([]*api.MdnsEntry, 0),
 		hubReader:                hubReader,
@@ -89,6 +116,9 @@ func NewHub(hubReader api.HubReaderInterface,
 		localService:             localService,
 		mdns:                     mdns,
 		dialer:                   newOutgoingAttemptDialer(certificate),
+		outboundAdmissions:       make(map[string]*outboundPairingAdmission),
+		outboundAuthorities:      make(map[string]*outboundAttemptAuthority),
+		outboundAttempts:         make(map[string]map[*outboundAttemptRegistration]struct{}),
 	}
 
 	return hub
@@ -96,6 +126,7 @@ func NewHub(hubReader api.HubReaderInterface,
 
 var _ api.HubInterface = (*Hub)(nil)
 var _ api.OutgoingAttemptGateSetter = (*Hub)(nil)
+var _ api.PairingRegistrationSetter = (*Hub)(nil)
 
 // SetOutgoingAttemptGate installs or removes the optional outgoing dial gate.
 func (h *Hub) SetOutgoingAttemptGate(gate api.OutgoingAttemptGate) error {
@@ -111,7 +142,11 @@ func (h *Hub) SetOutgoingAttemptGate(gate api.OutgoingAttemptGate) error {
 
 	h.muxAttemptGate.Lock()
 	h.outgoingAttemptGate = gate
+	h.outgoingGateEpoch++
+	h.invalidateAllOutboundAdmissionsLocked()
+	cancellations := h.removeAllOutboundAttemptRegistrationsLocked()
 	h.muxAttemptGate.Unlock()
+	cancelOutboundAttemptRegistrations(cancellations)
 	return nil
 }
 
@@ -120,6 +155,274 @@ func (h *Hub) configuredOutgoingAttemptGate() api.OutgoingAttemptGate {
 	defer h.muxAttemptGate.RUnlock()
 
 	return h.outgoingAttemptGate
+}
+
+func (h *Hub) createOutboundAdmission(ski string, service *api.ServiceDetails) bool {
+	admissionContext, cancel := context.WithCancel(context.Background())
+
+	h.muxAttemptGate.Lock()
+	defer h.muxAttemptGate.Unlock()
+	if h.outboundShutdown {
+		cancel()
+		return false
+	}
+	if h.outgoingAttemptGate == nil || isNilOutgoingAttemptValue(h.outgoingAttemptGate) {
+		cancel()
+		return false
+	}
+	if service.Trusted() {
+		cancel()
+		return false
+	}
+	if h.outboundAdmissions == nil {
+		h.outboundAdmissions = make(map[string]*outboundPairingAdmission)
+	}
+	if existing := h.outboundAdmissions[ski]; existing != nil {
+		existing.cancel()
+	}
+	h.outboundAdmissions[ski] = &outboundPairingAdmission{
+		gateGeneration: h.outgoingGateEpoch,
+		context:        admissionContext,
+		cancel:         cancel,
+	}
+	service.ConnectionStateDetail().SetState(api.ConnectionStateQueued)
+	return true
+}
+
+func (h *Hub) hasCurrentOutboundAdmission(ski string) bool {
+	h.muxAttemptGate.RLock()
+	defer h.muxAttemptGate.RUnlock()
+
+	admission := h.outboundAdmissions[ski]
+	return h.outgoingAttemptGate != nil &&
+		!isNilOutgoingAttemptValue(h.outgoingAttemptGate) &&
+		!h.outboundShutdown &&
+		admission != nil &&
+		admission.gateGeneration == h.outgoingGateEpoch &&
+		admission.context.Err() == nil
+}
+
+func (h *Hub) promoteOutboundTrust(ski string, service *api.ServiceDetails) {
+	h.muxAttemptGate.Lock()
+	defer h.muxAttemptGate.Unlock()
+
+	if admission := h.outboundAdmissions[ski]; admission != nil {
+		admission.cancel()
+	}
+	service.SetTrusted(true)
+}
+
+func (h *Hub) revokeOutboundAttempts(ski string, service *api.ServiceDetails) {
+	h.muxAttemptGate.Lock()
+	if h.outboundAdmissions == nil {
+		h.outboundAdmissions = make(map[string]*outboundPairingAdmission)
+	}
+	admission := h.outboundAdmissions[ski]
+	if admission == nil {
+		admissionContext, cancel := context.WithCancel(context.Background())
+		admission = &outboundPairingAdmission{
+			gateGeneration: h.outgoingGateEpoch,
+			context:        admissionContext,
+			cancel:         cancel,
+		}
+		h.outboundAdmissions[ski] = admission
+	}
+	admission.cancel()
+	h.rotateOutboundAuthorityLocked(ski)
+	cancellations := h.removeOutboundAttemptRegistrationsLocked(ski)
+	service.SetTrusted(false)
+	service.ConnectionStateDetail().SetState(api.ConnectionStateNone)
+	h.muxAttemptGate.Unlock()
+
+	// Cancellation may close a SHIP connection and re-enter the Hub.
+	cancelOutboundAttemptRegistrations(cancellations)
+}
+
+func (h *Hub) invalidateAllOutboundAdmissionsLocked() {
+	for _, admission := range h.outboundAdmissions {
+		admission.cancel()
+	}
+}
+
+func (h *Hub) outgoingAttemptGateSnapshot(
+	remoteService *api.ServiceDetails,
+) (api.OutgoingAttemptGate, uint64, *outboundAttemptAuthority, *outboundPairingAdmission, bool, bool) {
+	h.muxAttemptGate.Lock()
+	defer h.muxAttemptGate.Unlock()
+	if h.outboundShutdown {
+		return nil, 0, nil, nil, false, false
+	}
+
+	gate := h.outgoingAttemptGate
+	generation := h.outgoingGateEpoch
+	ski := remoteService.SKI()
+	untrusted := !remoteService.Trusted()
+	queued := remoteService.ConnectionStateDetail().State() == api.ConnectionStateQueued
+	admission := h.outboundAdmissions[ski]
+	requireAdmission := untrusted && (queued || admission != nil)
+	if !requireAdmission {
+		if gate == nil || isNilOutgoingAttemptValue(gate) {
+			return gate, generation, nil, nil, false, true
+		}
+		return gate, generation, h.currentOutboundAuthorityLocked(ski), nil, false, true
+	}
+	valid := gate != nil &&
+		!isNilOutgoingAttemptValue(gate) &&
+		admission != nil &&
+		admission.gateGeneration == generation &&
+		admission.context.Err() == nil
+	if !valid {
+		return gate, generation, nil, admission, true, false
+	}
+	return gate, generation, h.currentOutboundAuthorityLocked(ski), admission, true, true
+}
+
+// registerOutboundAttemptForLaunch performs the final authority check and
+// installs a Hub-owned cancellation context before DialContext is launched.
+func (h *Hub) registerOutboundAttemptForLaunch(
+	ski string,
+	generation uint64,
+	authority *outboundAttemptAuthority,
+	admission *outboundPairingAdmission,
+	requireAdmission bool,
+	metadata api.OutgoingAttemptMetadata,
+	permitContext context.Context,
+) (*outboundAttemptRegistration, bool) {
+	h.muxAttemptGate.Lock()
+	defer h.muxAttemptGate.Unlock()
+
+	current := h.outboundAdmissions[ski]
+	if h.outboundShutdown ||
+		h.outgoingAttemptGate == nil ||
+		isNilOutgoingAttemptValue(h.outgoingAttemptGate) ||
+		h.outgoingGateEpoch != generation ||
+		authority == nil ||
+		h.outboundAuthorities[ski] != authority {
+		return nil, false
+	}
+	if requireAdmission &&
+		(current == nil ||
+			current != admission ||
+			current.gateGeneration != generation ||
+			current.context.Err() != nil) {
+		return nil, false
+	}
+
+	attemptContext, cancel := context.WithCancel(permitContext)
+	registration := &outboundAttemptRegistration{
+		authority: authority,
+		metadata:  metadata,
+		context:   attemptContext,
+		cancel:    cancel,
+	}
+	registrations := h.outboundAttempts[ski]
+	if registrations == nil {
+		registrations = make(map[*outboundAttemptRegistration]struct{})
+		h.outboundAttempts[ski] = registrations
+	}
+	registrations[registration] = struct{}{}
+	return registration, true
+}
+
+func (h *Hub) currentOutboundAuthorityLocked(ski string) *outboundAttemptAuthority {
+	authority := h.outboundAuthorities[ski]
+	if authority != nil {
+		return authority
+	}
+	return h.rotateOutboundAuthorityLocked(ski)
+}
+
+func (h *Hub) rotateOutboundAuthorityLocked(ski string) *outboundAttemptAuthority {
+	h.outboundEpoch++
+	if h.outboundEpoch == 0 {
+		h.outboundEpoch++
+	}
+	authority := &outboundAttemptAuthority{epoch: h.outboundEpoch}
+	h.outboundAuthorities[ski] = authority
+	return authority
+}
+
+func (h *Hub) removeOutboundAttemptRegistrationsLocked(ski string) []*outboundAttemptRegistration {
+	registrations := h.outboundAttempts[ski]
+	if len(registrations) == 0 {
+		return nil
+	}
+	removed := make([]*outboundAttemptRegistration, 0, len(registrations))
+	for registration := range registrations {
+		removed = append(removed, registration)
+	}
+	delete(h.outboundAttempts, ski)
+	return removed
+}
+
+func (h *Hub) removeAllOutboundAttemptRegistrationsLocked() []*outboundAttemptRegistration {
+	var removed []*outboundAttemptRegistration
+	for ski := range h.outboundAttempts {
+		removed = append(removed, h.removeOutboundAttemptRegistrationsLocked(ski)...)
+	}
+	return removed
+}
+
+func (h *Hub) releaseOutboundAttemptRegistration(ski string, registration *outboundAttemptRegistration) {
+	if registration == nil {
+		return
+	}
+	h.muxAttemptGate.Lock()
+	registrations := h.outboundAttempts[ski]
+	if _, exists := registrations[registration]; exists {
+		delete(registrations, registration)
+		if len(registrations) == 0 {
+			delete(h.outboundAttempts, ski)
+		}
+	}
+	h.muxAttemptGate.Unlock()
+	registration.cancel()
+}
+
+func (h *Hub) bindOutboundAttemptConnection(
+	ski string,
+	registration *outboundAttemptRegistration,
+	connection api.ShipConnectionInterface,
+) bool {
+	if registration == nil || connection == nil {
+		return false
+	}
+	h.muxAttemptGate.Lock()
+	defer h.muxAttemptGate.Unlock()
+	if _, exists := h.outboundAttempts[ski][registration]; !exists || registration.context.Err() != nil {
+		return false
+	}
+	registration.connection = connection
+	return true
+}
+
+func (h *Hub) releaseOutboundAttemptForConnection(
+	ski string,
+	connection api.ShipConnectionInterface,
+	metadata api.OutgoingAttemptMetadata,
+) {
+	// Exact connection ownership prevents a stale close from releasing a newer
+	// registration if an external gate ever reuses metadata.
+	h.muxAttemptGate.Lock()
+	registrations := h.outboundAttempts[ski]
+	var removed []*outboundAttemptRegistration
+	for registration := range registrations {
+		if registration.connection == connection && registration.metadata == metadata {
+			delete(registrations, registration)
+			removed = append(removed, registration)
+		}
+	}
+	if len(registrations) == 0 {
+		delete(h.outboundAttempts, ski)
+	}
+	h.muxAttemptGate.Unlock()
+	cancelOutboundAttemptRegistrations(removed)
+}
+
+func cancelOutboundAttemptRegistrations(registrations []*outboundAttemptRegistration) {
+	for _, registration := range registrations {
+		registration.cancel()
+	}
 }
 
 // Start the ConnectionsHub with all its services
@@ -154,10 +457,11 @@ func (h *Hub) Shutdown() {
 		return
 	}
 
-	connections, started := h.beginShutdown()
+	connections, cancellations, started := h.beginShutdown()
 	if !started {
 		return
 	}
+	cancelOutboundAttemptRegistrations(cancellations)
 
 	h.mdns.Shutdown()
 	for _, c := range connections {
@@ -171,12 +475,15 @@ func (h *Hub) Shutdown() {
 	}
 }
 
-func (h *Hub) beginShutdown() ([]api.ShipConnectionInterface, bool) {
+func (h *Hub) beginShutdown() (
+	[]api.ShipConnectionInterface,
+	[]*outboundAttemptRegistration,
+	bool,
+) {
 	h.muxCon.Lock()
-	defer h.muxCon.Unlock()
-
 	if h.hasShutdown {
-		return nil, false
+		h.muxCon.Unlock()
+		return nil, nil, false
 	}
 	h.hasShutdown = true
 
@@ -185,7 +492,16 @@ func (h *Hub) beginShutdown() ([]api.ShipConnectionInterface, bool) {
 		connections = append(connections, connection)
 		delete(h.connections, ski)
 	}
-	return connections, true
+	h.muxCon.Unlock()
+
+	h.muxAttemptGate.Lock()
+	h.outboundShutdown = true
+	h.outgoingGateEpoch++
+	h.invalidateAllOutboundAdmissionsLocked()
+	cancellations := h.removeAllOutboundAttemptRegistrationsLocked()
+	h.muxAttemptGate.Unlock()
+
+	return connections, cancellations, true
 }
 
 // return the service for a SKI

@@ -1,6 +1,8 @@
 package hub
 
 import (
+	"errors"
+
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
 	"github.com/Project-Helianthus/helianthus-ship-go/model"
 	"github.com/Project-Helianthus/helianthus-ship-go/util"
@@ -73,6 +75,20 @@ func (h *Hub) SetAutoAccept(autoaccept bool) {
 	h.mdns.SetAutoAccept(autoaccept)
 }
 
+// SetPairingRegistration changes only the SHIP mDNS registration signal.
+// Manual approval flows use it to advertise availability without enabling
+// automatic handshake acceptance.
+func (h *Hub) SetPairingRegistration(available bool) error {
+	h.muxReg.Lock()
+	defer h.muxReg.Unlock()
+
+	setter, ok := h.mdns.(api.PairingRegistrationSetter)
+	if !ok {
+		return errors.New("mDNS does not support pairing registration")
+	}
+	return setter.SetPairingRegistration(available)
+}
+
 // check if auto accept is true
 func (h *Hub) IsAutoAcceptEnabled() bool {
 	h.muxReg.Lock()
@@ -92,21 +108,17 @@ func (h *Hub) checkHasStarted() bool {
 // which were stored as having the process completed
 func (h *Hub) RegisterRemoteSKI(ski string) {
 	ski = util.NormalizeSKI(ski)
+	service := h.ServiceForSKI(ski)
+	h.promoteOutboundTrust(ski, service)
 
 	// if the hub has not started, simply add it
 	if !h.checkHasStarted() {
-		service := h.ServiceForSKI(ski)
-		service.SetTrusted(true)
-
 		h.checkAutoReannounce()
 		return
 	}
 
 	// if the hub has started, trigger a search and connection attempt
 	conn := h.connectionForSKI(ski)
-
-	service := h.ServiceForSKI(ski)
-	service.SetTrusted(true)
 
 	// remotely initiated?
 	if conn != nil {
@@ -125,12 +137,11 @@ func (h *Hub) RegisterRemoteSKI(ski string) {
 
 // Remove pairing for the SKI
 func (h *Hub) UnregisterRemoteSKI(ski string) {
+	ski = util.NormalizeSKI(ski)
 	service := h.ServiceForSKI(ski)
-	service.SetTrusted(false)
+	h.revokeOutboundAttempts(ski, service)
 
 	h.removeConnectionAttemptCounter(ski)
-
-	service.ConnectionStateDetail().SetState(api.ConnectionStateNone)
 
 	h.hubReader.ServicePairingDetailUpdate(ski, service.ConnectionStateDetail())
 
@@ -152,15 +163,14 @@ func (h *Hub) DisconnectSKI(ski string, reason string) {
 
 // Cancels the pairing process for a SKI
 func (h *Hub) CancelPairingWithSKI(ski string) {
+	ski = util.NormalizeSKI(ski)
+	service := h.ServiceForSKI(ski)
+	h.revokeOutboundAttempts(ski, service)
 	h.removeConnectionAttemptCounter(ski)
 
 	if existingC := h.connectionForSKI(ski); existingC != nil {
 		existingC.AbortPendingHandshake()
 	}
-
-	service := h.ServiceForSKI(ski)
-	service.ConnectionStateDetail().SetState(api.ConnectionStateNone)
-	service.SetTrusted(false)
 
 	h.hubReader.ServicePairingDetailUpdate(ski, service.ConnectionStateDetail())
 }
