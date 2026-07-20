@@ -111,8 +111,9 @@ func TestOutboundPairingCancellationBeforeLaunchPreventsDial(t *testing.T) {
 				}
 			})
 			dialer := &fakePeerDialer{err: errAttemptTestDial}
-			hub, _, remote := newAttemptTestHub(t, gate, dialer)
+			hub, _, _ := newAttemptTestHub(t, gate, dialer)
 			queueOutboundPairingWithoutBackgroundDial(t, hub)
+			remote := hub.ServiceForSKI(outboundPairingTestSKI)
 
 			result := make(chan error, 1)
 			go func() {
@@ -164,8 +165,9 @@ func TestOutboundPairingGateLifecycleChangeBeforeAuthorizationPreventsDial(t *te
 		t.Run(test.name, func(t *testing.T) {
 			gate := newScriptedAttemptGate(gatePermit)
 			dialer := &fakePeerDialer{err: errAttemptTestDial}
-			hub, _, remote := newAttemptTestHub(t, gate, dialer)
+			hub, _, _ := newAttemptTestHub(t, gate, dialer)
 			queueOutboundPairingWithoutBackgroundDial(t, hub)
+			remote := hub.ServiceForSKI(outboundPairingTestSKI)
 
 			test.reconfigure(t, hub)
 			err := hub.connectFoundService(remote, outboundPairingTestEndpoint.Host, "54321", outboundPairingTestEndpoint.Path)
