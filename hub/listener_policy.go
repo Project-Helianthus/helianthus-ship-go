@@ -167,8 +167,9 @@ func (h *Hub) StartWithPolicy() error {
 	if h.listenerPolicy.DiscoveryEnabled {
 		lifecycle.discoveryOwned = true
 		if err := h.mdns.Start(h); err != nil {
-			resources, connections, _ := h.claimListenerPolicyTerminationLocked()
+			resources, connections, cancellations, _ := h.claimListenerPolicyTerminationLocked()
 			lifecycle.mu.Unlock()
+			cancelOutboundAttemptRegistrations(cancellations)
 			h.cleanupListenerPolicy(resources, connections)
 			h.finishListenerPolicyTermination()
 			return fmt.Errorf("start mDNS discovery: %w", err)
@@ -232,12 +233,13 @@ func (h *Hub) shutdownWithListenerPolicy() {
 func (h *Hub) terminateListenerPolicy() {
 	lifecycle := &h.listenerPolicyLifecycle
 	lifecycle.mu.Lock()
-	resources, connections, claimed := h.claimListenerPolicyTerminationLocked()
+	resources, connections, cancellations, claimed := h.claimListenerPolicyTerminationLocked()
 	lifecycle.mu.Unlock()
 	if !claimed {
 		return
 	}
 
+	cancelOutboundAttemptRegistrations(cancellations)
 	h.cleanupListenerPolicy(resources, connections)
 	h.finishListenerPolicyTermination()
 }
@@ -245,11 +247,12 @@ func (h *Hub) terminateListenerPolicy() {
 func (h *Hub) claimListenerPolicyTerminationLocked() (
 	listenerPolicyResources,
 	[]api.ShipConnectionInterface,
+	[]*outboundAttemptRegistration,
 	bool,
 ) {
-	connections, claimed := h.beginShutdown()
+	connections, cancellations, claimed := h.beginShutdown()
 	if !claimed {
-		return listenerPolicyResources{}, nil, false
+		return listenerPolicyResources{}, nil, nil, false
 	}
 
 	lifecycle := &h.listenerPolicyLifecycle
@@ -264,7 +267,7 @@ func (h *Hub) claimListenerPolicyTerminationLocked() (
 	lifecycle.serveDone = nil
 	lifecycle.discoveryOwned = false
 	lifecycle.started = false
-	return resources, connections, true
+	return resources, connections, cancellations, true
 }
 
 func (h *Hub) cleanupListenerPolicy(

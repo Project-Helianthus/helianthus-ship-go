@@ -213,8 +213,27 @@ func (h *Hub) isSkiConnected(ski string) bool {
 //
 // returns error contains a reason for failing the connection or nil if no further tries should be processed
 func (h *Hub) connectFoundService(remoteService *api.ServiceDetails, host, port, path string) error {
-	if h.isSkiConnected(remoteService.SKI()) {
-		return nil
+	if ski := remoteService.SKI(); ski != "" {
+		h.muxCon.Lock()
+		if h.hasShutdown {
+			h.muxCon.Unlock()
+			return outgoingAttemptDeniedError{}
+		}
+		if _, connected := h.connections[ski]; connected || h.connectionsInitiating[ski] {
+			h.muxCon.Unlock()
+			return nil
+		}
+		if h.connectionsInitiating == nil {
+			h.connectionsInitiating = make(map[string]bool)
+		}
+		h.connectionsInitiating[ski] = true
+		h.muxCon.Unlock()
+
+		defer func() {
+			h.muxCon.Lock()
+			delete(h.connectionsInitiating, ski)
+			h.muxCon.Unlock()
+		}()
 	}
 
 	logging.Log().Debugf("initiating connection to %s at %s:%s%s", remoteService.SKI(), host, port, path)

@@ -52,6 +52,8 @@ type Hub struct {
 	// which attempt is it to initate an connection to the remote SKI
 	connectionAttemptCounter map[string]int
 	connectionAttemptRunning map[string]bool
+	// SKIs with an outgoing dial in flight but not yet registered.
+	connectionsInitiating map[string]bool
 
 	port        int
 	certifciate tls.Certificate
@@ -67,6 +69,7 @@ type Hub struct {
 	outboundEpoch       uint64
 	outboundAuthorities map[string]*outboundAttemptAuthority
 	outboundAttempts    map[string]map[*outboundAttemptRegistration]struct{}
+	outboundShutdown    bool
 
 	autoaccept bool
 
@@ -104,6 +107,7 @@ func NewHub(hubReader api.HubReaderInterface,
 		connections:              make(map[string]api.ShipConnectionInterface),
 		connectionAttemptCounter: make(map[string]int),
 		connectionAttemptRunning: make(map[string]bool),
+		connectionsInitiating:    make(map[string]bool),
 		remoteServices:           make(map[string]*api.ServiceDetails),
 		knownMdnsEntries:         make([]*api.MdnsEntry, 0),
 		hubReader:                hubReader,
@@ -158,6 +162,10 @@ func (h *Hub) createOutboundAdmission(ski string, service *api.ServiceDetails) b
 
 	h.muxAttemptGate.Lock()
 	defer h.muxAttemptGate.Unlock()
+	if h.outboundShutdown {
+		cancel()
+		return false
+	}
 	if h.outgoingAttemptGate == nil || isNilOutgoingAttemptValue(h.outgoingAttemptGate) {
 		cancel()
 		return false
@@ -188,6 +196,7 @@ func (h *Hub) hasCurrentOutboundAdmission(ski string) bool {
 	admission := h.outboundAdmissions[ski]
 	return h.outgoingAttemptGate != nil &&
 		!isNilOutgoingAttemptValue(h.outgoingAttemptGate) &&
+		!h.outboundShutdown &&
 		admission != nil &&
 		admission.gateGeneration == h.outgoingGateEpoch &&
 		admission.context.Err() == nil
@@ -240,6 +249,9 @@ func (h *Hub) outgoingAttemptGateSnapshot(
 ) (api.OutgoingAttemptGate, uint64, *outboundAttemptAuthority, *outboundPairingAdmission, bool, bool) {
 	h.muxAttemptGate.Lock()
 	defer h.muxAttemptGate.Unlock()
+	if h.outboundShutdown {
+		return nil, 0, nil, nil, false, false
+	}
 
 	gate := h.outgoingAttemptGate
 	generation := h.outgoingGateEpoch
@@ -280,7 +292,8 @@ func (h *Hub) registerOutboundAttemptForLaunch(
 	defer h.muxAttemptGate.Unlock()
 
 	current := h.outboundAdmissions[ski]
-	if h.outgoingAttemptGate == nil ||
+	if h.outboundShutdown ||
+		h.outgoingAttemptGate == nil ||
 		isNilOutgoingAttemptValue(h.outgoingAttemptGate) ||
 		h.outgoingGateEpoch != generation ||
 		authority == nil ||
@@ -444,10 +457,11 @@ func (h *Hub) Shutdown() {
 		return
 	}
 
-	connections, started := h.beginShutdown()
+	connections, cancellations, started := h.beginShutdown()
 	if !started {
 		return
 	}
+	cancelOutboundAttemptRegistrations(cancellations)
 
 	h.mdns.Shutdown()
 	for _, c := range connections {
@@ -461,12 +475,15 @@ func (h *Hub) Shutdown() {
 	}
 }
 
-func (h *Hub) beginShutdown() ([]api.ShipConnectionInterface, bool) {
+func (h *Hub) beginShutdown() (
+	[]api.ShipConnectionInterface,
+	[]*outboundAttemptRegistration,
+	bool,
+) {
 	h.muxCon.Lock()
-	defer h.muxCon.Unlock()
-
 	if h.hasShutdown {
-		return nil, false
+		h.muxCon.Unlock()
+		return nil, nil, false
 	}
 	h.hasShutdown = true
 
@@ -475,7 +492,16 @@ func (h *Hub) beginShutdown() ([]api.ShipConnectionInterface, bool) {
 		connections = append(connections, connection)
 		delete(h.connections, ski)
 	}
-	return connections, true
+	h.muxCon.Unlock()
+
+	h.muxAttemptGate.Lock()
+	h.outboundShutdown = true
+	h.outgoingGateEpoch++
+	h.invalidateAllOutboundAdmissionsLocked()
+	cancellations := h.removeAllOutboundAttemptRegistrationsLocked()
+	h.muxAttemptGate.Unlock()
+
+	return connections, cancellations, true
 }
 
 // return the service for a SKI
