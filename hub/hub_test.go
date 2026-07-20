@@ -83,6 +83,7 @@ func (s *HubSuite) BeforeTest(suiteName, testName string) {
 	s.hubReader.EXPECT().RemoteSKIDisconnected(gomock.Any()).Return().AnyTimes()
 	s.hubReader.EXPECT().ServiceShipIDUpdate(gomock.Any(), gomock.Any()).Return().AnyTimes()
 	s.hubReader.EXPECT().ServicePairingDetailUpdate(gomock.Any(), gomock.Any()).Return().AnyTimes()
+	s.hubReader.EXPECT().VisibleRemoteServicesUpdated(gomock.Any()).Return().AnyTimes()
 	s.hubReader.EXPECT().AllowWaitingForTrust(gomock.Any()).Return(false).AnyTimes()
 
 	s.mdnsService = mocks.NewMockMdnsInterface(ctrl)
@@ -152,6 +153,62 @@ func (s *HubSuite) Test_PairingRegistrationDoesNotEnableAutoAccept() {
 	assert.NoError(s.T(), err)
 	assert.False(s.T(), s.sut.IsAutoAcceptEnabled())
 	assert.Equal(s.T(), []bool{true, false}, mdnsService.values)
+}
+
+func (s *HubSuite) Test_QueueRemoteSKILeavesTrustFalseAndRequestsDiscovery() {
+	const remoteSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
+
+	s.sut.muxStarted.Lock()
+	s.sut.hasStarted = true
+	s.sut.muxStarted.Unlock()
+	s.mdnsService.EXPECT().RequestMdnsEntries().Return().Times(1)
+
+	err := s.sut.QueueRemoteSKI(remoteSKI)
+	assert.NoError(s.T(), err)
+	remote := s.sut.ServiceForSKI(remoteSKI)
+	assert.False(s.T(), remote.Trusted())
+	assert.Equal(s.T(), api.ConnectionStateQueued, remote.ConnectionStateDetail().State())
+}
+
+func (s *HubSuite) Test_ReportRemoteEndpointDoesNotGrantTrust() {
+	const remoteSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
+	endpoint := api.RemoteEndpoint{Host: "192.168.100.21", Port: 12480, Path: "/ship/"}
+
+	s.sut.setConnectionAttemptRunning(remoteSKI, true)
+	err := s.sut.ReportRemoteEndpoint(remoteSKI, endpoint)
+	assert.NoError(s.T(), err)
+	assert.False(s.T(), s.sut.ServiceForSKI(remoteSKI).Trusted())
+
+	s.sut.muxMdns.Lock()
+	defer s.sut.muxMdns.Unlock()
+	if assert.Len(s.T(), s.sut.knownMdnsEntries, 1) {
+		entry := s.sut.knownMdnsEntries[0]
+		assert.Equal(s.T(), remoteSKI, entry.Ski)
+		assert.Equal(s.T(), endpoint.Host, entry.Host)
+		assert.Equal(s.T(), int(endpoint.Port), entry.Port)
+		assert.Equal(s.T(), endpoint.Path, entry.Path)
+	}
+}
+
+func (s *HubSuite) Test_ReportRemoteEndpointRejectsInvalidInput() {
+	const remoteSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
+	tests := []struct {
+		name     string
+		ski      string
+		endpoint api.RemoteEndpoint
+	}{
+		{name: "missing ski", endpoint: api.RemoteEndpoint{Host: "192.168.100.21", Port: 12480, Path: "/ship/"}},
+		{name: "short ski", ski: "b1b719", endpoint: api.RemoteEndpoint{Host: "192.168.100.21", Port: 12480, Path: "/ship/"}},
+		{name: "missing host", ski: remoteSKI, endpoint: api.RemoteEndpoint{Port: 12480, Path: "/ship/"}},
+		{name: "zero port", ski: remoteSKI, endpoint: api.RemoteEndpoint{Host: "192.168.100.21", Path: "/ship/"}},
+		{name: "relative path", ski: remoteSKI, endpoint: api.RemoteEndpoint{Host: "192.168.100.21", Port: 12480, Path: "ship"}},
+	}
+
+	for _, test := range tests {
+		s.Run(test.name, func() {
+			assert.Error(s.T(), s.sut.ReportRemoteEndpoint(test.ski, test.endpoint))
+		})
+	}
 }
 
 type pairingRegistrationMDNS struct {
