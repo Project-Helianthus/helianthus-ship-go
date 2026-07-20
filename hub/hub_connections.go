@@ -342,7 +342,16 @@ func (h *Hub) gatedDialContext(
 		return nil, nil, nil, outgoingAttemptDeniedError{}
 	}
 
-	gate := h.configuredOutgoingAttemptGate()
+	untrusted := !remoteService.Trusted()
+	queued := remoteService.ConnectionStateDetail().State() == api.ConnectionStateQueued
+	gate, gateGeneration, admission, requireAdmission, admissionValid := h.outgoingAttemptGateSnapshot(
+		remoteService.SKI(),
+		untrusted,
+		queued,
+	)
+	if !admissionValid {
+		return nil, nil, nil, outgoingAttemptDeniedError{}
+	}
 	permit := api.OutgoingAttemptPermit{Context: context.Background()}
 	address := fmt.Sprintf("wss://%s:%s%s", host, port, path)
 	defer func() {
@@ -424,6 +433,13 @@ func (h *Hub) gatedDialContext(
 		default:
 			abortOutgoingAttempt(gate, handle)
 			return nil, nil, nil, outgoingAttemptDeniedError{}
+		}
+		if requireAdmission {
+			if !h.lockOutboundAdmissionForLaunch(remoteService.SKI(), gateGeneration, admission) {
+				attempt.terminalFailure(h)
+				return nil, nil, attempt, outgoingAttemptDeniedError{}
+			}
+			defer h.muxAttemptGate.RUnlock()
 		}
 	}
 

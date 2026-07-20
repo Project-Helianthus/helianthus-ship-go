@@ -108,6 +108,7 @@ func (h *Hub) checkHasStarted() bool {
 // which were stored as having the process completed
 func (h *Hub) RegisterRemoteSKI(ski string) {
 	ski = util.NormalizeSKI(ski)
+	h.invalidateOutboundAdmission(ski)
 
 	// if the hub has not started, simply add it
 	if !h.checkHasStarted() {
@@ -141,6 +142,8 @@ func (h *Hub) RegisterRemoteSKI(ski string) {
 
 // Remove pairing for the SKI
 func (h *Hub) UnregisterRemoteSKI(ski string) {
+	ski = util.NormalizeSKI(ski)
+	h.invalidateOutboundAdmission(ski)
 	service := h.ServiceForSKI(ski)
 	service.SetTrusted(false)
 
@@ -168,6 +171,8 @@ func (h *Hub) DisconnectSKI(ski string, reason string) {
 
 // Cancels the pairing process for a SKI
 func (h *Hub) CancelPairingWithSKI(ski string) {
+	ski = util.NormalizeSKI(ski)
+	h.invalidateOutboundAdmission(ski)
 	h.removeConnectionAttemptCounter(ski)
 
 	if existingC := h.connectionForSKI(ski); existingC != nil {
