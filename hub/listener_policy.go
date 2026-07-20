@@ -59,6 +59,7 @@ func (listenerPolicyNoDiscoveryMDNS) Shutdown()                           {}
 func (listenerPolicyNoDiscoveryMDNS) AnnounceMdnsEntry() error            { return nil }
 func (listenerPolicyNoDiscoveryMDNS) UnannounceMdnsEntry()                {}
 func (listenerPolicyNoDiscoveryMDNS) SetAutoAccept(bool)                  {}
+func (listenerPolicyNoDiscoveryMDNS) SetPairingRegistration(bool) error   { return nil }
 func (listenerPolicyNoDiscoveryMDNS) RequestMdnsEntries()                 {}
 
 // NewHubWithListenerPolicy creates a Hub configured for exact-address listener startup.
