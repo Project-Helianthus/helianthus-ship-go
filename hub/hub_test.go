@@ -140,6 +140,17 @@ func (s *HubSuite) Test_AutoAccept() {
 	assert.False(s.T(), value)
 }
 
+func (s *HubSuite) Test_PairingRegistrationDoesNotEnableAutoAccept() {
+	s.mdnsService.EXPECT().SetAutoAccept(true).Return().Times(1)
+	s.mdnsService.EXPECT().SetAutoAccept(false).Return().Times(1)
+
+	s.sut.SetPairingRegistration(true)
+	assert.False(s.T(), s.sut.IsAutoAcceptEnabled())
+
+	s.sut.SetPairingRegistration(false)
+	assert.False(s.T(), s.sut.IsAutoAcceptEnabled())
+}
+
 func (s *HubSuite) Test_SetupRemoteDevice() {
 	ski := "12af9e"
 	localService := api.NewServiceDetails(ski)
