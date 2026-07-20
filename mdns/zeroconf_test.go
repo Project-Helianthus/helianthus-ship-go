@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -109,6 +110,30 @@ func TestScopedZeroconfAnnounceUsesRegisterProxyWithOnlyConfiguredAddress(t *tes
 	}
 	if legacyCalled {
 		t.Fatal("scoped Announce called stock Register")
+	}
+}
+
+func TestScopedZeroconfReannounceShutsDownPreviousServer(t *testing.T) {
+	iface, address := localMulticastAddress(t)
+	provider := newScopedZeroconfProvider([]net.Interface{iface}, "repeat-test-host", address)
+	defer provider.Shutdown()
+
+	if err := provider.Announce("repeat-test", 4712, []string{"register=false"}); err != nil {
+		t.Fatalf("first Announce() error = %v", err)
+	}
+	first := provider.zc
+	defer first.Shutdown()
+
+	if err := provider.Announce("repeat-test", 4712, []string{"register=true"}); err != nil {
+		t.Fatalf("second Announce() error = %v", err)
+	}
+	if first == provider.zc {
+		t.Fatal("second Announce() did not replace the Zeroconf server")
+	}
+
+	shutdown := reflect.ValueOf(first).Elem().FieldByName("isShutdown")
+	if !shutdown.IsValid() || !shutdown.Bool() {
+		t.Fatal("second Announce() left the previous Zeroconf server active")
 	}
 }
 
