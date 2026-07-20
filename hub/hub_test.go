@@ -151,6 +151,25 @@ func (s *HubSuite) Test_PairingRegistrationDoesNotEnableAutoAccept() {
 	assert.False(s.T(), s.sut.IsAutoAcceptEnabled())
 }
 
+type pairingRegistrationMDNS struct {
+	api.MdnsInterface
+	err error
+}
+
+func (m *pairingRegistrationMDNS) SetPairingRegistration(bool) error {
+	return m.err
+}
+
+func TestPairingRegistrationErrorIsPropagated(t *testing.T) {
+	wantErr := errors.New("announce failed")
+	mdnsService := &pairingRegistrationMDNS{err: wantErr}
+	hub := NewHub(nil, mdnsService, 4712, tls.Certificate{}, api.NewServiceDetails("local"))
+
+	err := hub.SetPairingRegistration(true)
+	assert.ErrorIs(t, err, wantErr)
+	var _ api.PairingRegistrationSetter = hub
+}
+
 func (s *HubSuite) Test_SetupRemoteDevice() {
 	ski := "12af9e"
 	localService := api.NewServiceDetails(ski)
