@@ -149,6 +149,7 @@ func (m *MdnsManager) interfaces() ([]net.Interface, []int32, error) {
 
 var _ api.MdnsInterface = (*MdnsManager)(nil)
 var _ api.ListenerPolicyMdnsInterface = (*MdnsManager)(nil)
+var _ api.PairingRegistrationSetter = (*MdnsManager)(nil)
 
 func (m *MdnsManager) Start(cb api.MdnsReportInterface) error {
 	policy, scoped, err := m.claimStart(cb)

@@ -54,6 +54,8 @@ func (l *listenerPolicyListener) Close() error {
 
 type listenerPolicyNoDiscoveryMDNS struct{}
 
+var _ api.PairingRegistrationSetter = listenerPolicyNoDiscoveryMDNS{}
+
 func (listenerPolicyNoDiscoveryMDNS) Start(api.MdnsReportInterface) error { return nil }
 func (listenerPolicyNoDiscoveryMDNS) Shutdown()                           {}
 func (listenerPolicyNoDiscoveryMDNS) AnnounceMdnsEntry() error            { return nil }
