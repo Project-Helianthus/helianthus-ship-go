@@ -156,7 +156,7 @@ func (s *HubSuite) Test_PairingRegistrationDoesNotEnableAutoAccept() {
 }
 
 func (s *HubSuite) Test_QueueRemoteSKILeavesTrustFalseAndRequestsDiscovery() {
-	const remoteSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
+	const remoteSKI = "0123456789abcdef0123456789abcdef01234567"
 
 	s.sut.muxAttemptGate.Lock()
 	s.sut.outgoingAttemptGate = newScriptedAttemptGate(gateAuthorizeDeny)
@@ -176,8 +176,8 @@ func (s *HubSuite) Test_QueueRemoteSKILeavesTrustFalseAndRequestsDiscovery() {
 }
 
 func (s *HubSuite) Test_ReportRemoteEndpointDoesNotGrantTrust() {
-	const remoteSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
-	endpoint := api.RemoteEndpoint{Host: "192.168.100.21", Port: 12480, Path: "/ship/"}
+	const remoteSKI = "0123456789abcdef0123456789abcdef01234567"
+	endpoint := api.RemoteEndpoint{Host: "192.0.2.21", Port: 54321, Path: "/ship/"}
 
 	s.sut.muxAttemptGate.Lock()
 	s.sut.outgoingAttemptGate = newScriptedAttemptGate(gateAuthorizeDeny)
@@ -200,8 +200,8 @@ func (s *HubSuite) Test_ReportRemoteEndpointDoesNotGrantTrust() {
 }
 
 func (s *HubSuite) Test_ReportRemoteEndpointRejectsUnqueuedRemote() {
-	const remoteSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
-	endpoint := api.RemoteEndpoint{Host: "192.168.100.21", Port: 12480, Path: "/ship/"}
+	const remoteSKI = "0123456789abcdef0123456789abcdef01234567"
+	endpoint := api.RemoteEndpoint{Host: "192.0.2.21", Port: 54321, Path: "/ship/"}
 
 	s.sut.muxAttemptGate.Lock()
 	s.sut.outgoingAttemptGate = newScriptedAttemptGate(gateAuthorizeDeny)
@@ -211,7 +211,7 @@ func (s *HubSuite) Test_ReportRemoteEndpointRejectsUnqueuedRemote() {
 }
 
 func (s *HubSuite) Test_QueueRemoteSKIRejectsTrustedRemoteWithoutDowngrade() {
-	const remoteSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
+	const remoteSKI = "0123456789abcdef0123456789abcdef01234567"
 	remote := s.sut.ServiceForSKI(remoteSKI)
 	remote.SetTrusted(true)
 	s.sut.muxAttemptGate.Lock()
@@ -224,8 +224,8 @@ func (s *HubSuite) Test_QueueRemoteSKIRejectsTrustedRemoteWithoutDowngrade() {
 }
 
 func (s *HubSuite) Test_OutboundPairingRequiresAttemptGate() {
-	const remoteSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
-	endpoint := api.RemoteEndpoint{Host: "192.168.100.21", Port: 12480, Path: "/ship/"}
+	const remoteSKI = "0123456789abcdef0123456789abcdef01234567"
+	endpoint := api.RemoteEndpoint{Host: "192.0.2.21", Port: 54321, Path: "/ship/"}
 
 	assert.ErrorIs(s.T(), s.sut.QueueRemoteSKI(remoteSKI), errOutboundGateRequired)
 	assert.ErrorIs(s.T(), s.sut.ReportRemoteEndpoint(remoteSKI, endpoint), errOutboundGateRequired)
@@ -242,7 +242,7 @@ func (m *requestRecordingMDNS) RequestMdnsEntries() {
 }
 
 func (s *HubSuite) Test_ReportRemoteEndpointRejectsInvalidInput() {
-	const remoteSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
+	const remoteSKI = "0123456789abcdef0123456789abcdef01234567"
 	s.sut.muxAttemptGate.Lock()
 	s.sut.outgoingAttemptGate = newScriptedAttemptGate(gateAuthorizeDeny)
 	s.sut.muxAttemptGate.Unlock()
@@ -251,11 +251,11 @@ func (s *HubSuite) Test_ReportRemoteEndpointRejectsInvalidInput() {
 		ski      string
 		endpoint api.RemoteEndpoint
 	}{
-		{name: "missing ski", endpoint: api.RemoteEndpoint{Host: "192.168.100.21", Port: 12480, Path: "/ship/"}},
-		{name: "short ski", ski: "b1b719", endpoint: api.RemoteEndpoint{Host: "192.168.100.21", Port: 12480, Path: "/ship/"}},
-		{name: "missing host", ski: remoteSKI, endpoint: api.RemoteEndpoint{Port: 12480, Path: "/ship/"}},
-		{name: "zero port", ski: remoteSKI, endpoint: api.RemoteEndpoint{Host: "192.168.100.21", Path: "/ship/"}},
-		{name: "relative path", ski: remoteSKI, endpoint: api.RemoteEndpoint{Host: "192.168.100.21", Port: 12480, Path: "ship"}},
+		{name: "missing ski", endpoint: api.RemoteEndpoint{Host: "192.0.2.21", Port: 54321, Path: "/ship/"}},
+		{name: "short ski", ski: "012345", endpoint: api.RemoteEndpoint{Host: "192.0.2.21", Port: 54321, Path: "/ship/"}},
+		{name: "missing host", ski: remoteSKI, endpoint: api.RemoteEndpoint{Port: 54321, Path: "/ship/"}},
+		{name: "zero port", ski: remoteSKI, endpoint: api.RemoteEndpoint{Host: "192.0.2.21", Path: "/ship/"}},
+		{name: "relative path", ski: remoteSKI, endpoint: api.RemoteEndpoint{Host: "192.0.2.21", Port: 54321, Path: "ship"}},
 	}
 
 	for _, test := range tests {

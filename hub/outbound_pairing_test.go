@@ -8,11 +8,11 @@ import (
 	"github.com/Project-Helianthus/helianthus-ship-go/model"
 )
 
-const outboundPairingTestSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
+const outboundPairingTestSKI = "0123456789abcdef0123456789abcdef01234567"
 
 var outboundPairingTestEndpoint = api.RemoteEndpoint{
-	Host: "192.168.100.21",
-	Port: 12480,
+	Host: "192.0.2.21",
+	Port: 54321,
 	Path: "/ship/",
 }
 
@@ -63,8 +63,8 @@ func TestOutboundPairingPermitCarriesExactEndpointWithoutTrustPromotion(t *testi
 	}
 	assertOutboundPairingRequest(t, requests[0])
 	calls, _ := dialer.snapshot()
-	if len(calls) == 0 || calls[0].url != "wss://192.168.100.21:12480/ship/" {
-		t.Fatalf("first dial = %#v, want exact VR940 endpoint", calls)
+	if len(calls) == 0 || calls[0].url != "wss://192.0.2.21:54321/ship/" {
+		t.Fatalf("first dial = %#v, want exact synthetic endpoint", calls)
 	}
 	if hub.ServiceForSKI(outboundPairingTestSKI).Trusted() {
 		t.Fatal("outgoing attempt granted trust before confirmation")
