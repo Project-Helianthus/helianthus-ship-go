@@ -204,17 +204,6 @@ func (g *scriptedAttemptGate) AbortPrepared(handle api.OutgoingAttemptHandle) (a
 	return api.OutgoingAttemptAbortConsumed, nil
 }
 
-func (g *scriptedAttemptGate) cancelLatest(t *testing.T) {
-	t.Helper()
-	g.mu.Lock()
-	handle := g.latest
-	g.mu.Unlock()
-	if handle == nil {
-		t.Fatal("gate has no prepared handle to cancel")
-	}
-	handle.cancel()
-}
-
 func (g *scriptedAttemptGate) snapshot() ([]api.OutgoingAttemptRequest, []api.OutgoingAttemptHandle, []api.OutgoingAttemptPermit, []api.OutgoingAttemptHandle) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -235,9 +224,11 @@ type fakePeerDialer struct {
 	calls               []dialObservation
 	peerEffects         int
 	err                 error
+	connection          *websocket.Conn
 	started             chan struct{}
 	startedOnce         sync.Once
 	waitForCancellation bool
+	release             <-chan struct{}
 }
 
 func (d *fakePeerDialer) DialContext(ctx context.Context, url string, _ http.Header) (*websocket.Conn, *http.Response, error) {
@@ -251,13 +242,17 @@ func (d *fakePeerDialer) DialContext(ctx context.Context, url string, _ http.Hea
 		return nil, nil, err
 	}
 	if d.waitForCancellation {
-		<-ctx.Done()
-		return nil, nil, ctx.Err()
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-d.release:
+			return nil, nil, d.err
+		}
 	}
 	d.mu.Lock()
 	d.peerEffects++
 	d.mu.Unlock()
-	return nil, nil, d.err
+	return d.connection, nil, d.err
 }
 
 func (d *fakePeerDialer) snapshot() ([]dialObservation, int) {
@@ -616,7 +611,7 @@ func TestAbortPreparedOnlyCleansUnlaunchedReservation(t *testing.T) {
 	})
 }
 
-func TestCanceledPermitContextIsPassedOnceWithoutPeerEffect(t *testing.T) {
+func TestCanceledPermitContextPreventsPeerEffect(t *testing.T) {
 	gate := newScriptedAttemptGate(gateCancelBeforePermit)
 	dialer := &fakePeerDialer{err: errAttemptTestDial}
 	hub, _, remote := newAttemptTestHub(t, gate, dialer)
@@ -628,65 +623,175 @@ func TestCanceledPermitContextIsPassedOnceWithoutPeerEffect(t *testing.T) {
 	if len(permits) != 1 || len(calls) != 1 {
 		t.Fatalf("permit/dial = %d/%d, want 1/1", len(permits), len(calls))
 	}
-	if permits[0].Context != calls[0].context || calls[0].context.Err() == nil {
-		t.Fatal("DialContext did not receive the exact already-canceled permit context")
+	if permits[0].Context.Err() == nil || calls[0].context.Err() == nil {
+		t.Fatal("DialContext did not receive an already-canceled attempt context")
 	}
 	if peerEffects != 0 {
 		t.Fatalf("already-canceled context reached fake peer %d times, want zero", peerEffects)
 	}
 }
 
-func TestCancellationAroundAuthorizeAndDialIsRaceSafe(t *testing.T) {
-	t.Run("unregistered and canceled while authorize is blocked", func(t *testing.T) {
-		gate := newScriptedAttemptGate(gatePermit)
-		gate.authorizeEntered = make(chan struct{})
-		gate.authorizeRelease = make(chan struct{})
-		t.Cleanup(func() {
+func TestHubInvalidationRechecksTrustedAttemptImmediatelyBeforeDial(t *testing.T) {
+	invalidations := []struct {
+		name string
+		run  func(*Hub, string)
+	}{
+		{name: "unregister remote", run: func(hub *Hub, ski string) { hub.UnregisterRemoteSKI(ski) }},
+		{name: "cancel pairing", run: func(hub *Hub, ski string) { hub.CancelPairingWithSKI(ski) }},
+	}
+
+	for _, invalidation := range invalidations {
+		t.Run(invalidation.name, func(t *testing.T) {
+			gate := newScriptedAttemptGate(gatePermit)
+			gate.authorizeEntered = make(chan struct{})
+			gate.authorizeRelease = make(chan struct{})
+			t.Cleanup(func() {
+				select {
+				case <-gate.authorizeRelease:
+				default:
+					close(gate.authorizeRelease)
+				}
+			})
+			dialer := &fakePeerDialer{err: errAttemptTestDial}
+			hub, _, remote := newAttemptTestHub(t, gate, dialer)
+			remote.SetTrusted(true)
+			result := make(chan error, 1)
+			go func() {
+				_, _, _, err := hub.gatedDialContext(remote, "peer.local", "4712", "/ship/")
+				result <- err
+			}()
+
+			waitForSignal(t, gate.authorizeEntered)
+			invalidationDone := make(chan struct{})
+			go func() {
+				invalidation.run(hub, remote.SKI())
+				close(invalidationDone)
+			}()
 			select {
-			case <-gate.authorizeRelease:
-			default:
-				close(gate.authorizeRelease)
+			case <-invalidationDone:
+			case <-time.After(2 * time.Second):
+				t.Fatal("Hub cancellation API blocked while launch authorization was paused")
 			}
+			close(gate.authorizeRelease)
+			err := waitForError(t, result)
+			calls, peerEffects := dialer.snapshot()
+			if len(calls) != 0 || peerEffects != 0 {
+				t.Fatalf("invalidated trusted attempt reached dialer/peer = %d/%d, want zero/zero", len(calls), peerEffects)
+			}
+			assertTypedAttemptDenial(t, err)
 		})
-		dialer := &fakePeerDialer{err: errAttemptTestDial}
-		hub, _, remote := newAttemptTestHub(t, gate, dialer)
-		remote.SetTrusted(true)
-		result := make(chan error, 1)
-		go func() {
-			result <- hub.connectFoundService(remote, "peer.local", "4712", "/ship/")
-		}()
+	}
+}
 
-		waitForSignal(t, gate.authorizeEntered)
-		hub.UnregisterRemoteSKI(remote.SKI())
-		gate.cancelLatest(t)
-		close(gate.authorizeRelease)
-		assertTypedAttemptDenial(t, waitForError(t, result))
-		if remote.Trusted() {
-			t.Fatal("unregistration left the remote service trusted")
-		}
-		calls, peerEffects := dialer.snapshot()
-		if len(calls) != 0 || peerEffects != 0 {
-			t.Fatalf("pre-authorize cancellation dial/peer = %d/%d, want zero/zero", len(calls), peerEffects)
-		}
-	})
+func TestHubCancellationInterruptsContextBlockedGatedDialWithoutDeadlock(t *testing.T) {
+	const remoteSKI = "13579bdf2468ace013579bdf2468ace013579bdf"
+	attemptKinds := []struct {
+		name  string
+		admit func(*testing.T, *Hub, *api.ServiceDetails)
+	}{
+		{
+			name: "queued pairing",
+			admit: func(t *testing.T, hub *Hub, _ *api.ServiceDetails) {
+				t.Helper()
+				if err := hub.QueueRemoteSKI(remoteSKI); err != nil {
+					t.Fatalf("queue synthetic remote: %v", err)
+				}
+			},
+		},
+		{
+			name: "trusted reconnect",
+			admit: func(_ *testing.T, _ *Hub, remote *api.ServiceDetails) {
+				remote.SetTrusted(true)
+			},
+		},
+	}
+	invalidations := []struct {
+		name string
+		run  func(*Hub, string)
+	}{
+		{name: "unregister remote", run: func(hub *Hub, ski string) { hub.UnregisterRemoteSKI(ski) }},
+		{name: "cancel pairing", run: func(hub *Hub, ski string) { hub.CancelPairingWithSKI(ski) }},
+	}
 
-	t.Run("canceled after authorize at dial boundary", func(t *testing.T) {
-		gate := newScriptedAttemptGate(gatePermit)
-		dialer := &fakePeerDialer{started: make(chan struct{}), waitForCancellation: true}
-		hub, _, remote := newAttemptTestHub(t, gate, dialer)
-		result := make(chan error, 1)
-		go func() {
-			result <- hub.connectFoundService(remote, "peer.local", "4712", "/ship/")
-		}()
+	for _, attemptKind := range attemptKinds {
+		for _, invalidation := range invalidations {
+			t.Run(attemptKind.name+"/"+invalidation.name, func(t *testing.T) {
+				release := make(chan struct{})
+				t.Cleanup(func() {
+					select {
+					case <-release:
+					default:
+						close(release)
+					}
+				})
+				gate := newScriptedAttemptGate(gatePermit)
+				dialer := &fakePeerDialer{
+					err:                 errAttemptTestDial,
+					started:             make(chan struct{}),
+					waitForCancellation: true,
+					release:             release,
+				}
+				hub, _, _ := newAttemptTestHub(t, gate, dialer)
+				remote := hub.ServiceForSKI(remoteSKI)
+				attemptKind.admit(t, hub, remote)
+				result := make(chan error, 1)
+				go func() {
+					_, _, _, err := hub.gatedDialContext(remote, "peer.local", "4712", "/ship/")
+					result <- err
+				}()
 
-		waitForSignal(t, dialer.started)
-		gate.cancelLatest(t)
-		assertTypedAttemptDenial(t, waitForError(t, result))
-		calls, peerEffects := dialer.snapshot()
-		if len(calls) != 1 || peerEffects != 0 {
-			t.Fatalf("dial-boundary cancellation dial/peer = %d/%d, want 1/0", len(calls), peerEffects)
+				waitForSignal(t, dialer.started)
+				invalidationDone := make(chan struct{})
+				go func() {
+					invalidation.run(hub, remoteSKI)
+					close(invalidationDone)
+				}()
+				select {
+				case <-invalidationDone:
+				case <-time.After(2 * time.Second):
+					t.Fatal("Hub cancellation API blocked while DialContext was running; admission lock may be held across DialContext")
+				}
+
+				var err error
+				select {
+				case err = <-result:
+				case <-time.After(2 * time.Second):
+					t.Fatal("context-blocked DialContext did not observe Hub-owned cancellation")
+				}
+				assertTypedAttemptDenial(t, err)
+				calls, peerEffects := dialer.snapshot()
+				if len(calls) != 1 {
+					t.Fatalf("canceled dial calls = %d, want 1", len(calls))
+				}
+				if calls[0].context.Err() == nil || peerEffects != 0 {
+					t.Fatalf("canceled dial context/peer = %v/%d, want canceled/0", calls[0].context.Err(), peerEffects)
+				}
+			})
 		}
-	})
+	}
+}
+
+func TestTrustedReconnectStillDialsWhenNotInvalidated(t *testing.T) {
+	gate := newScriptedAttemptGate(gatePermit)
+	wantConnection := &websocket.Conn{}
+	dialer := &fakePeerDialer{connection: wantConnection}
+	hub, _, remote := newAttemptTestHub(t, gate, dialer)
+	remote.SetTrusted(true)
+
+	connection, _, attempt, err := hub.gatedDialContext(remote, "peer.local", "4712", "/ship/")
+	if err != nil {
+		t.Fatalf("non-revoked trusted reconnect: %v", err)
+	}
+	if connection != wantConnection || attempt == nil {
+		t.Fatalf("trusted reconnect connection/attempt = %p/%#v, want %p/authorized attempt", connection, attempt, wantConnection)
+	}
+	calls, peerEffects := dialer.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("trusted reconnect dials = %d, want 1", len(calls))
+	}
+	if calls[0].context.Err() != nil || peerEffects != 1 {
+		t.Fatalf("trusted reconnect context/peer = %v/%d, want active/1", calls[0].context.Err(), peerEffects)
+	}
 }
 
 func newAttemptTestHub(t *testing.T, gate api.OutgoingAttemptGate, dialer *fakePeerDialer) (*Hub, *attemptTestMdns, *api.ServiceDetails) {
