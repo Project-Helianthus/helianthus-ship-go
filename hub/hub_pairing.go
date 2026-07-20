@@ -1,6 +1,8 @@
 package hub
 
 import (
+	"errors"
+
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
 	"github.com/Project-Helianthus/helianthus-ship-go/model"
 	"github.com/Project-Helianthus/helianthus-ship-go/util"
@@ -76,11 +78,15 @@ func (h *Hub) SetAutoAccept(autoaccept bool) {
 // SetPairingRegistration changes only the SHIP mDNS registration signal.
 // Manual approval flows use it to advertise availability without enabling
 // automatic handshake acceptance.
-func (h *Hub) SetPairingRegistration(available bool) {
+func (h *Hub) SetPairingRegistration(available bool) error {
 	h.muxReg.Lock()
 	defer h.muxReg.Unlock()
 
-	h.mdns.SetAutoAccept(available)
+	setter, ok := h.mdns.(api.PairingRegistrationSetter)
+	if !ok {
+		return errors.New("mDNS does not support pairing registration")
+	}
+	return setter.SetPairingRegistration(available)
 }
 
 // check if auto accept is true

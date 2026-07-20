@@ -37,6 +37,13 @@ type HubInterface interface {
 	CancelPairingWithSKI(ski string)
 }
 
+// PairingRegistrationSetter controls whether the SHIP service advertises that
+// a user-mediated pairing flow is available. It does not enable automatic
+// handshake acceptance. The caller owns the bounded pairing-window lifecycle.
+type PairingRegistrationSetter interface {
+	SetPairingRegistration(bool) error
+}
+
 // Interface to pass information from the hub to the eebus service
 //
 // Implemented by eebus service implementation, used by Hub

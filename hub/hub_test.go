@@ -141,22 +141,27 @@ func (s *HubSuite) Test_AutoAccept() {
 }
 
 func (s *HubSuite) Test_PairingRegistrationDoesNotEnableAutoAccept() {
-	s.mdnsService.EXPECT().SetAutoAccept(true).Return().Times(1)
-	s.mdnsService.EXPECT().SetAutoAccept(false).Return().Times(1)
+	mdnsService := &pairingRegistrationMDNS{MdnsInterface: s.mdnsService}
+	s.sut.mdns = mdnsService
 
-	s.sut.SetPairingRegistration(true)
+	err := s.sut.SetPairingRegistration(true)
+	assert.NoError(s.T(), err)
 	assert.False(s.T(), s.sut.IsAutoAcceptEnabled())
 
-	s.sut.SetPairingRegistration(false)
+	err = s.sut.SetPairingRegistration(false)
+	assert.NoError(s.T(), err)
 	assert.False(s.T(), s.sut.IsAutoAcceptEnabled())
+	assert.Equal(s.T(), []bool{true, false}, mdnsService.values)
 }
 
 type pairingRegistrationMDNS struct {
 	api.MdnsInterface
-	err error
+	err    error
+	values []bool
 }
 
-func (m *pairingRegistrationMDNS) SetPairingRegistration(bool) error {
+func (m *pairingRegistrationMDNS) SetPairingRegistration(value bool) error {
+	m.values = append(m.values, value)
 	return m.err
 }
 

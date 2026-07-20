@@ -96,6 +96,7 @@ func NewHub(hubReader api.HubReaderInterface,
 
 var _ api.HubInterface = (*Hub)(nil)
 var _ api.OutgoingAttemptGateSetter = (*Hub)(nil)
+var _ api.PairingRegistrationSetter = (*Hub)(nil)
 
 // SetOutgoingAttemptGate installs or removes the optional outgoing dial gate.
 func (h *Hub) SetOutgoingAttemptGate(gate api.OutgoingAttemptGate) error {
