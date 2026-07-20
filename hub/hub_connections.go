@@ -39,6 +39,7 @@ type authorizedOutgoingAttempt struct {
 	remoteSKI         string
 	metadata          api.OutgoingAttemptMetadata
 	context           context.Context
+	registration      *outboundAttemptRegistration
 	terminal          sync.Once
 	terminalSucceeded bool
 }
@@ -48,6 +49,7 @@ func (a *authorizedOutgoingAttempt) terminalFailure(h *Hub) bool {
 		return true
 	}
 	a.terminal.Do(func() {
+		h.releaseOutboundAttemptRegistration(a.remoteSKI, a.registration)
 		a.terminalSucceeded = h.reportOutgoingAttemptTerminalFailure(a.remoteSKI, a.metadata)
 	})
 	return a.terminalSucceeded
@@ -319,6 +321,9 @@ func (h *Hub) connectFoundService(remoteService *api.ServiceDetails, host, port,
 	if configurationErr != nil {
 		return failBeforeConnection(errOutgoingAttemptFailed)
 	}
+	if !h.bindOutboundAttemptConnection(remoteService.SKI(), attempt.registration, shipConnection) {
+		return failBeforeConnection(outgoingAttemptDeniedError{})
+	}
 
 	registered := h.registerOutgoingConnection(shipConnection, attempt.context)
 	shipConnection.Run()
@@ -342,13 +347,7 @@ func (h *Hub) gatedDialContext(
 		return nil, nil, nil, outgoingAttemptDeniedError{}
 	}
 
-	untrusted := !remoteService.Trusted()
-	queued := remoteService.ConnectionStateDetail().State() == api.ConnectionStateQueued
-	gate, gateGeneration, admission, requireAdmission, admissionValid := h.outgoingAttemptGateSnapshot(
-		remoteService.SKI(),
-		untrusted,
-		queued,
-	)
+	gate, gateGeneration, authority, admission, requireAdmission, admissionValid := h.outgoingAttemptGateSnapshot(remoteService)
 	if !admissionValid {
 		return nil, nil, nil, outgoingAttemptDeniedError{}
 	}
@@ -434,13 +433,22 @@ func (h *Hub) gatedDialContext(
 			abortOutgoingAttempt(gate, handle)
 			return nil, nil, nil, outgoingAttemptDeniedError{}
 		}
-		if requireAdmission {
-			if !h.lockOutboundAdmissionForLaunch(remoteService.SKI(), gateGeneration, admission) {
-				attempt.terminalFailure(h)
-				return nil, nil, attempt, outgoingAttemptDeniedError{}
-			}
-			defer h.muxAttemptGate.RUnlock()
+		registration, registered := h.registerOutboundAttemptForLaunch(
+			remoteService.SKI(),
+			gateGeneration,
+			authority,
+			admission,
+			requireAdmission,
+			expectedMetadata,
+			permit.Context,
+		)
+		if !registered {
+			attempt.terminalFailure(h)
+			return nil, nil, attempt, outgoingAttemptDeniedError{}
 		}
+		attempt.context = registration.context
+		attempt.registration = registration
+		permit.Context = registration.context
 	}
 
 	connection, response, err = h.dialer.DialContext(permit.Context, address, nil)

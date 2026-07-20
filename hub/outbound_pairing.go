@@ -33,10 +33,9 @@ func (h *Hub) QueueRemoteSKI(ski string) error {
 	if service.Trusted() {
 		return errors.New("remote is already trusted")
 	}
-	if !h.createOutboundAdmission(normalized) {
+	if !h.createOutboundAdmission(normalized, service) {
 		return errOutboundGateRequired
 	}
-	service.ConnectionStateDetail().SetState(api.ConnectionStateQueued)
 	if h.hubReader != nil {
 		h.hubReader.ServicePairingDetailUpdate(normalized, service.ConnectionStateDetail())
 	}
