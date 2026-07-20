@@ -73,6 +73,16 @@ func (h *Hub) SetAutoAccept(autoaccept bool) {
 	h.mdns.SetAutoAccept(autoaccept)
 }
 
+// SetPairingRegistration changes only the SHIP mDNS registration signal.
+// Manual approval flows use it to advertise availability without enabling
+// automatic handshake acceptance.
+func (h *Hub) SetPairingRegistration(available bool) {
+	h.muxReg.Lock()
+	defer h.muxReg.Unlock()
+
+	h.mdns.SetAutoAccept(available)
+}
+
 // check if auto accept is true
 func (h *Hub) IsAutoAcceptEnabled() bool {
 	h.muxReg.Lock()
