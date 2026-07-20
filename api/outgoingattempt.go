@@ -13,6 +13,20 @@ type OutgoingAttemptEndpoint struct {
 	Port uint16
 }
 
+// RemoteEndpoint identifies one manually reported SHIP endpoint.
+type RemoteEndpoint struct {
+	Host string
+	Port uint16
+	Path string
+}
+
+// OutboundPairingController is an optional hub capability for locally
+// initiated pairing without granting trust before the SHIP handshake.
+type OutboundPairingController interface {
+	QueueRemoteSKI(string) error
+	ReportRemoteEndpoint(string, RemoteEndpoint) error
+}
+
 // OutgoingAttemptRequest binds one outgoing attempt to its peer, endpoint, and path.
 type OutgoingAttemptRequest struct {
 	RemoteSKI string

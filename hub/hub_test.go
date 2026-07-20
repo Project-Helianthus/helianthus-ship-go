@@ -161,10 +161,12 @@ func (s *HubSuite) Test_QueueRemoteSKILeavesTrustFalseAndRequestsDiscovery() {
 	s.sut.muxStarted.Lock()
 	s.sut.hasStarted = true
 	s.sut.muxStarted.Unlock()
-	s.mdnsService.EXPECT().RequestMdnsEntries().Return().Times(1)
+	mdnsService := &requestRecordingMDNS{MdnsInterface: s.mdnsService}
+	s.sut.mdns = mdnsService
 
 	err := s.sut.QueueRemoteSKI(remoteSKI)
 	assert.NoError(s.T(), err)
+	assert.Equal(s.T(), 1, mdnsService.requests)
 	remote := s.sut.ServiceForSKI(remoteSKI)
 	assert.False(s.T(), remote.Trusted())
 	assert.Equal(s.T(), api.ConnectionStateQueued, remote.ConnectionStateDetail().State())
@@ -174,6 +176,7 @@ func (s *HubSuite) Test_ReportRemoteEndpointDoesNotGrantTrust() {
 	const remoteSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
 	endpoint := api.RemoteEndpoint{Host: "192.168.100.21", Port: 12480, Path: "/ship/"}
 
+	assert.NoError(s.T(), s.sut.QueueRemoteSKI(remoteSKI))
 	s.sut.setConnectionAttemptRunning(remoteSKI, true)
 	err := s.sut.ReportRemoteEndpoint(remoteSKI, endpoint)
 	assert.NoError(s.T(), err)
@@ -188,6 +191,33 @@ func (s *HubSuite) Test_ReportRemoteEndpointDoesNotGrantTrust() {
 		assert.Equal(s.T(), int(endpoint.Port), entry.Port)
 		assert.Equal(s.T(), endpoint.Path, entry.Path)
 	}
+}
+
+func (s *HubSuite) Test_ReportRemoteEndpointRejectsUnqueuedRemote() {
+	const remoteSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
+	endpoint := api.RemoteEndpoint{Host: "192.168.100.21", Port: 12480, Path: "/ship/"}
+
+	assert.ErrorIs(s.T(), s.sut.ReportRemoteEndpoint(remoteSKI, endpoint), errRemoteNotAdmitted)
+	assert.False(s.T(), s.sut.ServiceForSKI(remoteSKI).Trusted())
+}
+
+func (s *HubSuite) Test_QueueRemoteSKIRejectsTrustedRemoteWithoutDowngrade() {
+	const remoteSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
+	remote := s.sut.ServiceForSKI(remoteSKI)
+	remote.SetTrusted(true)
+
+	assert.Error(s.T(), s.sut.QueueRemoteSKI(remoteSKI))
+	assert.True(s.T(), remote.Trusted())
+	assert.NotEqual(s.T(), api.ConnectionStateQueued, remote.ConnectionStateDetail().State())
+}
+
+type requestRecordingMDNS struct {
+	api.MdnsInterface
+	requests int
+}
+
+func (m *requestRecordingMDNS) RequestMdnsEntries() {
+	m.requests++
 }
 
 func (s *HubSuite) Test_ReportRemoteEndpointRejectsInvalidInput() {
