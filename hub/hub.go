@@ -66,6 +66,11 @@ type Hub struct {
 
 	autoaccept bool
 
+	// Operator-validated, untrusted SKIs admitted while pairing registration is
+	// open. Endpoints remain owned exclusively by live mDNS observations.
+	pairingRegistration bool
+	pairingCandidates   map[string]struct{}
+
 	// The list of known remote services
 	remoteServices map[string]*api.ServiceDetails
 
@@ -98,6 +103,7 @@ func NewHub(hubReader api.HubReaderInterface,
 		connectionAttemptRunning: make(map[string]bool),
 		connectionsInitiating:    make(map[string]bool),
 		remoteServices:           make(map[string]*api.ServiceDetails),
+		pairingCandidates:        make(map[string]struct{}),
 		hubReader:                hubReader,
 		port:                     port,
 		certifciate:              certificate,
@@ -114,6 +120,7 @@ func NewHub(hubReader api.HubReaderInterface,
 var _ api.HubInterface = (*Hub)(nil)
 var _ api.OutgoingAttemptGateSetter = (*Hub)(nil)
 var _ api.PairingRegistrationSetter = (*Hub)(nil)
+var _ api.PairingCandidateQueuer = (*Hub)(nil)
 
 // SetOutgoingAttemptGate installs or removes the optional outgoing dial gate.
 func (h *Hub) SetOutgoingAttemptGate(gate api.OutgoingAttemptGate) error {
