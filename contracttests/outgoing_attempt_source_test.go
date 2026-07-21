@@ -31,6 +31,10 @@ func TestOutboundPairingAPIIsAbsentFromProductionTree(t *testing.T) {
 		"ReportRemoteEndpoint":                  {},
 		"cacheRemoteEndpoint":                   {},
 		"createOutboundAdmission":               {},
+		"errInvalidRemoteEndpoint":              {},
+		"errInvalidRemoteSKI":                   {},
+		"errOutboundGateRequired":               {},
+		"errRemoteNotAdmitted":                  {},
 		"hasCurrentOutboundAdmission":           {},
 		"invalidateAllOutboundAdmissionsLocked": {},
 		"outboundAdmissions":                    {},
@@ -66,6 +70,83 @@ func TestOutboundPairingAPIIsAbsentFromProductionTree(t *testing.T) {
 	sort.Strings(declarations)
 	if len(declarations) != 0 {
 		t.Errorf("removed outbound pairing declarations remain: %v", declarations)
+	}
+}
+
+func TestDiscoveredMdnsEntriesAreTheOnlyConnectionInitiationSource(t *testing.T) {
+	root, fset, files := loadProductionFiles(t)
+	expectedCallers := map[string]string{
+		"coordinateConnectionInitations": "ReportMdnsEntries",
+		"prepareConnectionInitation":     "coordinateConnectionInitations",
+		"initateConnectionWithError":     "prepareConnectionInitation",
+		"connectFoundService":            "initateConnectionWithError",
+		"gatedDialContext":               "connectFoundService",
+	}
+	callers := make(map[string][]string)
+	var constructorsOutsideDiscovery []string
+	var hubEndpointCollections []string
+
+	for _, parsed := range files {
+		parents := parentMap(parsed.file)
+		apiNames := importedPackageNames(parsed.file, "github.com/Project-Helianthus/helianthus-ship-go/api")
+		packageDir, err := filepath.Rel(root, filepath.Dir(parsed.path))
+		if err != nil {
+			t.Fatalf("resolve package directory for %s: %v", parsed.path, err)
+		}
+
+		ast.Inspect(parsed.file, func(node ast.Node) bool {
+			switch item := node.(type) {
+			case *ast.CompositeLit:
+				if !isMdnsEntryType(item.Type, parsed.file.Name.Name, apiNames) {
+					return true
+				}
+				owner := enclosingFunctionDeclaration(parents, item)
+				if packageDir != "mdns" || receiverName(owner) != "MdnsManager" {
+					constructorsOutsideDiscovery = append(constructorsOutsideDiscovery, fset.Position(item.Pos()).String())
+				}
+			case *ast.TypeSpec:
+				if item.Name.Name != "Hub" {
+					return true
+				}
+				structure, ok := item.Type.(*ast.StructType)
+				if !ok {
+					return true
+				}
+				for _, field := range structure.Fields.List {
+					if containsMdnsEntryCollection(field.Type, parsed.file.Name.Name, apiNames) {
+						hubEndpointCollections = append(hubEndpointCollections, fset.Position(field.Pos()).String())
+					}
+				}
+			case *ast.CallExpr:
+				selector, ok := item.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				if _, tracked := expectedCallers[selector.Sel.Name]; tracked {
+					callers[selector.Sel.Name] = append(callers[selector.Sel.Name],
+						fset.Position(item.Pos()).String()+" in "+enclosingFunction(parents, item))
+				}
+			}
+			return true
+		})
+	}
+
+	if len(constructorsOutsideDiscovery) != 0 {
+		t.Errorf("MdnsEntry values are constructed outside MdnsManager discovery/report processing: %v", constructorsOutsideDiscovery)
+	}
+	if len(hubEndpointCollections) != 0 {
+		t.Errorf("Hub retains a separate MdnsEntry collection that could become an unobserved endpoint feed: %v", hubEndpointCollections)
+	}
+	for callee, expectedCaller := range expectedCallers {
+		if len(callers[callee]) == 0 {
+			t.Errorf("production discovery pipeline has no call to %s", callee)
+			continue
+		}
+		for _, call := range callers[callee] {
+			if !strings.HasSuffix(call, " in "+expectedCaller) {
+				t.Errorf("%s bypasses discovered-entry pipeline; want only %s callers: %s", callee, expectedCaller, call)
+			}
+		}
 	}
 }
 
@@ -545,6 +626,66 @@ func parentMap(root ast.Node) map[ast.Node]ast.Node {
 		return true
 	})
 	return parents
+}
+
+func importedPackageNames(file *ast.File, importPath string) map[string]bool {
+	names := make(map[string]bool)
+	for _, imported := range file.Imports {
+		if strings.Trim(imported.Path.Value, `"`) != importPath {
+			continue
+		}
+		name := filepath.Base(importPath)
+		if imported.Name != nil {
+			name = imported.Name.Name
+		}
+		names[name] = true
+	}
+	return names
+}
+
+func isMdnsEntryType(expression ast.Expr, packageName string, apiNames map[string]bool) bool {
+	switch item := expression.(type) {
+	case *ast.Ident:
+		return item.Name == "MdnsEntry" && (packageName == "api" || apiNames["."])
+	case *ast.SelectorExpr:
+		owner, ok := item.X.(*ast.Ident)
+		return ok && apiNames[owner.Name] && item.Sel.Name == "MdnsEntry"
+	default:
+		return false
+	}
+}
+
+func containsMdnsEntryCollection(expression ast.Expr, packageName string, apiNames map[string]bool) bool {
+	switch item := expression.(type) {
+	case *ast.ArrayType:
+		return containsMdnsEntryType(item.Elt, packageName, apiNames)
+	case *ast.MapType:
+		return containsMdnsEntryType(item.Value, packageName, apiNames)
+	default:
+		return false
+	}
+}
+
+func containsMdnsEntryType(expression ast.Expr, packageName string, apiNames map[string]bool) bool {
+	switch item := expression.(type) {
+	case *ast.StarExpr:
+		return containsMdnsEntryType(item.X, packageName, apiNames)
+	case *ast.ArrayType:
+		return containsMdnsEntryType(item.Elt, packageName, apiNames)
+	case *ast.MapType:
+		return containsMdnsEntryType(item.Value, packageName, apiNames)
+	default:
+		return isMdnsEntryType(expression, packageName, apiNames)
+	}
+}
+
+func enclosingFunctionDeclaration(parents map[ast.Node]ast.Node, node ast.Node) *ast.FuncDecl {
+	for current := node; current != nil; current = parents[current] {
+		if declaration, ok := current.(*ast.FuncDecl); ok {
+			return declaration
+		}
+	}
+	return nil
 }
 
 func enclosingFunction(parents map[ast.Node]ast.Node, node ast.Node) string {

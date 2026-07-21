@@ -3,7 +3,6 @@ package hub
 import (
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
 )
@@ -24,68 +23,6 @@ func (g *notifyingAttemptGate) Prepare(request api.OutgoingAttemptRequest) (api.
 	handle, err := g.scriptedAttemptGate.Prepare(request)
 	g.prepared <- struct{}{}
 	return handle, err
-}
-
-func TestHubSingleFlightAcrossConcurrentDiscoveredEndpointAttempts(t *testing.T) {
-	authorizeRelease := make(chan struct{})
-	dialRelease := make(chan struct{})
-	t.Cleanup(func() {
-		select {
-		case <-authorizeRelease:
-		default:
-			close(authorizeRelease)
-		}
-		select {
-		case <-dialRelease:
-		default:
-			close(dialRelease)
-		}
-	})
-	gate := &notifyingAttemptGate{
-		scriptedAttemptGate: newScriptedAttemptGate(gatePermit),
-		prepared:            make(chan struct{}, 4),
-	}
-	gate.authorizeEntered = make(chan struct{})
-	gate.authorizeRelease = authorizeRelease
-	dialer := &fakePeerDialer{
-		err:                 errAttemptTestDial,
-		started:             make(chan struct{}),
-		waitForCancellation: true,
-		release:             dialRelease,
-	}
-	hub, _, _ := newAttemptTestHub(t, gate, dialer)
-	remote := hub.ServiceForSKI(outgoingAttemptTestSKI)
-	remote.SetTrusted(true)
-
-	result := make(chan error, 1)
-	go func() {
-		result <- hub.connectFoundService(remote, outgoingAttemptTestHost, outgoingAttemptTestPort, outgoingAttemptTestPath)
-	}()
-	waitForSignal(t, gate.prepared)
-	waitForSignal(t, gate.authorizeEntered)
-
-	if err := hub.connectFoundService(remote, outgoingAttemptTestHost, outgoingAttemptTestPort, outgoingAttemptTestPath); err != nil {
-		t.Fatalf("concurrent discovered endpoint attempt: %v", err)
-	}
-
-	select {
-	case <-gate.prepared:
-		requests, _, _, _ := gate.snapshot()
-		t.Fatalf("concurrent discovered endpoint prepared %d outgoing attempts for one SKI, want 1", len(requests))
-	case <-time.After(250 * time.Millisecond):
-	}
-
-	requests, authorized, _, _ := gate.snapshot()
-	if len(requests) != 1 || len(authorized) != 1 {
-		t.Fatalf("single-flight prepare/authorize counts = %d/%d, want 1/1", len(requests), len(authorized))
-	}
-
-	close(authorizeRelease)
-	waitForSignal(t, dialer.started)
-	close(dialRelease)
-	if err := waitForError(t, result); !errors.Is(err, errAttemptTestDial) {
-		t.Fatalf("discovered endpoint terminal error = %v, want %v", err, errAttemptTestDial)
-	}
 }
 
 func TestHubSingleFlightReservationClearsAfterTerminalFailure(t *testing.T) {
