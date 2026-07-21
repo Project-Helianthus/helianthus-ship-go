@@ -166,10 +166,14 @@ func (h *Hub) QueuePairingCandidate(candidateRef, expectedSKI string) error {
 		return api.ErrPairingCandidateActive
 	}
 	h.consumedPairingCandidates[candidateRef] = struct{}{}
-	h.activePairingCandidates[validatedSKI] = service
 	h.muxAttemptGate.Lock()
 	candidateAuthority := h.currentOutboundAuthorityLocked(validatedSKI)
 	h.muxAttemptGate.Unlock()
+	activeCandidate := &activePairingCandidate{
+		service:   service,
+		authority: candidateAuthority,
+	}
+	h.activePairingCandidates[validatedSKI] = activeCandidate
 	service.SetShipID("")
 	service.ConnectionStateDetail().SetState(api.ConnectionStateQueued)
 	h.muxReg.Unlock()
@@ -182,14 +186,14 @@ func (h *Hub) QueuePairingCandidate(candidateRef, expectedSKI string) error {
 	path := entry.path
 	h.launchPairingCandidate(func() {
 		h.muxReg.Lock()
-		active := h.activePairingCandidates[validatedSKI] == service
+		active := h.activePairingCandidates[validatedSKI] == activeCandidate
 		h.muxReg.Unlock()
 		if !active {
 			return
 		}
 		if err := h.connectFoundPairingCandidate(service, host, port, path, validatedSKI, candidateAuthority); err != nil {
 			h.muxReg.Lock()
-			active = h.activePairingCandidates[validatedSKI] == service && !service.Trusted()
+			active = h.activePairingCandidates[validatedSKI] == activeCandidate && !service.Trusted()
 			if active {
 				delete(h.activePairingCandidates, validatedSKI)
 			}
@@ -243,6 +247,39 @@ func (h *Hub) retirePairingCandidate(ski string, service *api.ServiceDetails) {
 	}
 	if h.hubReader != nil {
 		h.hubReader.ServicePairingDetailUpdate(ski, service.ConnectionStateDetail())
+	}
+}
+
+func (h *Hub) retireClosedPairingCandidate(
+	ski string,
+	releasedAuthority *outboundAttemptAuthority,
+) {
+	if releasedAuthority == nil {
+		return
+	}
+
+	h.muxReg.Lock()
+	active := h.activePairingCandidates[ski]
+	if active == nil || active.authority != releasedAuthority || active.service.Trusted() {
+		h.muxReg.Unlock()
+		return
+	}
+
+	// Keep admission and authority rotation under the same lock order used by
+	// QueuePairingCandidate so a replacement cannot inherit the retired epoch.
+	h.muxAttemptGate.Lock()
+	h.rotateOutboundAuthorityLocked(ski)
+	cancellations := h.removeOutboundAttemptRegistrationsLocked(ski)
+	active.service.SetTrusted(false)
+	active.service.ConnectionStateDetail().SetState(api.ConnectionStateNone)
+	h.muxAttemptGate.Unlock()
+	delete(h.activePairingCandidates, ski)
+	h.muxReg.Unlock()
+
+	cancelOutboundAttemptRegistrations(cancellations)
+	h.removeConnectionAttemptCounter(ski)
+	if h.hubReader != nil {
+		h.hubReader.ServicePairingDetailUpdate(ski, active.service.ConnectionStateDetail())
 	}
 }
 

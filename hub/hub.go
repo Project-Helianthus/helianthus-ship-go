@@ -39,6 +39,11 @@ type pairingCandidateObservation struct {
 	addresses []net.IP
 }
 
+type activePairingCandidate struct {
+	service   *api.ServiceDetails
+	authority *outboundAttemptAuthority
+}
+
 // defines the delay timeframes in seconds depening on the connection attempt counter
 // the last item will be re-used for higher attempt counter values
 var connectionInitiationDelayTimeRanges = []connectionInitiationDelayTimeRange{
@@ -81,7 +86,7 @@ type Hub struct {
 	pairingRegistration              bool
 	visiblePairingCandidates         map[string]pairingCandidateObservation
 	consumedPairingCandidates        map[string]struct{}
-	activePairingCandidates          map[string]*api.ServiceDetails
+	activePairingCandidates          map[string]*activePairingCandidate
 	latestPairingObservationRevision uint64
 	launchPairingCandidate           func(func())
 	beforePairingCandidateGate       func()
@@ -120,7 +125,7 @@ func NewHub(hubReader api.HubReaderInterface,
 		remoteServices:             make(map[string]*api.ServiceDetails),
 		visiblePairingCandidates:   make(map[string]pairingCandidateObservation),
 		consumedPairingCandidates:  make(map[string]struct{}),
-		activePairingCandidates:    make(map[string]*api.ServiceDetails),
+		activePairingCandidates:    make(map[string]*activePairingCandidate),
 		hubReader:                  hubReader,
 		port:                       port,
 		certifciate:                certificate,
@@ -319,16 +324,18 @@ func (h *Hub) releaseOutboundAttemptForConnection(
 	ski string,
 	connection api.ShipConnectionInterface,
 	metadata api.OutgoingAttemptMetadata,
-) {
+) *outboundAttemptAuthority {
 	// Exact connection ownership prevents a stale close from releasing a newer
 	// registration if an external gate ever reuses metadata.
 	h.muxAttemptGate.Lock()
 	registrations := h.outboundAttempts[ski]
 	var removed []*outboundAttemptRegistration
+	var releasedAuthority *outboundAttemptAuthority
 	for registration := range registrations {
 		if registration.connection == connection && registration.metadata == metadata {
 			delete(registrations, registration)
 			removed = append(removed, registration)
+			releasedAuthority = registration.authority
 		}
 	}
 	if len(registrations) == 0 {
@@ -336,6 +343,7 @@ func (h *Hub) releaseOutboundAttemptForConnection(
 	}
 	h.muxAttemptGate.Unlock()
 	cancelOutboundAttemptRegistrations(removed)
+	return releasedAuthority
 }
 
 func cancelOutboundAttemptRegistrations(registrations []*outboundAttemptRegistration) {

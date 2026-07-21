@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"net"
@@ -284,4 +285,96 @@ func TestPairingRegistrationCloseDoesNotRetireOutboundCandidate(t *testing.T) {
 	if len(requests) != 1 {
 		t.Fatalf("outbound candidate requests after inbound registration close = %d, want 1", len(requests))
 	}
+}
+
+func TestPairingCandidateTerminalCloseAllowsFreshCandidate(t *testing.T) {
+	gate := newScriptedAttemptGate(gatePermit)
+	hub, _, _ := newPairingCandidateHub(t, gate)
+	var launches []func()
+	hub.launchPairingCandidate = func(run func()) { launches = append(launches, run) }
+	reportPairingCandidate(hub, pairingCandidateTestRef, pairingCandidateTestSKI, "vr940.local", "192.168.100.21")
+
+	if err := hub.QueuePairingCandidate(pairingCandidateTestRef, pairingCandidateTestSKI); err != nil {
+		t.Fatalf("queue first pairing candidate: %v", err)
+	}
+
+	metadata := api.OutgoingAttemptMetadata{AttemptID: "terminal", Scope: "pairing", ControlEpoch: 1}
+	connection := &attemptCallbackConnection{ski: pairingCandidateTestSKI}
+	registration := installPairingCandidateAttempt(t, hub, pairingCandidateTestSKI, connection, metadata)
+	hub.HandleConnectionClosedWithAttempt(connection, false, metadata)
+	if registration.context.Err() == nil {
+		t.Fatal("terminal close did not cancel exact outbound registration")
+	}
+
+	reportPairingCandidate(hub, "shipc_fresh-generation", pairingCandidateTestSKI, "vr940.local", "192.168.100.21")
+	if err := hub.QueuePairingCandidate("shipc_fresh-generation", pairingCandidateTestSKI); err != nil {
+		t.Fatalf("queue fresh candidate after terminal close: %v", err)
+	}
+	if len(launches) != 2 {
+		t.Fatalf("scheduled candidate launches = %d, want 2", len(launches))
+	}
+}
+
+func TestPairingCandidateStaleCloseDoesNotRetireNewerAuthority(t *testing.T) {
+	gate := newScriptedAttemptGate(gatePermit)
+	hub, _, _ := newPairingCandidateHub(t, gate)
+	hub.launchPairingCandidate = func(func()) {}
+	reportPairingCandidate(hub, pairingCandidateTestRef, pairingCandidateTestSKI, "vr940.local", "192.168.100.21")
+
+	if err := hub.QueuePairingCandidate(pairingCandidateTestRef, pairingCandidateTestSKI); err != nil {
+		t.Fatalf("queue first pairing candidate: %v", err)
+	}
+	oldMetadata := api.OutgoingAttemptMetadata{AttemptID: "old", Scope: "pairing", ControlEpoch: 1}
+	oldConnection := &attemptCallbackConnection{ski: pairingCandidateTestSKI}
+	installPairingCandidateAttempt(t, hub, pairingCandidateTestSKI, oldConnection, oldMetadata)
+
+	hub.muxReg.Lock()
+	service := hub.activePairingCandidates[pairingCandidateTestSKI].service
+	hub.muxAttemptGate.Lock()
+	newAuthority := hub.rotateOutboundAuthorityLocked(pairingCandidateTestSKI)
+	hub.muxAttemptGate.Unlock()
+	newCandidate := &activePairingCandidate{service: service, authority: newAuthority}
+	hub.activePairingCandidates[pairingCandidateTestSKI] = newCandidate
+	hub.muxReg.Unlock()
+
+	hub.HandleConnectionClosedWithAttempt(oldConnection, false, oldMetadata)
+	hub.muxReg.Lock()
+	active := hub.activePairingCandidates[pairingCandidateTestSKI]
+	hub.muxReg.Unlock()
+	if active != newCandidate {
+		t.Fatal("stale close retired the newer pairing candidate")
+	}
+}
+
+func installPairingCandidateAttempt(
+	t *testing.T,
+	hub *Hub,
+	ski string,
+	connection api.ShipConnectionInterface,
+	metadata api.OutgoingAttemptMetadata,
+) *outboundAttemptRegistration {
+	t.Helper()
+	hub.muxReg.Lock()
+	active := hub.activePairingCandidates[ski]
+	hub.muxReg.Unlock()
+	if active == nil {
+		t.Fatal("pairing candidate is not active")
+	}
+	attemptContext, cancel := context.WithCancel(context.Background())
+	registration := &outboundAttemptRegistration{
+		authority:  active.authority,
+		metadata:   metadata,
+		context:    attemptContext,
+		cancel:     cancel,
+		connection: connection,
+	}
+	hub.muxAttemptGate.Lock()
+	registrations := hub.outboundAttempts[ski]
+	if registrations == nil {
+		registrations = make(map[*outboundAttemptRegistration]struct{})
+		hub.outboundAttempts[ski] = registrations
+	}
+	registrations[registration] = struct{}{}
+	hub.muxAttemptGate.Unlock()
+	return registration
 }
