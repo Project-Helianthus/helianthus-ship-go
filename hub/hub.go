@@ -78,15 +78,11 @@ type Hub struct {
 	// Handling mDNS related tasks
 	mdns api.MdnsInterface
 
-	// list of currently known/reported mDNS entries
-	knownMdnsEntries []*api.MdnsEntry
-
 	hasStarted bool
 
 	muxCon         sync.Mutex
 	muxConAttempt  sync.Mutex
 	muxReg         sync.Mutex
-	muxMdns        sync.Mutex
 	muxStarted     sync.Mutex
 	muxAttemptGate sync.RWMutex
 }
@@ -102,7 +98,6 @@ func NewHub(hubReader api.HubReaderInterface,
 		connectionAttemptRunning: make(map[string]bool),
 		connectionsInitiating:    make(map[string]bool),
 		remoteServices:           make(map[string]*api.ServiceDetails),
-		knownMdnsEntries:         make([]*api.MdnsEntry, 0),
 		hubReader:                hubReader,
 		port:                     port,
 		certifciate:              certificate,

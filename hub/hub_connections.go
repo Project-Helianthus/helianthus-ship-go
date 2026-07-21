@@ -698,13 +698,6 @@ func (h *Hub) prepareConnectionInitation(ski string, counter int, entry *api.Mdn
 	}
 }
 
-// attempt to establish a connection to a remote service
-// returns true if successful
-func (h *Hub) initateConnection(remoteService *api.ServiceDetails, entry *api.MdnsEntry) bool {
-	success, _ := h.initateConnectionWithError(remoteService, entry)
-	return success
-}
-
 func (h *Hub) initateConnectionWithError(remoteService *api.ServiceDetails, entry *api.MdnsEntry) (bool, error) {
 	var err error
 

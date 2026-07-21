@@ -577,19 +577,22 @@ func (s *HubSuite) Test_InitiateConnection() {
 	}
 	service := s.sut.ServiceForSKI(s.remoteSki)
 
-	result := s.sut.initateConnection(service, entry)
+	result, err := s.sut.initateConnectionWithError(service, entry)
 	assert.Equal(s.T(), false, result)
+	assert.NoError(s.T(), err)
 
 	entry.Addresses = []net.IP{[]byte("127.0.0.1")}
 
-	result = s.sut.initateConnection(service, entry)
+	result, err = s.sut.initateConnectionWithError(service, entry)
 	assert.Equal(s.T(), false, result)
+	assert.NoError(s.T(), err)
 
 	s.sut.RegisterRemoteSKI(s.remoteSki)
 	service.ConnectionStateDetail().SetState(api.ConnectionStateQueued)
 
-	result = s.sut.initateConnection(service, entry)
+	result, err = s.sut.initateConnectionWithError(service, entry)
 	assert.Equal(s.T(), false, result)
+	assert.Error(s.T(), err)
 }
 
 func (s *HubSuite) Test_checkHasStarted() {
