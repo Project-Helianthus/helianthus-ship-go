@@ -388,6 +388,8 @@ func (s *MdnsSuite) Test_MdnsEntries() {
 }
 
 func (s *MdnsSuite) Test_ProcessMdnsEntry() {
+	const remoteSKI = "0123456789abcdef0123456789abcdef01234567"
+
 	err := s.sut.Start(s.mdnsSearch)
 	assert.Nil(s.T(), err)
 
@@ -406,7 +408,7 @@ func (s *MdnsSuite) Test_ProcessMdnsEntry() {
 	elements["txtvers"] = "2"
 	elements["id"] = "id"
 	elements["path"] = "/ship"
-	elements["ski"] = "testski"
+	elements["ski"] = remoteSKI
 	elements["register"] = "falsee"
 
 	s.sut.processMdnsEntry(elements, name, host, ips, port, false)
@@ -420,7 +422,7 @@ func (s *MdnsSuite) Test_ProcessMdnsEntry() {
 	s.sut.processMdnsEntry(elements, name, host, ips, port, false)
 	assert.Equal(s.T(), 0, len(s.sut.mdnsEntries()))
 
-	elements["ski"] = "testski"
+	elements["ski"] = remoteSKI
 	s.sut.processMdnsEntry(elements, name, host, ips, port, false)
 	assert.Equal(s.T(), 0, len(s.sut.mdnsEntries()))
 

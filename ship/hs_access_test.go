@@ -229,3 +229,103 @@ func (s *AccessSuite) Test_OutgoingPairingHoldsBeforeSPINEUntilDurableApproval()
 	s.sut.ApprovePendingHandshake()
 	assert.Equal(s.T(), model.SmeStateComplete, s.sut.getState())
 }
+
+func (s *AccessSuite) Test_OutgoingPairingCanApproveSynchronouslyFromShipIDCallback() {
+	reader := mocks.NewShipConnectionDataReaderInterface(s.T())
+	s.mockShipInfo.EXPECT().SetupRemoteDevice("RemoteSKI", mock.Anything).Return(reader).Once()
+	s.mockShipInfo.EXPECT().ReportServiceShipID("RemoteSKI", "ObservedRemoteShipID").Run(func(string, string) {
+		s.sut.ApprovePendingHandshake()
+	}).Once()
+	connection, err := NewOutgoingConnectionHandler(
+		s.mockShipInfo,
+		s.mockWSWrite,
+		ShipRoleClient,
+		"LocalShipID",
+		"RemoteSKI",
+		"",
+		OutgoingAttemptConnectionConfiguration{
+			Metadata:               api.OutgoingAttemptMetadata{AttemptID: "candidate-attempt", Scope: "pairing", ControlEpoch: 17},
+			Context:                context.Background(),
+			RequirePairingApproval: true,
+		},
+	)
+	assert.NoError(s.T(), err)
+	s.sut = connection
+	s.sut.setState(model.SmeAccessMethodsRequest, nil)
+
+	accessMsg := model.AccessMethods{AccessMethods: model.AccessMethodsType{Id: util.Ptr("ObservedRemoteShipID")}}
+	msg, err := s.sut.shipMessage(model.MsgTypeControl, accessMsg)
+	assert.NoError(s.T(), err)
+	s.sut.handleState(false, msg)
+	assert.Equal(s.T(), model.SmeStateComplete, s.sut.getState())
+}
+
+func (s *AccessSuite) Test_OutgoingPairingCloseWinsBeforeApprovalWithoutSPINESetup() {
+	s.sut.requirePairingApproval = true
+	s.sut.pairingCommitStarted = true
+	s.sut.setState(model.SmeStateApproved, nil)
+
+	s.sut.CloseConnection(false, 4452, "pairing canceled")
+	s.sut.ApprovePendingHandshake()
+
+	assert.True(s.T(), s.sut.pairingTerminal)
+	assert.Nil(s.T(), s.sut.dataReader)
+	assert.Equal(s.T(), model.SmeStateApproved, s.sut.getState())
+}
+
+func (s *AccessSuite) Test_OutgoingPairingAbortWinsBeforeApprovalWithoutSPINESetup() {
+	s.sut.requirePairingApproval = true
+	s.sut.pairingCommitStarted = true
+	s.sut.setState(model.SmeStateApproved, nil)
+
+	s.sut.AbortPendingHandshake()
+	s.sut.ApprovePendingHandshake()
+
+	assert.True(s.T(), s.sut.pairingTerminal)
+	assert.Nil(s.T(), s.sut.dataReader)
+	assert.Equal(s.T(), model.SmeStateApproved, s.sut.getState())
+}
+
+func (s *AccessSuite) Test_OutgoingPairingApprovalSerializesSPINESetupAgainstConcurrentClose() {
+	s.sut.requirePairingApproval = true
+	s.sut.pairingCommitStarted = true
+	s.sut.setState(model.SmeStateApproved, nil)
+	reader := mocks.NewShipConnectionDataReaderInterface(s.T())
+	setupEntered := make(chan struct{})
+	setupRelease := make(chan struct{})
+	s.mockShipInfo.EXPECT().SetupRemoteDevice("RemoveDevice", s.sut).RunAndReturn(
+		func(string, api.ShipConnectionDataWriterInterface) api.ShipConnectionDataReaderInterface {
+			close(setupEntered)
+			<-setupRelease
+			return reader
+		},
+	).Once()
+
+	approvalDone := make(chan struct{})
+	go func() {
+		s.sut.ApprovePendingHandshake()
+		close(approvalDone)
+	}()
+	<-setupEntered
+
+	closeDone := make(chan struct{})
+	closeEntered := make(chan struct{})
+	s.sut.beforePairingTerminalLock = func() { close(closeEntered) }
+	go func() {
+		s.sut.CloseConnection(false, 4452, "concurrent close")
+		close(closeDone)
+	}()
+	<-closeEntered
+	select {
+	case <-closeDone:
+		s.T().Fatal("close crossed the in-progress SHIP-to-SPINE approval transition")
+	default:
+	}
+
+	close(setupRelease)
+	<-approvalDone
+	<-closeDone
+	assert.Equal(s.T(), model.SmeStateComplete, s.sut.getState())
+	assert.True(s.T(), s.sut.pairingTerminal)
+	assert.Same(s.T(), reader, s.sut.dataReader)
+}

@@ -33,9 +33,15 @@ type ShipConnection struct {
 	// data provider
 	infoProvider api.ShipConnectionInfoProviderInterface
 
-	outgoingAttemptMetadata api.OutgoingAttemptMetadata
-	outgoingAttemptContext  context.Context
-	hasOutgoingAttempt      bool
+	outgoingAttemptMetadata   api.OutgoingAttemptMetadata
+	outgoingAttemptContext    context.Context
+	hasOutgoingAttempt        bool
+	requirePairingApproval    bool
+	pairingApprovalReleased   bool
+	pairingCommitStarted      bool
+	pairingTerminal           bool
+	pairingApprovalMux        sync.Mutex
+	beforePairingTerminalLock func()
 
 	// Where to pass incoming SPINE messages to
 	dataReader api.ShipConnectionDataReaderInterface
@@ -85,8 +91,9 @@ var ErrInvalidOutgoingAttemptConnectionConfiguration = errors.New("invalid outgo
 
 // OutgoingAttemptConnectionConfiguration binds an outgoing connection to its launch.
 type OutgoingAttemptConnectionConfiguration struct {
-	Metadata api.OutgoingAttemptMetadata
-	Context  context.Context
+	Metadata               api.OutgoingAttemptMetadata
+	Context                context.Context
+	RequirePairingApproval bool
 }
 
 func NewConnectionHandler(
@@ -126,6 +133,7 @@ func NewOutgoingConnectionHandler(
 	connection.outgoingAttemptMetadata = configuration.Metadata
 	connection.outgoingAttemptContext = configuration.Context
 	connection.hasOutgoingAttempt = true
+	connection.requirePairingApproval = configuration.RequirePairingApproval
 	connection.initializeDataHandlerOnRun = true
 	connection.setAttemptCancellationStop(context.AfterFunc(configuration.Context, func() {
 		connection.initializeDataProcessing()
@@ -143,14 +151,15 @@ func newConnectionHandler(
 	remoteShipId string,
 	initializeDataHandler bool) *ShipConnection {
 	ship := &ShipConnection{
-		infoProvider: dataProvider,
-		dataWriter:   dataHandler,
-		role:         role,
-		localShipID:  localShipID,
-		remoteSKI:    remoteSki,
-		remoteShipID: remoteShipId,
-		smeState:     model.CmiStateInitStart,
-		smeError:     nil,
+		infoProvider:              dataProvider,
+		dataWriter:                dataHandler,
+		role:                      role,
+		localShipID:               localShipID,
+		remoteSKI:                 remoteSki,
+		remoteShipID:              remoteShipId,
+		smeState:                  model.CmiStateInitStart,
+		smeError:                  nil,
+		beforePairingTerminalLock: func() {},
 	}
 
 	ship.handshakeTimerStopChan = make(chan struct{})
@@ -254,6 +263,19 @@ func (c *ShipConnection) ShipHandshakeState() (model.ShipMessageExchangeState, e
 // invoked when pairing for a pending request is approved
 func (c *ShipConnection) ApprovePendingHandshake() {
 	state := c.getState()
+	if state == model.SmeStateApproved {
+		c.pairingApprovalMux.Lock()
+		defer c.pairingApprovalMux.Unlock()
+		if !c.requirePairingApproval || !c.pairingCommitStarted || c.pairingTerminal || c.pairingApprovalReleased {
+			return
+		}
+		c.pairingApprovalReleased = true
+		// Serialize the entire SHIP-to-SPINE transition with terminal close.
+		// A close that wins this lock cannot be followed by remote setup or
+		// buffered SPINE processing; an approval that wins completes first.
+		c.approveHandshake()
+		return
+	}
 	if state != model.SmeHelloStatePendingListen {
 		// TODO: what to do if the state is different?
 
@@ -273,6 +295,10 @@ func (c *ShipConnection) ApprovePendingHandshake() {
 // invoked when pairing for a pending request is denied
 func (c *ShipConnection) AbortPendingHandshake() {
 	state := c.getState()
+	if state == model.SmeStateApproved {
+		c.CloseConnection(false, 4452, "pairing approval aborted")
+		return
+	}
 	if state != model.SmeHelloStatePendingListen && state != model.SmeHelloStateReadyListen {
 		// TODO: what to do if the state is differnet?
 
@@ -285,9 +311,32 @@ func (c *ShipConnection) AbortPendingHandshake() {
 	c.setAndHandleState(model.SmeHelloStateAbort)
 }
 
+func (c *ShipConnection) pairingApprovalPending() bool {
+	c.pairingApprovalMux.Lock()
+	defer c.pairingApprovalMux.Unlock()
+	return c.requirePairingApproval && !c.pairingApprovalReleased
+}
+
+func (c *ShipConnection) beginPairingCommit() bool {
+	c.pairingApprovalMux.Lock()
+	defer c.pairingApprovalMux.Unlock()
+	if !c.requirePairingApproval {
+		return true
+	}
+	if c.pairingTerminal {
+		return false
+	}
+	c.pairingCommitStarted = true
+	return true
+}
+
 // close this ship connection
 func (c *ShipConnection) CloseConnection(safe bool, code int, reason string) {
 	c.shutdownOnce.Do(func() {
+		c.beforePairingTerminalLock()
+		c.pairingApprovalMux.Lock()
+		c.pairingTerminal = true
+		c.pairingApprovalMux.Unlock()
 		c.stopOutgoingAttemptCancellation()
 		c.stopHandshakeTimer()
 

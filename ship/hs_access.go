@@ -64,17 +64,30 @@ func (c *ShipConnection) handshakeAccessMethods_Request(message []byte) {
 			return
 		}
 
-		// save and report the SHIP ID
+		// Save the SHIP ID. For a selected outgoing candidate, the approval
+		// boundary is reached before the callback so a synchronous durable trust
+		// commit can release the hold without racing this state transition.
+		shipIDWasUnknown := len(c.remoteShipID) == 0
 		if len(c.remoteShipID) == 0 {
 			c.remoteShipID = *accessMethods.AccessMethods.Id
+		}
 
+		c.stopHandshakeTimer()
+		c.setState(model.SmeStateApproved, nil)
+		shouldReportShipID := shipIDWasUnknown || c.pairingApprovalPending()
+		if shouldReportShipID && !c.beginPairingCommit() {
+			return
+		}
+		if shouldReportShipID {
 			c.infoProvider.ReportServiceShipID(c.remoteSKI, c.remoteShipID)
 		}
+		if c.getState() != model.SmeStateApproved || c.pairingApprovalPending() {
+			return
+		}
+		c.approveHandshake()
+		return
 	} else {
 		c.endHandshakeWithError(fmt.Errorf("access methods: invalid response: %s", dataString))
 		return
 	}
-
-	c.setState(model.SmeStateApproved, nil)
-	c.approveHandshake()
 }

@@ -187,7 +187,7 @@ func TestExpectedSKIPinFailsBeforeWebsocketUpgrade(t *testing.T) {
 
 	connection, response, err := dialer.DialContextExpectedSKI(
 		context.Background(),
-		peer.server.URL+"/ship/",
+		"wss"+peer.server.URL[len("https"):]+"/ship/",
 		nil,
 		"0000000000000000000000000000000000000000",
 	)
@@ -209,7 +209,7 @@ func TestExpectedSKIPinFailsBeforeWebsocketUpgrade(t *testing.T) {
 
 	connection, response, err = dialer.DialContextExpectedSKI(
 		context.Background(),
-		peer.server.URL+"/ship/",
+		"wss"+peer.server.URL[len("https"):]+"/ship/",
 		nil,
 		peer.remoteSKI,
 	)

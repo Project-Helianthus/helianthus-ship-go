@@ -120,6 +120,35 @@ func TestPairingCandidateRequiresCurrentReferenceExactSKIAndAttemptGate(t *testi
 	}
 }
 
+func TestPairingCandidateRejectsNonCanonicalExpectedSKI(t *testing.T) {
+	hub, _, _ := newPairingCandidateHub(t, newScriptedAttemptGate(gatePrepareError))
+	reportPairingCandidate(hub, pairingCandidateTestRef, pairingCandidateTestSKI, "vr940.local", "192.168.100.21")
+	for _, invalid := range []string{
+		" " + pairingCandidateTestSKI,
+		pairingCandidateTestSKI + " ",
+		"B1B7197B064084E4CFEF2365105D8D36FF185E5B",
+	} {
+		if err := hub.QueuePairingCandidate(pairingCandidateTestRef, invalid); !errors.Is(err, api.ErrInvalidRemoteSKI) {
+			t.Errorf("QueuePairingCandidate(%q) error = %v, want %v", invalid, err, api.ErrInvalidRemoteSKI)
+		}
+	}
+}
+
+func TestPairingCandidateEmptyNewerSnapshotRetiresAndOlderReportCannotResurrect(t *testing.T) {
+	hub, _, reader := newPairingCandidateHub(t, newScriptedAttemptGate(gatePrepareError))
+	reportPairingCandidate(hub, pairingCandidateTestRef, pairingCandidateTestSKI, "vr940.local", "192.168.100.21")
+
+	hub.ReportMdnsEntriesRevision(map[string]*api.MdnsEntry{}, true, 18)
+	if err := hub.QueuePairingCandidate(pairingCandidateTestRef, pairingCandidateTestSKI); !errors.Is(err, api.ErrPairingCandidateUnavailable) {
+		t.Fatalf("retired candidate error = %v, want %v", err, api.ErrPairingCandidateUnavailable)
+	}
+
+	reportPairingCandidate(hub, pairingCandidateTestRef, pairingCandidateTestSKI, "vr940.local", "192.168.100.99")
+	if visible := reader.snapshot(); len(visible) != 0 {
+		t.Fatalf("older report resurrected visible candidate: %#v", visible)
+	}
+}
+
 func TestPairingCandidateFreezesOneObservedEndpointWithoutRegistrationCoupling(t *testing.T) {
 	gate := newScriptedAttemptGate(gatePrepareError)
 	hub, gate, _ := newPairingCandidateHub(t, gate)
@@ -145,5 +174,114 @@ func TestPairingCandidateFreezesOneObservedEndpointWithoutRegistrationCoupling(t
 	}
 	if err := hub.QueuePairingCandidate(pairingCandidateTestRef, pairingCandidateTestSKI); !errors.Is(err, api.ErrPairingCandidateConsumed) {
 		t.Fatalf("reused candidate error = %v, want %v", err, api.ErrPairingCandidateConsumed)
+	}
+}
+
+func TestPairingCandidateCanceledBeforeAsyncLaunchNeverPreparesAttempt(t *testing.T) {
+	gate := newScriptedAttemptGate(gatePermit)
+	hub, gate, _ := newPairingCandidateHub(t, gate)
+	var launch func()
+	hub.launchPairingCandidate = func(run func()) { launch = run }
+	reportPairingCandidate(hub, pairingCandidateTestRef, pairingCandidateTestSKI, "vr940.local", "192.168.100.21")
+
+	if err := hub.QueuePairingCandidate(pairingCandidateTestRef, pairingCandidateTestSKI); err != nil {
+		t.Fatalf("queue pairing candidate: %v", err)
+	}
+	if launch == nil {
+		t.Fatal("candidate launch was not scheduled")
+	}
+	hub.CancelPairingWithSKI(pairingCandidateTestSKI)
+	launch()
+
+	requests, authorized, permits, _ := gate.snapshot()
+	if len(requests) != 0 || len(authorized) != 0 || len(permits) != 0 {
+		t.Fatalf("canceled candidate reached gate: requests=%d authorized=%d permits=%d", len(requests), len(authorized), len(permits))
+	}
+}
+
+func TestPairingCandidateCanceledAfterActiveCheckRejectsCapturedAuthorityBeforePrepare(t *testing.T) {
+	gate := newScriptedAttemptGate(gatePermit)
+	hub, gate, _ := newPairingCandidateHub(t, gate)
+	var launch func()
+	hub.launchPairingCandidate = func(run func()) { launch = run }
+	gateEntered := make(chan struct{})
+	gateRelease := make(chan struct{})
+	hub.beforePairingCandidateGate = func() {
+		close(gateEntered)
+		<-gateRelease
+	}
+	reportPairingCandidate(hub, pairingCandidateTestRef, pairingCandidateTestSKI, "vr940.local", "192.168.100.21")
+
+	if err := hub.QueuePairingCandidate(pairingCandidateTestRef, pairingCandidateTestSKI); err != nil {
+		t.Fatalf("queue pairing candidate: %v", err)
+	}
+	launchDone := make(chan struct{})
+	go func() {
+		launch()
+		close(launchDone)
+	}()
+	<-gateEntered
+	hub.CancelPairingWithSKI(pairingCandidateTestSKI)
+	close(gateRelease)
+	<-launchDone
+
+	requests, authorized, permits, _ := gate.snapshot()
+	if len(requests) != 0 || len(authorized) != 0 || len(permits) != 0 {
+		t.Fatalf("stale candidate authority reached gate: requests=%d authorized=%d permits=%d", len(requests), len(authorized), len(permits))
+	}
+}
+
+func TestPairingCandidateGateRemovalAfterActiveCheckFailsBeforePrepare(t *testing.T) {
+	gate := newScriptedAttemptGate(gatePermit)
+	hub, gate, _ := newPairingCandidateHub(t, gate)
+	var launch func()
+	hub.launchPairingCandidate = func(run func()) { launch = run }
+	gateEntered := make(chan struct{})
+	gateRelease := make(chan struct{})
+	hub.beforePairingCandidateGate = func() {
+		close(gateEntered)
+		<-gateRelease
+	}
+	reportPairingCandidate(hub, pairingCandidateTestRef, pairingCandidateTestSKI, "vr940.local", "192.168.100.21")
+
+	if err := hub.QueuePairingCandidate(pairingCandidateTestRef, pairingCandidateTestSKI); err != nil {
+		t.Fatalf("queue pairing candidate: %v", err)
+	}
+	launchDone := make(chan struct{})
+	go func() {
+		launch()
+		close(launchDone)
+	}()
+	<-gateEntered
+	if err := hub.SetOutgoingAttemptGate(nil); err != nil {
+		t.Fatalf("remove outgoing attempt gate: %v", err)
+	}
+	close(gateRelease)
+	<-launchDone
+
+	requests, authorized, permits, _ := gate.snapshot()
+	if len(requests) != 0 || len(authorized) != 0 || len(permits) != 0 {
+		t.Fatalf("candidate without current gate reached old gate: requests=%d authorized=%d permits=%d", len(requests), len(authorized), len(permits))
+	}
+}
+
+func TestPairingRegistrationCloseDoesNotRetireOutboundCandidate(t *testing.T) {
+	gate := newScriptedAttemptGate(gatePrepareError)
+	hub, gate, _ := newPairingCandidateHub(t, gate)
+	var launch func()
+	hub.launchPairingCandidate = func(run func()) { launch = run }
+	reportPairingCandidate(hub, pairingCandidateTestRef, pairingCandidateTestSKI, "vr940.local", "192.168.100.21")
+
+	if err := hub.QueuePairingCandidate(pairingCandidateTestRef, pairingCandidateTestSKI); err != nil {
+		t.Fatalf("queue pairing candidate: %v", err)
+	}
+	if err := hub.SetPairingRegistration(false); err != nil {
+		t.Fatalf("close inbound pairing registration: %v", err)
+	}
+	launch()
+
+	requests, _, _, _ := gate.snapshot()
+	if len(requests) != 1 {
+		t.Fatalf("outbound candidate requests after inbound registration close = %d, want 1", len(requests))
 	}
 }

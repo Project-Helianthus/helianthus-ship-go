@@ -271,6 +271,7 @@ func (m *attemptTestMdns) Start(api.MdnsReportInterface) error { return nil }
 func (m *attemptTestMdns) Shutdown()                           {}
 func (m *attemptTestMdns) UnannounceMdnsEntry()                {}
 func (m *attemptTestMdns) SetAutoAccept(bool)                  {}
+func (m *attemptTestMdns) SetPairingRegistration(bool) error   { return nil }
 func (m *attemptTestMdns) AnnounceMdnsEntry() error {
 	m.mu.Lock()
 	m.announce++

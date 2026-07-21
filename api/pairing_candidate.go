@@ -3,15 +3,18 @@ package api
 import "errors"
 
 var (
-	ErrInvalidRemoteSKI            = errors.New("remote SKI must contain 40 hexadecimal characters")
-	ErrPairingRegistrationClosed   = errors.New("pairing registration is closed")
+	ErrInvalidRemoteSKI            = errors.New("remote SKI must contain exactly 40 lowercase hexadecimal characters")
+	ErrPairingCandidateUnavailable = errors.New("pairing candidate is unavailable")
+	ErrPairingCandidateSKIMismatch = errors.New("pairing candidate SKI does not match expected SKI")
+	ErrPairingCandidateConsumed    = errors.New("pairing candidate was already consumed")
+	ErrPairingCandidateActive      = errors.New("pairing candidate is already active for remote SKI")
 	ErrOutgoingAttemptGateRequired = errors.New("outgoing attempt gate is required")
 	ErrRemoteAlreadyTrusted        = errors.New("remote is already trusted")
 )
 
-// PairingCandidateQueuer admits one operator-validated SKI for a SHIP
-// connection through a live mDNS observation. It neither accepts an endpoint
-// nor grants durable trust.
+// PairingCandidateQueuer consumes one process-local discovery observation and
+// binds it to an independently supplied expected SKI. It accepts no endpoint
+// input and grants no durable trust.
 type PairingCandidateQueuer interface {
-	QueuePairingCandidate(string) error
+	QueuePairingCandidate(candidateRef, expectedSKI string) error
 }

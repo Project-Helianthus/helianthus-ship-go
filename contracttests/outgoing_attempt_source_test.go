@@ -101,12 +101,15 @@ func TestDiscoveredMdnsEntriesAreTheOnlyConnectionInitiationSource(t *testing.T)
 	root, fset, files := loadProductionFiles(t)
 	typedPackages := loadTypedProductionPackages(t, root, fset, files)
 	discovery := analyzeTypedDiscoveryPackages(typedPackages)
-	expectedCallers := map[string]string{
-		"coordinateConnectionInitations": "ReportMdnsEntries",
-		"prepareConnectionInitation":     "coordinateConnectionInitations",
-		"initateConnectionWithError":     "prepareConnectionInitation",
-		"connectFoundService":            "initateConnectionWithError",
-		"gatedDialContext":               "connectFoundService",
+	expectedCallers := map[string][]string{
+		"coordinateConnectionInitations":  {"ReportMdnsEntriesRevision"},
+		"prepareConnectionInitation":      {"coordinateConnectionInitations"},
+		"initateConnectionWithError":      {"prepareConnectionInitation"},
+		"connectFoundService":             {"initateConnectionWithError"},
+		"connectFoundPairingCandidate":    {"QueuePairingCandidate"},
+		"connectFoundServiceWithOptions":  {"connectFoundPairingCandidate", "connectFoundService"},
+		"gatedDialContext":                {"connectFoundServiceWithOptions"},
+		"gatedDialContextWithExpectedSKI": {"connectFoundServiceWithOptions", "gatedDialContext"},
 	}
 	callers := make(map[string][]string)
 
@@ -129,8 +132,8 @@ func TestDiscoveredMdnsEntriesAreTheOnlyConnectionInitiationSource(t *testing.T)
 	}
 
 	t.Logf("ReportMdnsEntries production call inventory: %v", discovery.reportCalls)
-	if len(discovery.reportCalls) != 2 {
-		t.Errorf("ReportMdnsEntries production call inventory changed: got %d calls %v, want exactly 2 reviewed mDNS provider calls",
+	if len(discovery.reportCalls) != 3 {
+		t.Errorf("ReportMdnsEntries production call inventory changed: got %d calls %v, want exactly 3 reviewed provider/delegation calls",
 			len(discovery.reportCalls), discovery.reportCalls)
 	}
 	if len(discovery.unauthorizedReportCalls) != 0 {
@@ -148,8 +151,8 @@ func TestDiscoveredMdnsEntriesAreTheOnlyConnectionInitiationSource(t *testing.T)
 			continue
 		}
 		for _, call := range callers[callee] {
-			if !strings.HasSuffix(call, " in "+expectedCaller) {
-				t.Errorf("%s bypasses discovered-entry pipeline; want only %s callers: %s", callee, expectedCaller, call)
+			if !hasAllowedCaller(call, expectedCaller) {
+				t.Errorf("%s bypasses discovered-entry pipeline; allowed callers %v: %s", callee, expectedCaller, call)
 			}
 		}
 	}
@@ -207,6 +210,15 @@ func allocateCandidate() *candidate { return &candidate{Ski: "synthetic"} }
 	}
 }
 
+func hasAllowedCaller(call string, allowed []string) bool {
+	for _, caller := range allowed {
+		if strings.HasSuffix(call, " in "+caller) {
+			return true
+		}
+	}
+	return false
+}
+
 func TestOutgoingAttemptAPIIsClosedAndAdditive(t *testing.T) {
 	root, fset, files := loadProductionFiles(t)
 
@@ -254,7 +266,7 @@ func TestOutgoingAttemptAPIIsClosedAndAdditive(t *testing.T) {
 		"OutgoingAttemptConnectionClosed", "OutgoingAttemptHandshakeStateUpdate",
 	})
 	assertStructFields(t, root, fset, files, "ship", "OutgoingAttemptConnectionConfiguration", []string{
-		"Context", "Metadata",
+		"Context", "Metadata", "RequirePairingApproval",
 	})
 	assertFunctionType(t, root, fset, files, "ship", "NewConnectionHandler",
 		"func(dataProvider api.ShipConnectionInfoProviderInterface, dataHandler api.WebsocketDataWriterInterface, role shipRole, localShipID, remoteSki, remoteShipId string) *ShipConnection")
@@ -342,11 +354,12 @@ func TestProductionDialInventoryAndAttemptPropagation(t *testing.T) {
 	_, fset, files := loadProductionFiles(t)
 
 	var directDial []string
-	var directDialContext []string
-	var dialContextCalls []*ast.CallExpr
+	dialContextCalls := make(map[string][]*ast.CallExpr)
+	var pinnedDialCalls []*ast.CallExpr
 	var hiddenSelectors []string
 	var helperDecls []*ast.FuncDecl
-	var helperCalls []*ast.CallExpr
+	var selectedPathCalls []*ast.CallExpr
+	var fallbackPathCalls []*ast.CallExpr
 	var directAuthorize []string
 	var authorizeCalls []*ast.CallExpr
 	legacyConstructorCalls := make(map[string][]*ast.CallExpr)
@@ -357,7 +370,7 @@ func TestProductionDialInventoryAndAttemptPropagation(t *testing.T) {
 		ast.Inspect(parsed.file, func(node ast.Node) bool {
 			switch item := node.(type) {
 			case *ast.FuncDecl:
-				if item.Name.Name == "gatedDialContext" {
+				if item.Name.Name == "gatedDialContextWithExpectedSKI" {
 					helperDecls = append(helperDecls, item)
 				}
 			case *ast.SelectorExpr:
@@ -380,8 +393,7 @@ func TestProductionDialInventoryAndAttemptPropagation(t *testing.T) {
 				if item.Sel.Name == "Dial" {
 					directDial = append(directDial, position+" in "+owner)
 				} else {
-					directDialContext = append(directDialContext, position+" in "+owner)
-					dialContextCalls = append(dialContextCalls, call)
+					dialContextCalls[owner] = append(dialContextCalls[owner], call)
 				}
 			case *ast.CallExpr:
 				if identifier, ok := item.Fun.(*ast.Ident); ok && identifier.Name == "authorizeOutgoingAttempt" {
@@ -393,8 +405,14 @@ func TestProductionDialInventoryAndAttemptPropagation(t *testing.T) {
 					return true
 				}
 				owner := enclosingFunction(parents, item)
-				if selector.Sel.Name == "gatedDialContext" && owner == "connectFoundService" {
-					helperCalls = append(helperCalls, item)
+				if selector.Sel.Name == "DialContextExpectedSKI" {
+					pinnedDialCalls = append(pinnedDialCalls, item)
+				}
+				if selector.Sel.Name == "gatedDialContextWithExpectedSKI" && owner == "connectFoundServiceWithOptions" {
+					selectedPathCalls = append(selectedPathCalls, item)
+				}
+				if selector.Sel.Name == "gatedDialContext" && owner == "connectFoundServiceWithOptions" {
+					fallbackPathCalls = append(fallbackPathCalls, item)
 				}
 				if selector.Sel.Name == "NewConnectionHandler" && rendered(fset, selector.X) == "ship" {
 					legacyConstructorCalls[owner] = append(legacyConstructorCalls[owner], item)
@@ -413,76 +431,107 @@ func TestProductionDialInventoryAndAttemptPropagation(t *testing.T) {
 	if len(hiddenSelectors) != 0 {
 		t.Errorf("Dial or DialContext is referenced through alias/wrapper indirection: %v", hiddenSelectors)
 	}
-	if len(directDialContext) != 1 || !strings.HasSuffix(directDialContext[0], " in gatedDialContext") {
-		t.Errorf("DialContext inventory = %v, want exactly one call in gatedDialContext", directDialContext)
-	} else {
-		contextArgument := "<missing>"
-		if len(dialContextCalls[0].Args) > 0 {
-			contextArgument = rendered(fset, dialContextCalls[0].Args[0])
+	expectedDialOwners := map[string]string{
+		"DialContext":                     "ctx",
+		"DialContextExpectedSKI":          "ctx",
+		"gatedDialContextWithExpectedSKI": "permit.Context",
+	}
+	for owner, expectedContext := range expectedDialOwners {
+		calls := dialContextCalls[owner]
+		if len(calls) != 1 {
+			t.Errorf("DialContext calls in %s = %d, want one", owner, len(calls))
+			continue
 		}
-		if len(dialContextCalls[0].Args) == 0 || !isPermitContextSelector(dialContextCalls[0].Args[0]) {
-			t.Errorf("DialContext context argument = %q, want the permit's exact Context field", contextArgument)
+		contextArgument := "<missing>"
+		if len(calls[0].Args) > 0 {
+			contextArgument = rendered(fset, calls[0].Args[0])
+		}
+		if expectedContext == "permit.Context" {
+			if len(calls[0].Args) == 0 || !isPermitContextSelector(calls[0].Args[0]) {
+				t.Errorf("DialContext context in %s = %q, want permit.Context", owner, contextArgument)
+			}
+		} else if contextArgument != expectedContext {
+			t.Errorf("DialContext context in %s = %q, want %q", owner, contextArgument, expectedContext)
 		}
 	}
+	if len(dialContextCalls) != len(expectedDialOwners) {
+		t.Errorf("unexpected DialContext owners: %v", sortedCallOwners(dialContextCalls))
+	}
+	if len(pinnedDialCalls) != 1 || len(helperDecls) != 1 ||
+		enclosingFunction(parentMap(helperDecls[0]), pinnedDialCalls[0]) != "gatedDialContextWithExpectedSKI" {
+		t.Errorf("expected-SKI dial calls = %d, want one in gatedDialContextWithExpectedSKI", len(pinnedDialCalls))
+	} else if len(pinnedDialCalls[0].Args) == 0 || !isPermitContextSelector(pinnedDialCalls[0].Args[0]) {
+		t.Error("expected-SKI dial does not use the permit's exact Context")
+	}
 	if len(helperDecls) != 1 || receiverName(helperDecls[0]) != "Hub" {
-		t.Errorf("gatedDialContext declarations = %d with receivers %v, want one Hub method", len(helperDecls), receiverNames(helperDecls))
+		t.Errorf("gatedDialContextWithExpectedSKI declarations = %d with receivers %v, want one Hub method", len(helperDecls), receiverNames(helperDecls))
 	} else {
-		assertGateBranchImmediatelyPrecedesDial(t, fset, helperDecls[0])
+		assertGateBranchPrecedesDials(t, fset, helperDecls[0])
 	}
 	if len(directAuthorize) != 1 || !strings.HasSuffix(directAuthorize[0], " in authorizeOutgoingAttempt") {
 		t.Errorf("AuthorizeLaunch inventory = %v, want one direct call in authorizeOutgoingAttempt", directAuthorize)
 	}
 	if len(authorizeCalls) != 1 || len(helperDecls) != 1 {
-		t.Errorf("authorizeOutgoingAttempt call count = %d, want one in gatedDialContext", len(authorizeCalls))
-	} else if enclosingFunction(parentMap(helperDecls[0]), authorizeCalls[0]) != "gatedDialContext" {
-		t.Error("authorizeOutgoingAttempt is not called from gatedDialContext")
-	} else if len(dialContextCalls) == 1 && authorizeCalls[0].Pos() >= dialContextCalls[0].Pos() {
-		t.Error("AuthorizeLaunch path does not precede the sole DialContext call")
+		t.Errorf("authorizeOutgoingAttempt call count = %d, want one in gatedDialContextWithExpectedSKI", len(authorizeCalls))
+	} else if enclosingFunction(parentMap(helperDecls[0]), authorizeCalls[0]) != "gatedDialContextWithExpectedSKI" {
+		t.Error("authorizeOutgoingAttempt is not called from gatedDialContextWithExpectedSKI")
 	}
 
-	sort.Slice(helperCalls, func(i, j int) bool { return helperCalls[i].Pos() < helperCalls[j].Pos() })
-	if len(helperCalls) != 2 {
-		t.Errorf("connectFoundService gatedDialContext calls = %d, want selected path then root fallback", len(helperCalls))
-	} else {
-		firstPath := rendered(fset, helperCalls[0].Args[len(helperCalls[0].Args)-1])
-		fallbackPath := rendered(fset, helperCalls[1].Args[len(helperCalls[1].Args)-1])
-		if firstPath != "path" || fallbackPath != `""` {
-			t.Errorf("gated path order = %q then %q, want path then root/no-path", firstPath, fallbackPath)
-		}
+	if len(selectedPathCalls) != 1 || len(selectedPathCalls[0].Args) != 6 ||
+		rendered(fset, selectedPathCalls[0].Args[3]) != "path" ||
+		rendered(fset, selectedPathCalls[0].Args[4]) != "expectedSKI" ||
+		rendered(fset, selectedPathCalls[0].Args[5]) != "requiredAuthority" {
+		t.Errorf("selected path must pass path, expected SKI, and captured authority exactly once: %v", selectedPathCalls)
+	}
+	if len(fallbackPathCalls) != 1 || len(fallbackPathCalls[0].Args) != 4 ||
+		rendered(fset, fallbackPathCalls[0].Args[3]) != `""` {
+		t.Errorf("trusted reconnect fallback must pass the root/no-path exactly once: %v", fallbackPathCalls)
 	}
 
 	assertConnectionConstructor(t, fset, "NewConnectionHandler", legacyConstructorCalls["ServeHTTP"], 6, "ship.ShipRoleServer")
-	if len(legacyConstructorCalls["connectFoundService"]) != 1 {
-		t.Errorf("ungated NewConnectionHandler calls in connectFoundService = %d, want one", len(legacyConstructorCalls["connectFoundService"]))
+	if len(legacyConstructorCalls["connectFoundServiceWithOptions"]) != 1 {
+		t.Errorf("ungated NewConnectionHandler calls in connectFoundServiceWithOptions = %d, want one", len(legacyConstructorCalls["connectFoundServiceWithOptions"]))
 	}
-	assertConnectionConstructor(t, fset, "NewOutgoingConnectionHandler", outgoingConstructorCalls["connectFoundService"], 7, "ship.ShipRoleClient")
+	assertConnectionConstructor(t, fset, "NewOutgoingConnectionHandler", outgoingConstructorCalls["connectFoundServiceWithOptions"], 7, "ship.ShipRoleClient")
 }
 
-func assertGateBranchImmediatelyPrecedesDial(t *testing.T, fset *token.FileSet, declaration *ast.FuncDecl) {
+func sortedCallOwners(calls map[string][]*ast.CallExpr) []string {
+	owners := make([]string, 0, len(calls))
+	for owner := range calls {
+		owners = append(owners, owner)
+	}
+	sort.Strings(owners)
+	return owners
+}
+
+func assertGateBranchPrecedesDials(t *testing.T, fset *token.FileSet, declaration *ast.FuncDecl) {
 	t.Helper()
-	for index, statement := range declaration.Body.List {
+	var gateEnd token.Pos
+	for _, statement := range declaration.Body.List {
 		conditional, ok := statement.(*ast.IfStmt)
 		if !ok || rendered(fset, conditional.Cond) != "gate != nil" {
 			continue
 		}
-		if index+1 >= len(declaration.Body.List) {
-			t.Fatal("gated authorization branch has no immediate DialContext successor")
-		}
-		assignment, ok := declaration.Body.List[index+1].(*ast.AssignStmt)
-		if !ok || len(assignment.Rhs) != 1 {
-			t.Fatalf("statement immediately after gated authorization = %T, want DialContext assignment", declaration.Body.List[index+1])
-		}
-		call, ok := assignment.Rhs[0].(*ast.CallExpr)
+		gateEnd = conditional.End()
+		break
+	}
+	if gateEnd == token.NoPos {
+		t.Fatal("gatedDialContextWithExpectedSKI is missing its top-level gate authorization branch")
+	}
+	ast.Inspect(declaration.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
 		if !ok {
-			t.Fatalf("statement immediately after gated authorization = %q, want DialContext call", rendered(fset, assignment))
+			return true
 		}
 		selector, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || selector.Sel.Name != "DialContext" {
-			t.Fatalf("statement immediately after gated authorization = %q, want sole DialContext", rendered(fset, assignment))
+		if !ok || (selector.Sel.Name != "DialContext" && selector.Sel.Name != "DialContextExpectedSKI") {
+			return true
 		}
-		return
-	}
-	t.Fatal("gatedDialContext is missing its top-level gate authorization branch")
+		if call.Pos() <= gateEnd {
+			t.Errorf("network dial at %s precedes completed gate authorization branch", fset.Position(call.Pos()))
+		}
+		return true
+	})
 }
 
 func assertConnectionConstructor(t *testing.T, fset *token.FileSet, name string, calls []*ast.CallExpr, argCount int, role string) {
@@ -789,7 +838,7 @@ func analyzeTypedDiscoveryPackages(typedPackages []typedProductionPackage) disco
 					if isReportMdnsEntriesCall(item, typedPackage.info) {
 						site := typedSite(typedPackage, parents, item)
 						analysis.reportCalls = append(analysis.reportCalls, site)
-						if !isMdnsProviderMethod(typedPackage, enclosingFunctionDeclaration(parents, item)) {
+						if !isReviewedMdnsReportMethod(typedPackage, enclosingFunctionDeclaration(parents, item)) {
 							analysis.unauthorizedReportCalls = append(analysis.unauthorizedReportCalls, site)
 						}
 					}
@@ -864,16 +913,19 @@ func isReportMdnsEntriesSelector(selector *ast.SelectorExpr, info *types.Info) b
 		object = info.Uses[selector.Sel]
 	}
 	function, ok := object.(*types.Func)
-	if !ok || function.Name() != "ReportMdnsEntries" {
+	if !ok || (function.Name() != "ReportMdnsEntries" && function.Name() != "ReportMdnsEntriesRevision") {
 		return false
 	}
 	signature, ok := function.Type().(*types.Signature)
-	if !ok || signature.Params().Len() != 2 {
+	if !ok || (signature.Params().Len() != 2 && signature.Params().Len() != 3) {
 		return false
 	}
 	entries, ok := types.Unalias(signature.Params().At(0).Type()).(*types.Map)
-	return ok && isStringType(entries.Key()) && isCanonicalMdnsEntry(entries.Elem()) &&
-		isBoolType(signature.Params().At(1).Type())
+	if !ok || !isStringType(entries.Key()) || !isCanonicalMdnsEntry(entries.Elem()) ||
+		!isBoolType(signature.Params().At(1).Type()) {
+		return false
+	}
+	return signature.Params().Len() == 2 || isUint64Type(signature.Params().At(2).Type())
 }
 
 func isCanonicalMdnsEntry(value types.Type) bool {
@@ -949,6 +1001,14 @@ func isMdnsProviderMethod(typedPackage typedProductionPackage, declaration *ast.
 		named.Obj().Name() == "MdnsManager"
 }
 
+func isReviewedMdnsReportMethod(typedPackage typedProductionPackage, declaration *ast.FuncDecl) bool {
+	if isMdnsProviderMethod(typedPackage, declaration) {
+		return true
+	}
+	return declaration != nil && typedPackage.path == canonicalModulePath+"/hub" &&
+		declaration.Name.Name == "ReportMdnsEntries" && receiverName(declaration) == "Hub"
+}
+
 func isStringType(value types.Type) bool {
 	basic, ok := types.Unalias(value).(*types.Basic)
 	return ok && basic.Kind() == types.String
@@ -957,6 +1017,11 @@ func isStringType(value types.Type) bool {
 func isBoolType(value types.Type) bool {
 	basic, ok := types.Unalias(value).(*types.Basic)
 	return ok && basic.Kind() == types.Bool
+}
+
+func isUint64Type(value types.Type) bool {
+	basic, ok := types.Unalias(value).(*types.Basic)
+	return ok && basic.Kind() == types.Uint64
 }
 
 func typedSite(typedPackage typedProductionPackage, parents map[ast.Node]ast.Node, node ast.Node) string {

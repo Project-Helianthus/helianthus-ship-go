@@ -28,6 +28,57 @@ type outgoingAttemptDialer interface {
 	DialContext(context.Context, string, http.Header) (*websocket.Conn, *http.Response, error)
 }
 
+type expectedSKIOutgoingAttemptDialer interface {
+	DialContextExpectedSKI(context.Context, string, http.Header, string) (*websocket.Conn, *http.Response, error)
+}
+
+type websocketOutgoingAttemptDialer struct {
+	dialer *websocket.Dialer
+}
+
+func (d *websocketOutgoingAttemptDialer) DialContext(
+	ctx context.Context,
+	url string,
+	headers http.Header,
+) (*websocket.Conn, *http.Response, error) {
+	return d.dialer.DialContext(ctx, url, headers)
+}
+
+func (d *websocketOutgoingAttemptDialer) DialContextExpectedSKI(
+	ctx context.Context,
+	url string,
+	headers http.Header,
+	expectedSKI string,
+) (*websocket.Conn, *http.Response, error) {
+	clone := *d.dialer
+	tlsConfig := d.dialer.TLSClientConfig.Clone()
+	previousVerifier := tlsConfig.VerifyPeerCertificate
+	tlsConfig.VerifyPeerCertificate = func(rawCerts [][]byte, verifiedChains [][]*x509.Certificate) error {
+		if previousVerifier != nil {
+			if err := previousVerifier(rawCerts, verifiedChains); err != nil {
+				return err
+			}
+		}
+		if len(rawCerts) == 0 {
+			return errors.New("remote certificate is missing")
+		}
+		leaf, err := x509.ParseCertificate(rawCerts[0])
+		if err != nil {
+			return fmt.Errorf("parse remote certificate: %w", err)
+		}
+		observedSKI, err := cert.SkiFromCertificate(leaf)
+		if err != nil {
+			return fmt.Errorf("derive remote certificate SKI: %w", err)
+		}
+		if observedSKI != expectedSKI {
+			return errors.New("remote certificate SKI does not match selected candidate")
+		}
+		return nil
+	}
+	clone.TLSClientConfig = tlsConfig
+	return clone.DialContext(ctx, url, headers)
+}
+
 type outgoingAttemptDeniedError struct{}
 
 func (outgoingAttemptDeniedError) Error() string       { return "outgoing attempt denied" }
@@ -70,7 +121,7 @@ func (h *Hub) reportOutgoingAttemptTerminalFailure(remoteSKI string, metadata ap
 }
 
 func newOutgoingAttemptDialer(certificate tls.Certificate) outgoingAttemptDialer {
-	return &websocket.Dialer{
+	return &websocketOutgoingAttemptDialer{dialer: &websocket.Dialer{
 		Proxy:            http.ProxyFromEnvironment,
 		HandshakeTimeout: 5 * time.Second,
 		TLSClientConfig: &tls.Config{
@@ -81,7 +132,7 @@ func newOutgoingAttemptDialer(certificate tls.Certificate) outgoingAttemptDialer
 			CipherSuites: cert.CipherSuites, // #nosec G402
 		},
 		Subprotocols: []string{api.ShipWebsocketSubProtocol},
-	}
+	}}
 }
 
 // Websocket connection handling
@@ -213,6 +264,31 @@ func (h *Hub) isSkiConnected(ski string) bool {
 //
 // returns error contains a reason for failing the connection or nil if no further tries should be processed
 func (h *Hub) connectFoundService(remoteService *api.ServiceDetails, host, port, path string) error {
+	return h.connectFoundServiceWithOptions(remoteService, host, port, path, "", true, false, nil)
+}
+
+func (h *Hub) connectFoundPairingCandidate(
+	remoteService *api.ServiceDetails,
+	host,
+	port,
+	path,
+	expectedSKI string,
+	candidateAuthority *outboundAttemptAuthority,
+) error {
+	h.beforePairingCandidateGate()
+	return h.connectFoundServiceWithOptions(remoteService, host, port, path, expectedSKI, false, true, candidateAuthority)
+}
+
+func (h *Hub) connectFoundServiceWithOptions(
+	remoteService *api.ServiceDetails,
+	host,
+	port,
+	path,
+	expectedSKI string,
+	allowEmptyPathFallback bool,
+	requirePairingApproval bool,
+	requiredAuthority *outboundAttemptAuthority,
+) error {
 	if ski := remoteService.SKI(); ski != "" {
 		h.muxCon.Lock()
 		if h.hasShutdown {
@@ -221,6 +297,9 @@ func (h *Hub) connectFoundService(remoteService *api.ServiceDetails, host, port,
 		}
 		if _, connected := h.connections[ski]; connected || h.connectionsInitiating[ski] {
 			h.muxCon.Unlock()
+			if expectedSKI != "" {
+				return outgoingAttemptDeniedError{}
+			}
 			return nil
 		}
 		if h.connectionsInitiating == nil {
@@ -238,12 +317,12 @@ func (h *Hub) connectFoundService(remoteService *api.ServiceDetails, host, port,
 
 	logging.Log().Debugf("initiating connection to %s at %s:%s%s", remoteService.SKI(), host, port, path)
 
-	conn, resp, attempt, err := h.gatedDialContext(remoteService, host, port, path)
+	conn, resp, attempt, err := h.gatedDialContextWithExpectedSKI(remoteService, host, port, path, expectedSKI, requiredAuthority)
 	if err == nil {
 		if resp != nil && resp.Body != nil {
 			defer resp.Body.Close()
 		}
-	} else {
+	} else if allowEmptyPathFallback {
 		if isOutgoingAttemptDenied(err) {
 			return err
 		}
@@ -257,13 +336,15 @@ func (h *Hub) connectFoundService(remoteService *api.ServiceDetails, host, port,
 		if resp != nil && resp.Body != nil {
 			defer resp.Body.Close()
 		}
+	} else {
+		return err
 	}
 
 	failBeforeConnection := func(connectionErr error) error {
 		if conn != nil {
 			_ = conn.Close()
 		}
-		if !attempt.terminalFailure(h) {
+		if attempt != nil && !attempt.terminalFailure(h) {
 			return outgoingAttemptDeniedError{}
 		}
 		return connectionErr
@@ -306,7 +387,7 @@ func (h *Hub) connectFoundService(remoteService *api.ServiceDetails, host, port,
 
 	if !h.keepThisConnection(conn, false, remoteService) {
 		errorString := fmt.Sprintf("closing connection to %s: ignoring this connection", remoteService.SKI())
-		if !attempt.terminalFailure(h) {
+		if attempt != nil && !attempt.terminalFailure(h) {
 			return outgoingAttemptDeniedError{}
 		}
 		return errors.New(errorString)
@@ -333,8 +414,9 @@ func (h *Hub) connectFoundService(remoteService *api.ServiceDetails, host, port,
 		remoteService.SKI(),
 		remoteService.ShipID(),
 		ship.OutgoingAttemptConnectionConfiguration{
-			Metadata: attempt.metadata,
-			Context:  attempt.context,
+			Metadata:               attempt.metadata,
+			Context:                attempt.context,
+			RequirePairingApproval: requirePairingApproval,
 		},
 	)
 	if configurationErr != nil {
@@ -362,11 +444,22 @@ func (h *Hub) gatedDialContext(
 	port,
 	path string,
 ) (connection *websocket.Conn, response *http.Response, attempt *authorizedOutgoingAttempt, err error) {
+	return h.gatedDialContextWithExpectedSKI(remoteService, host, port, path, "", nil)
+}
+
+func (h *Hub) gatedDialContextWithExpectedSKI(
+	remoteService *api.ServiceDetails,
+	host,
+	port,
+	path,
+	expectedSKI string,
+	requiredAuthority *outboundAttemptAuthority,
+) (connection *websocket.Conn, response *http.Response, attempt *authorizedOutgoingAttempt, err error) {
 	if remoteService == nil {
 		return nil, nil, nil, outgoingAttemptDeniedError{}
 	}
 
-	gate, gateGeneration, authority, active := h.outgoingAttemptGateSnapshot(remoteService)
+	gate, gateGeneration, authority, active := h.outgoingAttemptGateSnapshot(remoteService, requiredAuthority)
 	if !active {
 		return nil, nil, nil, outgoingAttemptDeniedError{}
 	}
@@ -468,7 +561,13 @@ func (h *Hub) gatedDialContext(
 		permit.Context = registration.context
 	}
 
-	connection, response, err = h.dialer.DialContext(permit.Context, address, nil)
+	if expectedSKI == "" {
+		connection, response, err = h.dialer.DialContext(permit.Context, address, nil)
+	} else if pinnedDialer, ok := h.dialer.(expectedSKIOutgoingAttemptDialer); ok {
+		connection, response, err = pinnedDialer.DialContextExpectedSKI(permit.Context, address, nil, expectedSKI)
+	} else {
+		err = errors.New("outgoing dialer does not support expected-SKI pinning")
+	}
 	if attempt == nil {
 		return connection, response, nil, err
 	}

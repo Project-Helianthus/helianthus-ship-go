@@ -3,6 +3,7 @@ package hub
 import (
 	"context"
 	"crypto/tls"
+	"net"
 	"net/http"
 	"sync"
 
@@ -28,6 +29,14 @@ type outboundAttemptRegistration struct {
 	context    context.Context
 	cancel     context.CancelFunc
 	connection api.ShipConnectionInterface
+}
+
+type pairingCandidateObservation struct {
+	ski       string
+	revision  uint64
+	path      string
+	port      int
+	addresses []net.IP
 }
 
 // defines the delay timeframes in seconds depening on the connection attempt counter
@@ -66,10 +75,16 @@ type Hub struct {
 
 	autoaccept bool
 
-	// Operator-validated, untrusted SKIs admitted while pairing registration is
-	// open. Endpoints remain owned exclusively by live mDNS observations.
-	pairingRegistration bool
-	pairingCandidates   map[string]struct{}
+	// Pairing registration controls only the inbound register=true signal.
+	// Outbound candidate capabilities are volatile, generation-bound mDNS
+	// observations and never persist an endpoint.
+	pairingRegistration              bool
+	visiblePairingCandidates         map[string]pairingCandidateObservation
+	consumedPairingCandidates        map[string]struct{}
+	activePairingCandidates          map[string]*api.ServiceDetails
+	latestPairingObservationRevision uint64
+	launchPairingCandidate           func(func())
+	beforePairingCandidateGate       func()
 
 	// The list of known remote services
 	remoteServices map[string]*api.ServiceDetails
@@ -98,20 +113,24 @@ func NewHub(hubReader api.HubReaderInterface,
 	certificate tls.Certificate,
 	localService *api.ServiceDetails) *Hub {
 	hub := &Hub{
-		connections:              make(map[string]api.ShipConnectionInterface),
-		connectionAttemptCounter: make(map[string]int),
-		connectionAttemptRunning: make(map[string]bool),
-		connectionsInitiating:    make(map[string]bool),
-		remoteServices:           make(map[string]*api.ServiceDetails),
-		pairingCandidates:        make(map[string]struct{}),
-		hubReader:                hubReader,
-		port:                     port,
-		certifciate:              certificate,
-		localService:             localService,
-		mdns:                     mdns,
-		dialer:                   newOutgoingAttemptDialer(certificate),
-		outboundAuthorities:      make(map[string]*outboundAttemptAuthority),
-		outboundAttempts:         make(map[string]map[*outboundAttemptRegistration]struct{}),
+		connections:                make(map[string]api.ShipConnectionInterface),
+		connectionAttemptCounter:   make(map[string]int),
+		connectionAttemptRunning:   make(map[string]bool),
+		connectionsInitiating:      make(map[string]bool),
+		remoteServices:             make(map[string]*api.ServiceDetails),
+		visiblePairingCandidates:   make(map[string]pairingCandidateObservation),
+		consumedPairingCandidates:  make(map[string]struct{}),
+		activePairingCandidates:    make(map[string]*api.ServiceDetails),
+		hubReader:                  hubReader,
+		port:                       port,
+		certifciate:                certificate,
+		localService:               localService,
+		mdns:                       mdns,
+		dialer:                     newOutgoingAttemptDialer(certificate),
+		outboundAuthorities:        make(map[string]*outboundAttemptAuthority),
+		outboundAttempts:           make(map[string]map[*outboundAttemptRegistration]struct{}),
+		launchPairingCandidate:     func(run func()) { go run() },
+		beforePairingCandidateGate: func() {},
 	}
 
 	return hub
@@ -164,6 +183,7 @@ func (h *Hub) revokeOutboundAttempts(ski string, service *api.ServiceDetails) {
 
 func (h *Hub) outgoingAttemptGateSnapshot(
 	remoteService *api.ServiceDetails,
+	requiredAuthority *outboundAttemptAuthority,
 ) (api.OutgoingAttemptGate, uint64, *outboundAttemptAuthority, bool) {
 	h.muxAttemptGate.Lock()
 	defer h.muxAttemptGate.Unlock()
@@ -174,9 +194,16 @@ func (h *Hub) outgoingAttemptGateSnapshot(
 	gate := h.outgoingAttemptGate
 	generation := h.outgoingGateEpoch
 	if gate == nil || isNilOutgoingAttemptValue(gate) {
+		if requiredAuthority != nil {
+			return gate, generation, nil, false
+		}
 		return gate, generation, nil, true
 	}
-	return gate, generation, h.currentOutboundAuthorityLocked(remoteService.SKI()), true
+	authority := h.currentOutboundAuthorityLocked(remoteService.SKI())
+	if requiredAuthority != nil && authority != requiredAuthority {
+		return gate, generation, nil, false
+	}
+	return gate, generation, authority, true
 }
 
 // registerOutboundAttemptForLaunch performs the final authority check and
