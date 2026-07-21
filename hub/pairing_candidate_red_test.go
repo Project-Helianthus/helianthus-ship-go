@@ -3,119 +3,147 @@ package hub
 import (
 	"crypto/tls"
 	"errors"
+	"net"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
 )
 
-const pairingCandidateTestSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
+const (
+	pairingCandidateTestRef = "shipc_test-generation-17"
+	pairingCandidateTestSKI = "b1b7197b064084e4cfef2365105d8d36ff185e5b"
+)
 
-type pairingCandidateMDNS struct {
-	*attemptTestMdns
-	registration []bool
-	err          error
+type pairingCandidateReader struct {
+	attemptAwareGateTestHubReader
+	mu      sync.Mutex
+	visible []api.RemoteService
 }
 
-func (m *pairingCandidateMDNS) SetPairingRegistration(value bool) error {
-	if m.err != nil {
-		return m.err
-	}
-	m.registration = append(m.registration, value)
-	return nil
+func (reader *pairingCandidateReader) VisibleRemoteServicesUpdated(entries []api.RemoteService) {
+	reader.mu.Lock()
+	reader.visible = append([]api.RemoteService(nil), entries...)
+	reader.mu.Unlock()
 }
 
-func newPairingCandidateHub(t *testing.T, withGate bool) (*Hub, *pairingCandidateMDNS) {
+func (reader *pairingCandidateReader) snapshot() []api.RemoteService {
+	reader.mu.Lock()
+	defer reader.mu.Unlock()
+	return append([]api.RemoteService(nil), reader.visible...)
+}
+
+func newPairingCandidateHub(t *testing.T, gate api.OutgoingAttemptGate) (*Hub, *scriptedAttemptGate, *pairingCandidateReader) {
 	t.Helper()
-	reader := &attemptAwareGateTestHubReader{}
-	mdns := &pairingCandidateMDNS{attemptTestMdns: &attemptTestMdns{}}
+	reader := &pairingCandidateReader{}
+	mdns := &attemptTestMdns{}
 	hub := NewHub(reader, mdns, 0, tls.Certificate{}, api.NewServiceDetails("local-ski"))
-	if withGate {
-		if err := hub.SetOutgoingAttemptGate(newScriptedAttemptGate(gatePermit)); err != nil {
+	var scripted *scriptedAttemptGate
+	if gate != nil {
+		if candidate, ok := gate.(*scriptedAttemptGate); ok {
+			scripted = candidate
+		}
+		if err := hub.SetOutgoingAttemptGate(gate); err != nil {
 			t.Fatalf("install outgoing attempt gate: %v", err)
 		}
 	}
 	hub.hasStarted = true
-	return hub, mdns
+	return hub, scripted, reader
 }
 
-func TestHubExposesDiscoveredPairingCandidateQueue(t *testing.T) {
+func reportPairingCandidate(hub *Hub, ref, ski, host string, addresses ...string) {
+	parsed := make([]net.IP, 0, len(addresses))
+	for _, address := range addresses {
+		parsed = append(parsed, net.ParseIP(address))
+	}
+	hub.ReportMdnsEntries(map[string]*api.MdnsEntry{
+		ref: {
+			CandidateRef:        ref,
+			ObservationRevision: 17,
+			Name:                "VR940",
+			Ski:                 ski,
+			Identifier:          "vr940-ship-id",
+			Path:                "/ship/",
+			Host:                host,
+			Port:                12480,
+			Addresses:           parsed,
+		},
+	}, true)
+}
+
+func waitForPairingCandidateRequest(t *testing.T, gate *scriptedAttemptGate) api.OutgoingAttemptRequest {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		requests, _, _, _ := gate.snapshot()
+		if len(requests) != 0 {
+			if len(requests) != 1 {
+				t.Fatalf("outgoing requests = %d, want exactly 1", len(requests))
+			}
+			return requests[0]
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("timed out waiting for pairing candidate request")
+	return api.OutgoingAttemptRequest{}
+}
+
+func TestHubExposesGenerationBoundPairingCandidateQueue(t *testing.T) {
 	var _ api.PairingCandidateQueuer = (*Hub)(nil)
 }
 
-func TestPairingCandidateRequiresOpenRegistrationAndAttemptGate(t *testing.T) {
-	hub, _ := newPairingCandidateHub(t, true)
-	if err := hub.QueuePairingCandidate(pairingCandidateTestSKI); !errors.Is(err, api.ErrPairingRegistrationClosed) {
-		t.Fatalf("closed pairing queue error = %v, want %v", err, api.ErrPairingRegistrationClosed)
-	}
+func TestPairingCandidateVisibilityCarriesOpaqueReference(t *testing.T) {
+	hub, _, reader := newPairingCandidateHub(t, nil)
+	reportPairingCandidate(hub, pairingCandidateTestRef, pairingCandidateTestSKI, "vr940.local", "192.168.100.21")
 
-	hub, _ = newPairingCandidateHub(t, false)
-	if err := hub.SetPairingRegistration(true); err != nil {
-		t.Fatalf("open pairing registration: %v", err)
-	}
-	if err := hub.QueuePairingCandidate(pairingCandidateTestSKI); !errors.Is(err, api.ErrOutgoingAttemptGateRequired) {
-		t.Fatalf("ungated pairing queue error = %v, want %v", err, api.ErrOutgoingAttemptGateRequired)
+	visible := reader.snapshot()
+	if len(visible) != 1 || visible[0].CandidateRef != pairingCandidateTestRef || visible[0].Ski != pairingCandidateTestSKI {
+		t.Fatalf("visible candidates = %#v", visible)
 	}
 }
 
-func TestPairingCandidateQueuesWithoutGrantingTrustOrEndpoint(t *testing.T) {
-	hub, mdns := newPairingCandidateHub(t, true)
-	if err := hub.SetPairingRegistration(true); err != nil {
-		t.Fatalf("open pairing registration: %v", err)
+func TestPairingCandidateRequiresCurrentReferenceExactSKIAndAttemptGate(t *testing.T) {
+	hub, _, _ := newPairingCandidateHub(t, newScriptedAttemptGate(gatePrepareError))
+	if err := hub.QueuePairingCandidate("missing", pairingCandidateTestSKI); !errors.Is(err, api.ErrPairingCandidateUnavailable) {
+		t.Fatalf("unknown candidate error = %v, want %v", err, api.ErrPairingCandidateUnavailable)
 	}
-	if err := hub.QueuePairingCandidate(pairingCandidateTestSKI); err != nil {
-		t.Fatalf("queue pairing candidate: %v", err)
+	reportPairingCandidate(hub, pairingCandidateTestRef, pairingCandidateTestSKI, "vr940.local", "192.168.100.21")
+	if err := hub.QueuePairingCandidate(pairingCandidateTestRef, "0000000000000000000000000000000000000000"); !errors.Is(err, api.ErrPairingCandidateSKIMismatch) {
+		t.Fatalf("candidate SKI mismatch error = %v, want %v", err, api.ErrPairingCandidateSKIMismatch)
 	}
 
-	service := hub.ServiceForSKI(pairingCandidateTestSKI)
-	if service.Trusted() {
-		t.Fatal("queueing a discovered candidate granted durable trust")
-	}
-	if got := service.ConnectionStateDetail().State(); got != api.ConnectionStateQueued {
-		t.Fatalf("candidate state = %v, want %v", got, api.ConnectionStateQueued)
-	}
-	_, requests := mdns.counts()
-	if requests != 1 {
-		t.Fatalf("mDNS requests = %d, want 1", requests)
+	hub, _, _ = newPairingCandidateHub(t, nil)
+	reportPairingCandidate(hub, pairingCandidateTestRef, pairingCandidateTestSKI, "vr940.local", "192.168.100.21")
+	if err := hub.QueuePairingCandidate(pairingCandidateTestRef, pairingCandidateTestSKI); !errors.Is(err, api.ErrOutgoingAttemptGateRequired) {
+		t.Fatalf("ungated candidate error = %v, want %v", err, api.ErrOutgoingAttemptGateRequired)
 	}
 }
 
-func TestClosingPairingRegistrationRetiresUntrustedCandidate(t *testing.T) {
-	hub, mdns := newPairingCandidateHub(t, true)
-	if err := hub.SetPairingRegistration(true); err != nil {
-		t.Fatalf("open pairing registration: %v", err)
-	}
-	if err := hub.QueuePairingCandidate(pairingCandidateTestSKI); err != nil {
-		t.Fatalf("queue pairing candidate: %v", err)
-	}
-	if err := hub.SetPairingRegistration(false); err != nil {
-		t.Fatalf("close pairing registration: %v", err)
-	}
+func TestPairingCandidateFreezesOneObservedEndpointWithoutRegistrationCoupling(t *testing.T) {
+	gate := newScriptedAttemptGate(gatePrepareError)
+	hub, gate, _ := newPairingCandidateHub(t, gate)
+	reportPairingCandidate(
+		hub,
+		pairingCandidateTestRef,
+		pairingCandidateTestSKI,
+		"vr940.local",
+		"192.168.100.21",
+		"192.168.100.22",
+	)
 
-	service := hub.ServiceForSKI(pairingCandidateTestSKI)
-	if service.Trusted() {
-		t.Fatal("retiring a candidate changed trust")
+	// Local register=true controls inbound visibility and is intentionally not
+	// an authority prerequisite for this outbound selection.
+	if err := hub.QueuePairingCandidate(pairingCandidateTestRef, pairingCandidateTestSKI); err != nil {
+		t.Fatalf("queue pairing candidate while local registration is closed: %v", err)
 	}
-	if got := service.ConnectionStateDetail().State(); got != api.ConnectionStateNone {
-		t.Fatalf("retired candidate state = %v, want %v", got, api.ConnectionStateNone)
-	}
-	wantRegistration := []bool{true, false}
-	if len(mdns.registration) != len(wantRegistration) || mdns.registration[0] != true || mdns.registration[1] != false {
-		t.Fatalf("registration transitions = %v, want %v", mdns.registration, wantRegistration)
-	}
-}
+	reportPairingCandidate(hub, "shipc_replacement", pairingCandidateTestSKI, "attacker.local", "192.168.100.99")
 
-func TestPairingCandidateRejectsInvalidOrTrustedSKI(t *testing.T) {
-	hub, _ := newPairingCandidateHub(t, true)
-	if err := hub.SetPairingRegistration(true); err != nil {
-		t.Fatalf("open pairing registration: %v", err)
+	request := waitForPairingCandidateRequest(t, gate)
+	if request.RemoteSKI != pairingCandidateTestSKI || request.Endpoint.Host != "192.168.100.21" || request.Endpoint.Port != 12480 || request.Path != "/ship/" {
+		t.Fatalf("frozen outgoing request = %#v", request)
 	}
-	if err := hub.QueuePairingCandidate("not-a-ski"); !errors.Is(err, api.ErrInvalidRemoteSKI) {
-		t.Fatalf("invalid SKI error = %v, want %v", err, api.ErrInvalidRemoteSKI)
-	}
-
-	service := hub.ServiceForSKI(pairingCandidateTestSKI)
-	service.SetTrusted(true)
-	if err := hub.QueuePairingCandidate(pairingCandidateTestSKI); !errors.Is(err, api.ErrRemoteAlreadyTrusted) {
-		t.Fatalf("trusted candidate error = %v, want %v", err, api.ErrRemoteAlreadyTrusted)
+	if err := hub.QueuePairingCandidate(pairingCandidateTestRef, pairingCandidateTestSKI); !errors.Is(err, api.ErrPairingCandidateConsumed) {
+		t.Fatalf("reused candidate error = %v, want %v", err, api.ErrPairingCandidateConsumed)
 	}
 }

@@ -178,6 +178,52 @@ func waitForSessionMessage(t *testing.T, session *reconnectingShipSession) accep
 	}
 }
 
+func TestExpectedSKIPinFailsBeforeWebsocketUpgrade(t *testing.T) {
+	peer, clientCertificate := newReconnectingLocalShipPeer(t)
+	dialer, ok := newOutgoingAttemptDialer(clientCertificate).(expectedSKIOutgoingAttemptDialer)
+	if !ok {
+		t.Fatal("production dialer does not support an expected-SKI TLS pin")
+	}
+
+	connection, response, err := dialer.DialContextExpectedSKI(
+		context.Background(),
+		peer.server.URL+"/ship/",
+		nil,
+		"0000000000000000000000000000000000000000",
+	)
+	if response != nil && response.Body != nil {
+		_ = response.Body.Close()
+	}
+	if connection != nil {
+		_ = connection.Close()
+	}
+	if err == nil {
+		t.Fatal("mismatched certificate SKI reached websocket upgrade")
+	}
+	select {
+	case session := <-peer.sessions:
+		session.close()
+		t.Fatal("mismatched certificate SKI invoked the websocket handler")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	connection, response, err = dialer.DialContextExpectedSKI(
+		context.Background(),
+		peer.server.URL+"/ship/",
+		nil,
+		peer.remoteSKI,
+	)
+	if response != nil && response.Body != nil {
+		defer response.Body.Close()
+	}
+	if err != nil {
+		t.Fatalf("matching certificate SKI: %v", err)
+	}
+	session := waitForReconnectingSession(t, peer)
+	_ = connection.Close()
+	session.close()
+}
+
 func waitForHubConnection(t *testing.T, hub *Hub, ski string, connected bool) api.ShipConnectionInterface {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)

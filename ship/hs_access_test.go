@@ -1,9 +1,11 @@
 package ship
 
 import (
+	"context"
 	"sync"
 	"testing"
 
+	"github.com/Project-Helianthus/helianthus-ship-go/api"
 	"github.com/Project-Helianthus/helianthus-ship-go/mocks"
 	"github.com/Project-Helianthus/helianthus-ship-go/model"
 	"github.com/Project-Helianthus/helianthus-ship-go/util"
@@ -194,5 +196,36 @@ func (s *AccessSuite) Test_Methods_NoShipID() {
 	s.sut.handleState(false, msg)
 
 	assert.Equal(s.T(), false, s.sut.handshakeTimerRunning)
+	assert.Equal(s.T(), model.SmeStateComplete, s.sut.getState())
+}
+
+func (s *AccessSuite) Test_OutgoingPairingHoldsBeforeSPINEUntilDurableApproval() {
+	s.mockShipInfo.EXPECT().ReportServiceShipID("RemoteSKI", "ObservedRemoteShipID")
+	connection, err := NewOutgoingConnectionHandler(
+		s.mockShipInfo,
+		s.mockWSWrite,
+		ShipRoleClient,
+		"LocalShipID",
+		"RemoteSKI",
+		"",
+		OutgoingAttemptConnectionConfiguration{
+			Metadata:               api.OutgoingAttemptMetadata{AttemptID: "candidate-attempt", Scope: "pairing", ControlEpoch: 17},
+			Context:                context.Background(),
+			RequirePairingApproval: true,
+		},
+	)
+	assert.NoError(s.T(), err)
+	s.sut = connection
+	s.sut.setState(model.SmeAccessMethodsRequest, nil)
+
+	accessMsg := model.AccessMethods{AccessMethods: model.AccessMethodsType{Id: util.Ptr("ObservedRemoteShipID")}}
+	msg, err := s.sut.shipMessage(model.MsgTypeControl, accessMsg)
+	assert.NoError(s.T(), err)
+	s.sut.handleState(false, msg)
+	assert.Equal(s.T(), model.SmeStateApproved, s.sut.getState())
+
+	reader := mocks.NewShipConnectionDataReaderInterface(s.T())
+	s.mockShipInfo.EXPECT().SetupRemoteDevice("RemoteSKI", s.sut).Return(reader).Once()
+	s.sut.ApprovePendingHandshake()
 	assert.Equal(s.T(), model.SmeStateComplete, s.sut.getState())
 }
