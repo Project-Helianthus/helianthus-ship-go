@@ -44,6 +44,11 @@ type activePairingCandidate struct {
 	authority *outboundAttemptAuthority
 }
 
+type pairingCandidateRetirement struct {
+	ski     string
+	service *api.ServiceDetails
+}
+
 // defines the delay timeframes in seconds depening on the connection attempt counter
 // the last item will be re-used for higher attempt counter values
 var connectionInitiationDelayTimeRanges = []connectionInitiationDelayTimeRange{
@@ -90,6 +95,7 @@ type Hub struct {
 	latestPairingObservationRevision uint64
 	launchPairingCandidate           func(func())
 	beforePairingCandidateGate       func()
+	beforePairingCandidateRetire     func()
 
 	// The list of known remote services
 	remoteServices map[string]*api.ServiceDetails
@@ -118,24 +124,25 @@ func NewHub(hubReader api.HubReaderInterface,
 	certificate tls.Certificate,
 	localService *api.ServiceDetails) *Hub {
 	hub := &Hub{
-		connections:                make(map[string]api.ShipConnectionInterface),
-		connectionAttemptCounter:   make(map[string]int),
-		connectionAttemptRunning:   make(map[string]bool),
-		connectionsInitiating:      make(map[string]bool),
-		remoteServices:             make(map[string]*api.ServiceDetails),
-		visiblePairingCandidates:   make(map[string]pairingCandidateObservation),
-		consumedPairingCandidates:  make(map[string]struct{}),
-		activePairingCandidates:    make(map[string]*activePairingCandidate),
-		hubReader:                  hubReader,
-		port:                       port,
-		certifciate:                certificate,
-		localService:               localService,
-		mdns:                       mdns,
-		dialer:                     newOutgoingAttemptDialer(certificate),
-		outboundAuthorities:        make(map[string]*outboundAttemptAuthority),
-		outboundAttempts:           make(map[string]map[*outboundAttemptRegistration]struct{}),
-		launchPairingCandidate:     func(run func()) { go run() },
-		beforePairingCandidateGate: func() {},
+		connections:                  make(map[string]api.ShipConnectionInterface),
+		connectionAttemptCounter:     make(map[string]int),
+		connectionAttemptRunning:     make(map[string]bool),
+		connectionsInitiating:        make(map[string]bool),
+		remoteServices:               make(map[string]*api.ServiceDetails),
+		visiblePairingCandidates:     make(map[string]pairingCandidateObservation),
+		consumedPairingCandidates:    make(map[string]struct{}),
+		activePairingCandidates:      make(map[string]*activePairingCandidate),
+		hubReader:                    hubReader,
+		port:                         port,
+		certifciate:                  certificate,
+		localService:                 localService,
+		mdns:                         mdns,
+		dialer:                       newOutgoingAttemptDialer(certificate),
+		outboundAuthorities:          make(map[string]*outboundAttemptAuthority),
+		outboundAttempts:             make(map[string]map[*outboundAttemptRegistration]struct{}),
+		launchPairingCandidate:       func(run func()) { go run() },
+		beforePairingCandidateGate:   func() {},
+		beforePairingCandidateRetire: func() {},
 	}
 
 	return hub
@@ -158,12 +165,22 @@ func (h *Hub) SetOutgoingAttemptGate(gate api.OutgoingAttemptGate) error {
 		}
 	}
 
+	h.muxReg.Lock()
 	h.muxAttemptGate.Lock()
 	h.outgoingAttemptGate = gate
 	h.outgoingGateEpoch++
+	retirements := make([]pairingCandidateRetirement, 0, len(h.activePairingCandidates))
+	for ski := range h.activePairingCandidates {
+		if retired := h.retireActivePairingCandidateLocked(ski, nil, nil); retired != nil {
+			retirements = append(retirements, *retired)
+		}
+	}
 	cancellations := h.removeAllOutboundAttemptRegistrationsLocked()
 	h.muxAttemptGate.Unlock()
+	h.removeOutboundAttemptConnections(cancellations)
+	h.muxReg.Unlock()
 	cancelOutboundAttemptRegistrations(cancellations)
+	h.finishPairingCandidateRetirements(retirements)
 	return nil
 }
 
@@ -175,12 +192,16 @@ func (h *Hub) configuredOutgoingAttemptGate() api.OutgoingAttemptGate {
 }
 
 func (h *Hub) revokeOutboundAttempts(ski string, service *api.ServiceDetails) {
+	h.muxReg.Lock()
 	h.muxAttemptGate.Lock()
 	h.rotateOutboundAuthorityLocked(ski)
 	cancellations := h.removeOutboundAttemptRegistrationsLocked(ski)
+	delete(h.activePairingCandidates, ski)
 	service.SetTrusted(false)
 	service.ConnectionStateDetail().SetState(api.ConnectionStateNone)
 	h.muxAttemptGate.Unlock()
+	h.removeOutboundAttemptConnections(cancellations)
+	h.muxReg.Unlock()
 
 	// Cancellation may close a SHIP connection and re-enter the Hub.
 	cancelOutboundAttemptRegistrations(cancellations)
@@ -349,6 +370,14 @@ func (h *Hub) releaseOutboundAttemptForConnection(
 func cancelOutboundAttemptRegistrations(registrations []*outboundAttemptRegistration) {
 	for _, registration := range registrations {
 		registration.cancel()
+	}
+}
+
+func (h *Hub) removeOutboundAttemptConnections(registrations []*outboundAttemptRegistration) {
+	for _, registration := range registrations {
+		if registration.connection != nil {
+			h.removeExactConnection(registration.connection)
+		}
 	}
 }
 

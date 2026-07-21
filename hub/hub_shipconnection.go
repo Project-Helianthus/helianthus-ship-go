@@ -49,9 +49,9 @@ func (h *Hub) HandleConnectionClosedWithAttempt(
 ) {
 	remoteSKI := connection.RemoteSKI()
 	releasedAuthority := h.releaseOutboundAttemptForConnection(remoteSKI, connection, metadata)
-	h.retireClosedPairingCandidate(remoteSKI, releasedAuthority)
 	if reader, ok := h.hubReader.(api.OutgoingAttemptHubReaderInterface); ok {
 		h.removeExactConnection(connection)
+		h.retirePairingCandidate(remoteSKI, nil, releasedAuthority)
 		reader.OutgoingAttemptConnectionClosed(remoteSKI, handshakeCompleted, metadata)
 		if handshakeCompleted || h.IsRemoteServiceForSKIPaired(remoteSKI) {
 			h.checkAutoReannounce()
@@ -59,6 +59,7 @@ func (h *Hub) HandleConnectionClosedWithAttempt(
 		return
 	}
 	h.HandleConnectionClosed(connection, handshakeCompleted)
+	h.retirePairingCandidate(remoteSKI, nil, releasedAuthority)
 }
 
 func (h *Hub) removeExactConnection(connection api.ShipConnectionInterface) {
@@ -114,7 +115,10 @@ func (h *Hub) HandleShipHandshakeStateUpdate(ski string, state model.ShipState) 
 	// overwrite service Paired value
 	if state.State == model.SmeHelloStateOk {
 		service := h.ServiceForSKI(ski)
+		h.muxReg.Lock()
 		service.SetTrusted(true)
+		delete(h.activePairingCandidates, ski)
+		h.muxReg.Unlock()
 	}
 
 	pairingState := h.mapShipMessageExchangeState(state.State, ski)

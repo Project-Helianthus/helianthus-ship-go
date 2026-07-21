@@ -192,15 +192,7 @@ func (h *Hub) QueuePairingCandidate(candidateRef, expectedSKI string) error {
 			return
 		}
 		if err := h.connectFoundPairingCandidate(service, host, port, path, validatedSKI, candidateAuthority); err != nil {
-			h.muxReg.Lock()
-			active = h.activePairingCandidates[validatedSKI] == activeCandidate && !service.Trusted()
-			if active {
-				delete(h.activePairingCandidates, validatedSKI)
-			}
-			h.muxReg.Unlock()
-			if active {
-				h.retirePairingCandidate(validatedSKI, service)
-			}
+			h.retirePairingCandidate(validatedSKI, activeCandidate, nil)
 		}
 	})
 	return nil
@@ -239,47 +231,59 @@ func pairingCandidateAddress(addresses []net.IP) (string, bool) {
 	return values[0], true
 }
 
-func (h *Hub) retirePairingCandidate(ski string, service *api.ServiceDetails) {
-	h.revokeOutboundAttempts(ski, service)
-	h.removeConnectionAttemptCounter(ski)
-	if existing := h.connectionForSKI(ski); existing != nil {
-		existing.AbortPendingHandshake()
-	}
-	if h.hubReader != nil {
-		h.hubReader.ServicePairingDetailUpdate(ski, service.ConnectionStateDetail())
-	}
-}
-
-func (h *Hub) retireClosedPairingCandidate(
+func (h *Hub) retirePairingCandidate(
 	ski string,
-	releasedAuthority *outboundAttemptAuthority,
+	expectedCandidate *activePairingCandidate,
+	expectedAuthority *outboundAttemptAuthority,
 ) {
-	if releasedAuthority == nil {
-		return
-	}
-
 	h.muxReg.Lock()
-	active := h.activePairingCandidates[ski]
-	if active == nil || active.authority != releasedAuthority || active.service.Trusted() {
-		h.muxReg.Unlock()
-		return
-	}
-
-	// Keep admission and authority rotation under the same lock order used by
-	// QueuePairingCandidate so a replacement cannot inherit the retired epoch.
 	h.muxAttemptGate.Lock()
-	h.rotateOutboundAuthorityLocked(ski)
-	cancellations := h.removeOutboundAttemptRegistrationsLocked(ski)
-	active.service.SetTrusted(false)
-	active.service.ConnectionStateDetail().SetState(api.ConnectionStateNone)
+	retirement := h.retireActivePairingCandidateLocked(ski, expectedCandidate, expectedAuthority)
+	var cancellations []*outboundAttemptRegistration
+	if retirement != nil {
+		cancellations = h.removeOutboundAttemptRegistrationsLocked(ski)
+	}
 	h.muxAttemptGate.Unlock()
-	delete(h.activePairingCandidates, ski)
+	h.removeOutboundAttemptConnections(cancellations)
 	h.muxReg.Unlock()
 
 	cancelOutboundAttemptRegistrations(cancellations)
-	h.removeConnectionAttemptCounter(ski)
-	if h.hubReader != nil {
-		h.hubReader.ServicePairingDetailUpdate(ski, active.service.ConnectionStateDetail())
+	if retirement != nil {
+		h.finishPairingCandidateRetirements([]pairingCandidateRetirement{*retirement})
+	}
+}
+
+// retireActivePairingCandidateLocked requires muxReg and muxAttemptGate. Trust
+// approval uses muxReg too, making durable approval and retirement linearizable.
+func (h *Hub) retireActivePairingCandidateLocked(
+	ski string,
+	expectedCandidate *activePairingCandidate,
+	expectedAuthority *outboundAttemptAuthority,
+) *pairingCandidateRetirement {
+	active := h.activePairingCandidates[ski]
+	if active == nil ||
+		(expectedCandidate != nil && active != expectedCandidate) ||
+		(expectedAuthority != nil && active.authority != expectedAuthority) ||
+		active.service.Trusted() {
+		return nil
+	}
+
+	h.beforePairingCandidateRetire()
+	h.rotateOutboundAuthorityLocked(ski)
+	active.service.ConnectionStateDetail().SetState(api.ConnectionStateNone)
+	delete(h.activePairingCandidates, ski)
+	return &pairingCandidateRetirement{ski: ski, service: active.service}
+}
+
+func (h *Hub) finishPairingCandidateRetirements(retirements []pairingCandidateRetirement) {
+	for _, retirement := range retirements {
+		h.removeConnectionAttemptCounter(retirement.ski)
+		if h.hubReader != nil {
+			h.hubReader.ServicePairingDetailUpdate(
+				retirement.ski,
+				retirement.service.ConnectionStateDetail(),
+			)
+		}
 	}
 }
 
@@ -303,8 +307,8 @@ func (h *Hub) checkHasStarted() bool {
 func (h *Hub) RegisterRemoteSKI(ski string) {
 	ski = util.NormalizeSKI(ski)
 	service := h.ServiceForSKI(ski)
-	service.SetTrusted(true)
 	h.muxReg.Lock()
+	service.SetTrusted(true)
 	delete(h.activePairingCandidates, ski)
 	h.muxReg.Unlock()
 
@@ -336,9 +340,6 @@ func (h *Hub) RegisterRemoteSKI(ski string) {
 func (h *Hub) UnregisterRemoteSKI(ski string) {
 	ski = util.NormalizeSKI(ski)
 	service := h.ServiceForSKI(ski)
-	h.muxReg.Lock()
-	delete(h.activePairingCandidates, ski)
-	h.muxReg.Unlock()
 	h.revokeOutboundAttempts(ski, service)
 
 	h.removeConnectionAttemptCounter(ski)
@@ -365,9 +366,6 @@ func (h *Hub) DisconnectSKI(ski string, reason string) {
 func (h *Hub) CancelPairingWithSKI(ski string) {
 	ski = util.NormalizeSKI(ski)
 	service := h.ServiceForSKI(ski)
-	h.muxReg.Lock()
-	delete(h.activePairingCandidates, ski)
-	h.muxReg.Unlock()
 	h.revokeOutboundAttempts(ski, service)
 	h.removeConnectionAttemptCounter(ski)
 

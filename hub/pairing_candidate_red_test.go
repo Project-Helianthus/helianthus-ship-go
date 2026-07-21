@@ -19,8 +19,9 @@ const (
 
 type pairingCandidateReader struct {
 	attemptAwareGateTestHubReader
-	mu      sync.Mutex
-	visible []api.RemoteService
+	mu            sync.Mutex
+	visible       []api.RemoteService
+	pairingUpdate func()
 }
 
 func (reader *pairingCandidateReader) VisibleRemoteServicesUpdated(entries []api.RemoteService) {
@@ -33,6 +34,24 @@ func (reader *pairingCandidateReader) snapshot() []api.RemoteService {
 	reader.mu.Lock()
 	defer reader.mu.Unlock()
 	return append([]api.RemoteService(nil), reader.visible...)
+}
+
+func (reader *pairingCandidateReader) ServicePairingDetailUpdate(
+	string,
+	*api.ConnectionStateDetail,
+) {
+	reader.mu.Lock()
+	update := reader.pairingUpdate
+	reader.mu.Unlock()
+	if update != nil {
+		update()
+	}
+}
+
+func (reader *pairingCandidateReader) setPairingUpdate(update func()) {
+	reader.mu.Lock()
+	reader.pairingUpdate = update
+	reader.mu.Unlock()
 }
 
 func newPairingCandidateHub(t *testing.T, gate api.OutgoingAttemptGate) (*Hub, *scriptedAttemptGate, *pairingCandidateReader) {
@@ -312,6 +331,147 @@ func TestPairingCandidateTerminalCloseAllowsFreshCandidate(t *testing.T) {
 	}
 	if len(launches) != 2 {
 		t.Fatalf("scheduled candidate launches = %d, want 2", len(launches))
+	}
+}
+
+func TestPairingCandidateGateInvalidationSynchronouslyAllowsFreshCandidate(t *testing.T) {
+	gate := newScriptedAttemptGate(gatePermit)
+	hub, _, _ := newPairingCandidateHub(t, gate)
+	hub.launchPairingCandidate = func(func()) {}
+	reportPairingCandidate(hub, pairingCandidateTestRef, pairingCandidateTestSKI, "vr940.local", "192.168.100.21")
+
+	if err := hub.QueuePairingCandidate(pairingCandidateTestRef, pairingCandidateTestSKI); err != nil {
+		t.Fatalf("queue first pairing candidate: %v", err)
+	}
+	metadata := api.OutgoingAttemptMetadata{AttemptID: "invalidated", Scope: "pairing", ControlEpoch: 1}
+	connection := &attemptCallbackConnection{ski: pairingCandidateTestSKI}
+	registration := installPairingCandidateAttempt(t, hub, pairingCandidateTestSKI, connection, metadata)
+	hub.registerConnection(connection)
+	if err := hub.SetOutgoingAttemptGate(nil); err != nil {
+		t.Fatalf("remove outgoing attempt gate: %v", err)
+	}
+	if registration.context.Err() == nil {
+		t.Fatal("gate invalidation did not cancel the active registration")
+	}
+	if got := hub.connectionForSKI(pairingCandidateTestSKI); got != nil {
+		t.Fatalf("gate invalidation left closing connection visible to retry: %#v", got)
+	}
+	hub.muxReg.Lock()
+	activeAfterRemoval := hub.activePairingCandidates[pairingCandidateTestSKI]
+	hub.muxReg.Unlock()
+	if activeAfterRemoval != nil {
+		t.Fatal("gate invalidation stranded the active pairing candidate")
+	}
+
+	replacementGate := newScriptedAttemptGate(gatePermit)
+	if err := hub.SetOutgoingAttemptGate(replacementGate); err != nil {
+		t.Fatalf("install replacement outgoing attempt gate: %v", err)
+	}
+	hub.dialer = &fakePeerDialer{err: errAttemptTestDial}
+	hub.launchPairingCandidate = func(run func()) { run() }
+	reportPairingCandidate(hub, "shipc_after-gate-replacement", pairingCandidateTestSKI, "vr940.local", "192.168.100.21")
+	if err := hub.QueuePairingCandidate("shipc_after-gate-replacement", pairingCandidateTestSKI); err != nil {
+		t.Fatalf("queue fresh candidate after gate replacement: %v", err)
+	}
+	requests, _, _, _ := replacementGate.snapshot()
+	if len(requests) != 1 {
+		t.Fatalf("fresh candidate reached replacement gate %d times, want 1", len(requests))
+	}
+}
+
+func TestPairingCandidateTerminalCloseRemovesConnectionBeforeRetryCallback(t *testing.T) {
+	gate := newScriptedAttemptGate(gatePermit)
+	hub, gate, reader := newPairingCandidateHub(t, gate)
+	hub.launchPairingCandidate = func(func()) {}
+	reportPairingCandidate(hub, pairingCandidateTestRef, pairingCandidateTestSKI, "vr940.local", "192.168.100.21")
+	if err := hub.QueuePairingCandidate(pairingCandidateTestRef, pairingCandidateTestSKI); err != nil {
+		t.Fatalf("queue first pairing candidate: %v", err)
+	}
+
+	const freshRef = "shipc_retry-from-terminal-callback"
+	hub.muxReg.Lock()
+	hub.visiblePairingCandidates[freshRef] = pairingCandidateObservation{
+		ski:       pairingCandidateTestSKI,
+		revision:  18,
+		path:      "/ship/",
+		port:      12480,
+		addresses: []net.IP{net.ParseIP("192.168.100.21")},
+	}
+	hub.muxReg.Unlock()
+
+	metadata := api.OutgoingAttemptMetadata{AttemptID: "closing", Scope: "pairing", ControlEpoch: 1}
+	connection := &attemptCallbackConnection{ski: pairingCandidateTestSKI}
+	installPairingCandidateAttempt(t, hub, pairingCandidateTestSKI, connection, metadata)
+	hub.registerConnection(connection)
+	hub.dialer = &fakePeerDialer{err: errAttemptTestDial}
+	hub.launchPairingCandidate = func(run func()) { run() }
+	var retryMu sync.Mutex
+	retryStarted := false
+	var retryErr error
+	reader.setPairingUpdate(func() {
+		retryMu.Lock()
+		if retryStarted {
+			retryMu.Unlock()
+			return
+		}
+		retryStarted = true
+		retryMu.Unlock()
+		retryErr = hub.QueuePairingCandidate(freshRef, pairingCandidateTestSKI)
+	})
+
+	hub.HandleConnectionClosedWithAttempt(connection, false, metadata)
+	if retryErr != nil {
+		t.Fatalf("retry from terminal callback: %v", retryErr)
+	}
+	requests, _, _, _ := gate.snapshot()
+	if len(requests) != 1 {
+		t.Fatalf("retry reached outgoing gate %d times, want 1 after old connection removal", len(requests))
+	}
+}
+
+func TestPairingCandidateTerminalRetirementCannotOverwriteConcurrentTrust(t *testing.T) {
+	gate := newScriptedAttemptGate(gatePermit)
+	hub, _, _ := newPairingCandidateHub(t, gate)
+	hub.launchPairingCandidate = func(func()) {}
+	reportPairingCandidate(hub, pairingCandidateTestRef, pairingCandidateTestSKI, "vr940.local", "192.168.100.21")
+	if err := hub.QueuePairingCandidate(pairingCandidateTestRef, pairingCandidateTestSKI); err != nil {
+		t.Fatalf("queue first pairing candidate: %v", err)
+	}
+
+	metadata := api.OutgoingAttemptMetadata{AttemptID: "trust-race", Scope: "pairing", ControlEpoch: 1}
+	connection := &attemptCallbackConnection{ski: pairingCandidateTestSKI}
+	installPairingCandidateAttempt(t, hub, pairingCandidateTestSKI, connection, metadata)
+	hub.registerConnection(connection)
+	retireEntered := make(chan struct{})
+	retireRelease := make(chan struct{})
+	var retireOnce sync.Once
+	hub.beforePairingCandidateRetire = func() {
+		retireOnce.Do(func() { close(retireEntered) })
+		<-retireRelease
+	}
+
+	closeDone := make(chan struct{})
+	go func() {
+		hub.HandleConnectionClosedWithAttempt(connection, false, metadata)
+		close(closeDone)
+	}()
+	<-retireEntered
+	registerDone := make(chan struct{})
+	go func() {
+		hub.RegisterRemoteSKI(pairingCandidateTestSKI)
+		close(registerDone)
+	}()
+	select {
+	case <-registerDone:
+		t.Fatal("durable trust registration bypassed retirement serialization")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(retireRelease)
+	<-closeDone
+	<-registerDone
+
+	if !hub.ServiceForSKI(pairingCandidateTestSKI).Trusted() {
+		t.Fatal("terminal retirement overwrote concurrent durable trust")
 	}
 }
 
