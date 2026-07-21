@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -35,6 +36,257 @@ type localShipPeer struct {
 	messages  chan acceptedShipMessage
 	release   chan struct{}
 	once      sync.Once
+}
+
+type reconnectingShipSession struct {
+	connection *websocket.Conn
+	message    chan acceptedShipMessage
+	release    chan struct{}
+	once       sync.Once
+}
+
+func (s *reconnectingShipSession) close() {
+	s.once.Do(func() {
+		close(s.release)
+		_ = s.connection.Close()
+	})
+}
+
+type reconnectingLocalShipPeer struct {
+	server    *httptest.Server
+	host      string
+	port      int
+	remoteSKI string
+	sessions  chan *reconnectingShipSession
+	mu        sync.Mutex
+	active    map[*reconnectingShipSession]struct{}
+	once      sync.Once
+}
+
+func newReconnectingLocalShipPeer(t *testing.T) (*reconnectingLocalShipPeer, tls.Certificate) {
+	t.Helper()
+	serverCertificate, err := cert.CreateCertificate("test-unit", "test-org", "DE", "reconnecting-peer")
+	if err != nil {
+		t.Fatalf("create reconnecting server certificate: %v", err)
+	}
+	clientCertificate, err := cert.CreateCertificate("test-unit", "test-org", "DE", "reconnecting-client")
+	if err != nil {
+		t.Fatalf("create reconnecting client certificate: %v", err)
+	}
+	leaf, err := x509.ParseCertificate(serverCertificate.Certificate[0])
+	if err != nil {
+		t.Fatalf("parse reconnecting server certificate: %v", err)
+	}
+	remoteSKI, err := cert.SkiFromCertificate(leaf)
+	if err != nil {
+		t.Fatalf("derive reconnecting server SKI: %v", err)
+	}
+
+	peer := &reconnectingLocalShipPeer{
+		remoteSKI: remoteSKI,
+		sessions:  make(chan *reconnectingShipSession, 4),
+		active:    make(map[*reconnectingShipSession]struct{}),
+	}
+	upgrader := websocket.Upgrader{
+		CheckOrigin:  func(*http.Request) bool { return true },
+		Subprotocols: []string{api.ShipWebsocketSubProtocol},
+	}
+	handler := http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		connection, upgradeErr := upgrader.Upgrade(response, request, nil)
+		if upgradeErr != nil {
+			return
+		}
+		session := &reconnectingShipSession{
+			connection: connection,
+			message:    make(chan acceptedShipMessage, 1),
+			release:    make(chan struct{}),
+		}
+		peer.mu.Lock()
+		peer.active[session] = struct{}{}
+		peer.mu.Unlock()
+		defer func() {
+			peer.mu.Lock()
+			delete(peer.active, session)
+			peer.mu.Unlock()
+			_ = connection.Close()
+		}()
+
+		peer.sessions <- session
+		messageType, payload, readErr := connection.ReadMessage()
+		session.message <- acceptedShipMessage{messageType: messageType, payload: payload, err: readErr}
+		<-session.release
+	})
+	server := httptest.NewUnstartedServer(handler)
+	server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{serverCertificate},
+		ClientAuth:   tls.RequireAnyClientCert,
+		CipherSuites: cert.CipherSuites, // #nosec G402 -- SHIP mandates this suite set.
+		MinVersion:   tls.VersionTLS12,
+	}
+	server.StartTLS()
+	peer.server = server
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		peer.close()
+		t.Fatalf("parse reconnecting peer URL: %v", err)
+	}
+	peer.host = parsed.Hostname()
+	peer.port, err = strconv.Atoi(parsed.Port())
+	if err != nil {
+		peer.close()
+		t.Fatalf("parse reconnecting peer port: %v", err)
+	}
+	t.Cleanup(peer.close)
+	return peer, clientCertificate
+}
+
+func (p *reconnectingLocalShipPeer) close() {
+	p.once.Do(func() {
+		p.mu.Lock()
+		active := make([]*reconnectingShipSession, 0, len(p.active))
+		for session := range p.active {
+			active = append(active, session)
+		}
+		p.mu.Unlock()
+		for _, session := range active {
+			session.close()
+		}
+		p.server.CloseClientConnections()
+		p.server.Close()
+	})
+}
+
+func waitForReconnectingSession(t *testing.T, peer *reconnectingLocalShipPeer) *reconnectingShipSession {
+	t.Helper()
+	select {
+	case session := <-peer.sessions:
+		return session
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for reconnecting SHIP session")
+		return nil
+	}
+}
+
+func waitForSessionMessage(t *testing.T, session *reconnectingShipSession) acceptedShipMessage {
+	t.Helper()
+	select {
+	case observed := <-session.message:
+		return observed
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for reconnecting SHIP message")
+		return acceptedShipMessage{}
+	}
+}
+
+func waitForHubConnection(t *testing.T, hub *Hub, ski string, connected bool) api.ShipConnectionInterface {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		connection := hub.connectionForSKI(ski)
+		if (connection != nil) == connected {
+			return connection
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("connection state for %s did not become connected=%t", ski, connected)
+	return nil
+}
+
+func waitForMdnsCounts(mdns *attemptTestMdns, announce, request int) bool {
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		gotAnnounce, gotRequest := mdns.counts()
+		if gotAnnounce >= announce && gotRequest >= request {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
+func TestDiscoveredServiceReportsAreSingleFlightAndReconnectAfterTerminalDisconnect(t *testing.T) {
+	peer, clientCertificate := newReconnectingLocalShipPeer(t)
+	authorizeRelease := make(chan struct{})
+	t.Cleanup(func() {
+		select {
+		case <-authorizeRelease:
+		default:
+			close(authorizeRelease)
+		}
+	})
+	gate := &notifyingAttemptGate{
+		scriptedAttemptGate: newScriptedAttemptGate(gatePermit),
+		prepared:            make(chan struct{}, 8),
+	}
+	gate.authorizeEntered = make(chan struct{})
+	gate.authorizeRelease = authorizeRelease
+	mdns := &attemptTestMdns{}
+	hub := NewHub(&attemptAwareGateTestHubReader{}, mdns, 0, clientCertificate, api.NewServiceDetails("local-ski"))
+	if err := hub.SetOutgoingAttemptGate(gate); err != nil {
+		t.Fatalf("install outgoing attempt gate: %v", err)
+	}
+	hub.muxStarted.Lock()
+	hub.hasStarted = true
+	hub.muxStarted.Unlock()
+
+	hub.RegisterRemoteSKI(peer.remoteSKI)
+	if !hub.ServiceForSKI(peer.remoteSKI).Trusted() {
+		t.Fatal("RegisterRemoteSKI did not authorize the discovered service")
+	}
+	requests, _, _, _ := gate.snapshot()
+	if len(requests) != 0 {
+		t.Fatalf("authorization initiated %d attempts without a discovered entry", len(requests))
+	}
+
+	entry := &api.MdnsEntry{
+		Ski:  peer.remoteSKI,
+		Host: peer.host,
+		Port: peer.port,
+		Path: "/ship/",
+	}
+	report := map[string]*api.MdnsEntry{peer.remoteSKI: entry}
+	hub.ReportMdnsEntries(report, true)
+	waitForSignal(t, gate.prepared)
+	waitForSignal(t, gate.authorizeEntered)
+	for range 3 {
+		hub.ReportMdnsEntries(report, true)
+	}
+	select {
+	case <-gate.prepared:
+		requests, _, _, _ = gate.snapshot()
+		t.Fatalf("duplicate discovery reports prepared %d concurrent attempts, want 1", len(requests))
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	close(authorizeRelease)
+	first := waitForReconnectingSession(t, peer)
+	observed := waitForSessionMessage(t, first)
+	if observed.err != nil || observed.messageType != websocket.BinaryMessage || !bytes.Equal(observed.payload, model.ShipInit) {
+		t.Fatalf("first discovered connection message = type:%d payload:%x err:%v", observed.messageType, observed.payload, observed.err)
+	}
+	waitForHubConnection(t, hub, peer.remoteSKI, true)
+
+	first.close()
+	waitForHubConnection(t, hub, peer.remoteSKI, false)
+	if !waitForMdnsCounts(mdns, 1, 2) {
+		announce, request := mdns.counts()
+		t.Errorf("terminal disconnect mDNS announce/request counts = %d/%d, want at least 1/2", announce, request)
+	}
+
+	hub.ReportMdnsEntries(map[string]*api.MdnsEntry{}, true)
+	hub.ReportMdnsEntries(report, true)
+	waitForSignal(t, gate.prepared)
+	second := waitForReconnectingSession(t, peer)
+	observed = waitForSessionMessage(t, second)
+	if observed.err != nil || observed.messageType != websocket.BinaryMessage || !bytes.Equal(observed.payload, model.ShipInit) {
+		t.Fatalf("reconnected discovered service message = type:%d payload:%x err:%v", observed.messageType, observed.payload, observed.err)
+	}
+	waitForHubConnection(t, hub, peer.remoteSKI, true)
+	requests, _, _, _ = gate.snapshot()
+	if len(requests) != 2 {
+		t.Fatalf("disappear/reannounce prepared %d attempts total, want exactly 2", len(requests))
+	}
+	second.close()
 }
 
 func newLocalShipPeer(t *testing.T) (*localShipPeer, tls.Certificate) {

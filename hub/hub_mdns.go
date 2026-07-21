@@ -2,8 +2,6 @@ package hub
 
 import (
 	"net"
-	"sort"
-	"strings"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
 )
@@ -11,12 +9,8 @@ import (
 var _ api.MdnsReportInterface = (*Hub)(nil)
 
 // Process reported mDNS services
-func (h *Hub) ReportMdnsEntries(entries map[string]*api.MdnsEntry, newEntries bool) {
-	var mdnsEntries []*api.MdnsEntry
-
+func (h *Hub) ReportMdnsEntries(entries map[string]*api.MdnsEntry, _ bool) {
 	for ski, entry := range entries {
-		mdnsEntries = append(mdnsEntries, entry)
-
 		// check if this ski is already connected
 		if h.isSkiConnected(ski) {
 			continue
@@ -39,20 +33,6 @@ func (h *Hub) ReportMdnsEntries(entries map[string]*api.MdnsEntry, newEntries bo
 		}
 
 		h.coordinateConnectionInitations(ski, entry)
-	}
-
-	sort.Slice(mdnsEntries, func(i, j int) bool {
-		item1 := mdnsEntries[i]
-		item2 := mdnsEntries[j]
-		a := strings.ToLower(item1.Brand + item1.Model + item1.Ski)
-		b := strings.ToLower(item2.Brand + item2.Model + item2.Ski)
-		return a < b
-	})
-
-	if newEntries {
-		h.muxMdns.Lock()
-		h.knownMdnsEntries = mdnsEntries
-		h.muxMdns.Unlock()
 	}
 
 	var remoteServices []api.RemoteService

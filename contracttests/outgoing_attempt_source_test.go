@@ -2,12 +2,17 @@ package contracttests
 
 import (
 	"bytes"
+	"fmt"
 	"go/ast"
 	"go/format"
+	"go/importer"
 	"go/parser"
 	"go/token"
+	"go/types"
+	"io"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -17,9 +22,189 @@ import (
 	"golang.org/x/mod/modfile"
 )
 
+const (
+	canonicalModulePath = "github.com/Project-Helianthus/helianthus-ship-go"
+	canonicalAPIPath    = canonicalModulePath + "/api"
+)
+
 type productionFile struct {
 	path string
 	file *ast.File
+}
+
+type typedProductionPackage struct {
+	path   string
+	fset   *token.FileSet
+	syntax []*ast.File
+	info   *types.Info
+}
+
+type discoverySourceAnalysis struct {
+	reportCalls             []string
+	unauthorizedReportCalls []string
+	unauthorizedAllocations []string
+	hubEndpointCollections  []string
+}
+
+func TestOutboundPairingAPIIsAbsentFromProductionTree(t *testing.T) {
+	_, fset, files := loadProductionFiles(t)
+	forbidden := map[string]struct{}{
+		"OutboundPairingController":             {},
+		"QueueRemoteSKI":                        {},
+		"RemoteEndpoint":                        {},
+		"ReportRemoteEndpoint":                  {},
+		"cacheRemoteEndpoint":                   {},
+		"createOutboundAdmission":               {},
+		"errInvalidRemoteEndpoint":              {},
+		"errInvalidRemoteSKI":                   {},
+		"errOutboundGateRequired":               {},
+		"errRemoteNotAdmitted":                  {},
+		"hasCurrentOutboundAdmission":           {},
+		"invalidateAllOutboundAdmissionsLocked": {},
+		"outboundAdmissions":                    {},
+		"outboundPairingAdmission":              {},
+		"promoteOutboundTrust":                  {},
+		"validOutboundSKI":                      {},
+		"validRemoteEndpoint":                   {},
+	}
+
+	var declarations []string
+	for _, parsed := range files {
+		ast.Inspect(parsed.file, func(node ast.Node) bool {
+			var names []*ast.Ident
+			switch declaration := node.(type) {
+			case *ast.FuncDecl:
+				names = []*ast.Ident{declaration.Name}
+			case *ast.TypeSpec:
+				names = []*ast.Ident{declaration.Name}
+			case *ast.ValueSpec:
+				names = declaration.Names
+			case *ast.Field:
+				names = declaration.Names
+			}
+			for _, name := range names {
+				if _, found := forbidden[name.Name]; found {
+					declarations = append(declarations, fset.Position(name.Pos()).String())
+				}
+			}
+			return true
+		})
+	}
+
+	sort.Strings(declarations)
+	if len(declarations) != 0 {
+		t.Errorf("removed outbound pairing declarations remain: %v", declarations)
+	}
+}
+
+func TestDiscoveredMdnsEntriesAreTheOnlyConnectionInitiationSource(t *testing.T) {
+	root, fset, files := loadProductionFiles(t)
+	typedPackages := loadTypedProductionPackages(t, root, fset, files)
+	discovery := analyzeTypedDiscoveryPackages(typedPackages)
+	expectedCallers := map[string]string{
+		"coordinateConnectionInitations": "ReportMdnsEntries",
+		"prepareConnectionInitation":     "coordinateConnectionInitations",
+		"initateConnectionWithError":     "prepareConnectionInitation",
+		"connectFoundService":            "initateConnectionWithError",
+		"gatedDialContext":               "connectFoundService",
+	}
+	callers := make(map[string][]string)
+
+	for _, parsed := range files {
+		parents := parentMap(parsed.file)
+
+		ast.Inspect(parsed.file, func(node ast.Node) bool {
+			if item, ok := node.(*ast.CallExpr); ok {
+				selector, ok := item.Fun.(*ast.SelectorExpr)
+				if !ok {
+					return true
+				}
+				if _, tracked := expectedCallers[selector.Sel.Name]; tracked {
+					callers[selector.Sel.Name] = append(callers[selector.Sel.Name],
+						fset.Position(item.Pos()).String()+" in "+enclosingFunction(parents, item))
+				}
+			}
+			return true
+		})
+	}
+
+	t.Logf("ReportMdnsEntries production call inventory: %v", discovery.reportCalls)
+	if len(discovery.reportCalls) != 2 {
+		t.Errorf("ReportMdnsEntries production call inventory changed: got %d calls %v, want exactly 2 reviewed mDNS provider calls",
+			len(discovery.reportCalls), discovery.reportCalls)
+	}
+	if len(discovery.unauthorizedReportCalls) != 0 {
+		t.Errorf("ReportMdnsEntries is called outside the real mDNS manager/provider path: %v", discovery.unauthorizedReportCalls)
+	}
+	if len(discovery.unauthorizedAllocations) != 0 {
+		t.Errorf("MdnsEntry values are allocated outside MdnsManager discovery/report processing: %v", discovery.unauthorizedAllocations)
+	}
+	if len(discovery.hubEndpointCollections) != 0 {
+		t.Errorf("Hub retains a separate MdnsEntry collection that could become an unobserved endpoint feed: %v", discovery.hubEndpointCollections)
+	}
+	for callee, expectedCaller := range expectedCallers {
+		if len(callers[callee]) == 0 {
+			t.Errorf("production discovery pipeline has no call to %s", callee)
+			continue
+		}
+		for _, call := range callers[callee] {
+			if !strings.HasSuffix(call, " in "+expectedCaller) {
+				t.Errorf("%s bypasses discovered-entry pipeline; want only %s callers: %s", callee, expectedCaller, call)
+			}
+		}
+	}
+}
+
+func TestDiscoverySourceAnalysisRejectsRenamedSyntheticEndpointPaths(t *testing.T) {
+	tests := []struct {
+		name            string
+		source          string
+		wantReportCalls int
+		wantAllocations int
+	}{
+		{
+			name: "renamed API forwards caller supplied entry",
+			source: `package fixture
+import api "github.com/Project-Helianthus/helianthus-ship-go/api"
+type Hub struct{}
+func (*Hub) ReportMdnsEntries(map[string]*api.MdnsEntry, bool) {}
+func submitCandidate(h *Hub, candidate *api.MdnsEntry) {
+	h.ReportMdnsEntries(map[string]*api.MdnsEntry{candidate.Ski: candidate}, true)
+}`,
+			wantReportCalls: 1,
+		},
+		{
+			name: "alias passed to new",
+			source: `package fixture
+import api "github.com/Project-Helianthus/helianthus-ship-go/api"
+type candidate = api.MdnsEntry
+func allocateCandidate() *candidate { return new(candidate) }
+`,
+			wantAllocations: 1,
+		},
+		{
+			name: "pointer to alias composite literal",
+			source: `package fixture
+import api "github.com/Project-Helianthus/helianthus-ship-go/api"
+type candidate = api.MdnsEntry
+func allocateCandidate() *candidate { return &candidate{Ski: "synthetic"} }
+`,
+			wantAllocations: 1,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := loadTypedFixture(t, test.name, test.source)
+			analysis := analyzeTypedDiscoveryPackages([]typedProductionPackage{fixture})
+			if len(analysis.unauthorizedReportCalls) != test.wantReportCalls {
+				t.Errorf("unauthorized ReportMdnsEntries calls = %v, want %d", analysis.unauthorizedReportCalls, test.wantReportCalls)
+			}
+			if len(analysis.unauthorizedAllocations) != test.wantAllocations {
+				t.Errorf("unauthorized MdnsEntry allocations = %v, want %d", analysis.unauthorizedAllocations, test.wantAllocations)
+			}
+		})
+	}
 }
 
 func TestOutgoingAttemptAPIIsClosedAndAdditive(t *testing.T) {
@@ -498,6 +683,339 @@ func parentMap(root ast.Node) map[ast.Node]ast.Node {
 		return true
 	})
 	return parents
+}
+
+func loadTypedProductionPackages(
+	t *testing.T,
+	root string,
+	fset *token.FileSet,
+	files []productionFile,
+) []typedProductionPackage {
+	t.Helper()
+	exportFiles := goListExportFiles(t, root)
+	exportImporter := importer.ForCompiler(fset, runtime.Compiler, func(path string) (io.ReadCloser, error) {
+		exportPath, exists := exportFiles[path]
+		if !exists {
+			return nil, fmt.Errorf("no export data for %q", path)
+		}
+		return os.Open(exportPath)
+	})
+
+	filesByPackage := make(map[string][]*ast.File)
+	for _, parsed := range files {
+		relativeDir, err := filepath.Rel(root, filepath.Dir(parsed.path))
+		if err != nil {
+			t.Fatalf("resolve package path for %s: %v", parsed.path, err)
+		}
+		packagePath := canonicalModulePath
+		if relativeDir != "." {
+			packagePath += "/" + filepath.ToSlash(relativeDir)
+		}
+		filesByPackage[packagePath] = append(filesByPackage[packagePath], parsed.file)
+	}
+
+	packagePaths := make([]string, 0, len(filesByPackage))
+	for packagePath := range filesByPackage {
+		packagePaths = append(packagePaths, packagePath)
+	}
+	sort.Strings(packagePaths)
+
+	typed := make([]typedProductionPackage, 0, len(packagePaths))
+	for _, packagePath := range packagePaths {
+		info := &types.Info{
+			Types:      make(map[ast.Expr]types.TypeAndValue),
+			Defs:       make(map[*ast.Ident]types.Object),
+			Uses:       make(map[*ast.Ident]types.Object),
+			Selections: make(map[*ast.SelectorExpr]*types.Selection),
+		}
+		_, err := (&types.Config{
+			GoVersion: "go1.22",
+			Importer:  exportImporter,
+		}).Check(packagePath, fset, filesByPackage[packagePath], info)
+		if err != nil {
+			t.Fatalf("type-check production package %s: %v", packagePath, err)
+		}
+		typed = append(typed, typedProductionPackage{
+			path:   packagePath,
+			fset:   fset,
+			syntax: filesByPackage[packagePath],
+			info:   info,
+		})
+	}
+	return typed
+}
+
+func goListExportFiles(t *testing.T, root string) map[string]string {
+	t.Helper()
+	command := exec.Command("go", "list", "-export", "-deps", "-f", "{{if .Export}}{{.ImportPath}}\t{{.Export}}{{end}}", "./...")
+	command.Dir = root
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("load production export data: %v\n%s", err, output)
+	}
+	exportFiles := make(map[string]string)
+	for _, line := range strings.Split(string(output), "\n") {
+		if line == "" {
+			continue
+		}
+		packagePath, exportPath, found := strings.Cut(line, "\t")
+		if !found {
+			t.Fatalf("parse go list export line %q", line)
+		}
+		exportFiles[packagePath] = exportPath
+	}
+	return exportFiles
+}
+
+func analyzeTypedDiscoveryPackages(typedPackages []typedProductionPackage) discoverySourceAnalysis {
+	var analysis discoverySourceAnalysis
+	for _, typedPackage := range typedPackages {
+		for _, file := range typedPackage.syntax {
+			if strings.HasSuffix(typedPackage.fset.Position(file.Pos()).Filename, "_test.go") {
+				continue
+			}
+			parents := parentMap(file)
+			ast.Inspect(file, func(node ast.Node) bool {
+				switch item := node.(type) {
+				case *ast.CompositeLit:
+					if isCanonicalMdnsEntry(typedPackage.info.TypeOf(item)) {
+						recordMdnsAllocation(&analysis, typedPackage, parents, item)
+					}
+				case *ast.CallExpr:
+					if isBuiltinNew(item, typedPackage.info) && len(item.Args) == 1 &&
+						isCanonicalMdnsEntry(typedPackage.info.TypeOf(item.Args[0])) {
+						recordMdnsAllocation(&analysis, typedPackage, parents, item)
+					}
+					if isReportMdnsEntriesCall(item, typedPackage.info) {
+						site := typedSite(typedPackage, parents, item)
+						analysis.reportCalls = append(analysis.reportCalls, site)
+						if !isMdnsProviderMethod(typedPackage, enclosingFunctionDeclaration(parents, item)) {
+							analysis.unauthorizedReportCalls = append(analysis.unauthorizedReportCalls, site)
+						}
+					}
+				case *ast.SelectorExpr:
+					if !isReportMdnsEntriesSelector(item, typedPackage.info) {
+						return true
+					}
+					call, directlyCalled := parents[item].(*ast.CallExpr)
+					if directlyCalled && call.Fun == item {
+						return true
+					}
+					site := typedSite(typedPackage, parents, item) + " (method value)"
+					analysis.unauthorizedReportCalls = append(analysis.unauthorizedReportCalls, site)
+				case *ast.TypeSpec:
+					if !isHubType(item, typedPackage) {
+						return true
+					}
+					structure, ok := item.Type.(*ast.StructType)
+					if !ok {
+						return true
+					}
+					for _, field := range structure.Fields.List {
+						if storesCanonicalMdnsEntry(typedPackage.info.TypeOf(field.Type), make(map[types.Type]bool)) {
+							analysis.hubEndpointCollections = append(analysis.hubEndpointCollections,
+								typedPackage.fset.Position(field.Pos()).String())
+						}
+					}
+				}
+				return true
+			})
+		}
+	}
+	sort.Strings(analysis.reportCalls)
+	sort.Strings(analysis.unauthorizedReportCalls)
+	sort.Strings(analysis.unauthorizedAllocations)
+	sort.Strings(analysis.hubEndpointCollections)
+	return analysis
+}
+
+func recordMdnsAllocation(
+	analysis *discoverySourceAnalysis,
+	typedPackage typedProductionPackage,
+	parents map[ast.Node]ast.Node,
+	node ast.Node,
+) {
+	owner := enclosingFunctionDeclaration(parents, node)
+	if !isMdnsProviderMethod(typedPackage, owner) {
+		analysis.unauthorizedAllocations = append(analysis.unauthorizedAllocations,
+			typedSite(typedPackage, parents, node))
+	}
+}
+
+func isBuiltinNew(call *ast.CallExpr, info *types.Info) bool {
+	identifier, ok := call.Fun.(*ast.Ident)
+	if !ok {
+		return false
+	}
+	builtin, ok := info.Uses[identifier].(*types.Builtin)
+	return ok && builtin.Name() == "new"
+}
+
+func isReportMdnsEntriesCall(call *ast.CallExpr, info *types.Info) bool {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	return ok && isReportMdnsEntriesSelector(selector, info)
+}
+
+func isReportMdnsEntriesSelector(selector *ast.SelectorExpr, info *types.Info) bool {
+	var object types.Object
+	if selection := info.Selections[selector]; selection != nil {
+		object = selection.Obj()
+	} else {
+		object = info.Uses[selector.Sel]
+	}
+	function, ok := object.(*types.Func)
+	if !ok || function.Name() != "ReportMdnsEntries" {
+		return false
+	}
+	signature, ok := function.Type().(*types.Signature)
+	if !ok || signature.Params().Len() != 2 {
+		return false
+	}
+	entries, ok := types.Unalias(signature.Params().At(0).Type()).(*types.Map)
+	return ok && isStringType(entries.Key()) && isCanonicalMdnsEntry(entries.Elem()) &&
+		isBoolType(signature.Params().At(1).Type())
+}
+
+func isCanonicalMdnsEntry(value types.Type) bool {
+	if value == nil {
+		return false
+	}
+	value = types.Unalias(value)
+	if pointer, ok := value.(*types.Pointer); ok {
+		return isCanonicalMdnsEntry(pointer.Elem())
+	}
+	named, ok := value.(*types.Named)
+	return ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == canonicalAPIPath &&
+		named.Obj().Name() == "MdnsEntry"
+}
+
+func storesCanonicalMdnsEntry(value types.Type, seen map[types.Type]bool) bool {
+	if value == nil {
+		return false
+	}
+	value = types.Unalias(value)
+	if isCanonicalMdnsEntry(value) {
+		return true
+	}
+	if seen[value] {
+		return false
+	}
+	seen[value] = true
+
+	switch concrete := value.(type) {
+	case *types.Pointer:
+		return storesCanonicalMdnsEntry(concrete.Elem(), seen)
+	case *types.Array:
+		return storesCanonicalMdnsEntry(concrete.Elem(), seen)
+	case *types.Slice:
+		return storesCanonicalMdnsEntry(concrete.Elem(), seen)
+	case *types.Map:
+		return storesCanonicalMdnsEntry(concrete.Key(), seen) || storesCanonicalMdnsEntry(concrete.Elem(), seen)
+	case *types.Named:
+		return storesCanonicalMdnsEntry(concrete.Underlying(), seen)
+	case *types.Struct:
+		for index := 0; index < concrete.NumFields(); index++ {
+			if storesCanonicalMdnsEntry(concrete.Field(index).Type(), seen) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isHubType(specification *ast.TypeSpec, typedPackage typedProductionPackage) bool {
+	object, ok := typedPackage.info.Defs[specification.Name].(*types.TypeName)
+	return ok && object.Pkg() != nil && object.Pkg().Path() == canonicalModulePath+"/hub" && object.Name() == "Hub"
+}
+
+func isMdnsProviderMethod(typedPackage typedProductionPackage, declaration *ast.FuncDecl) bool {
+	if declaration == nil || typedPackage.path != canonicalModulePath+"/mdns" {
+		return false
+	}
+	function, ok := typedPackage.info.Defs[declaration.Name].(*types.Func)
+	if !ok {
+		return false
+	}
+	signature, ok := function.Type().(*types.Signature)
+	if !ok || signature.Recv() == nil {
+		return false
+	}
+	receiver := types.Unalias(signature.Recv().Type())
+	if pointer, ok := receiver.(*types.Pointer); ok {
+		receiver = types.Unalias(pointer.Elem())
+	}
+	named, ok := receiver.(*types.Named)
+	return ok && named.Obj().Pkg() != nil && named.Obj().Pkg().Path() == canonicalModulePath+"/mdns" &&
+		named.Obj().Name() == "MdnsManager"
+}
+
+func isStringType(value types.Type) bool {
+	basic, ok := types.Unalias(value).(*types.Basic)
+	return ok && basic.Kind() == types.String
+}
+
+func isBoolType(value types.Type) bool {
+	basic, ok := types.Unalias(value).(*types.Basic)
+	return ok && basic.Kind() == types.Bool
+}
+
+func typedSite(typedPackage typedProductionPackage, parents map[ast.Node]ast.Node, node ast.Node) string {
+	return typedPackage.fset.Position(node.Pos()).String() + " in " + enclosingFunction(parents, node)
+}
+
+type fixtureImporter struct {
+	api *types.Package
+}
+
+func (importer fixtureImporter) Import(path string) (*types.Package, error) {
+	if path == canonicalAPIPath {
+		return importer.api, nil
+	}
+	return nil, fmt.Errorf("fixture import %q is not supported", path)
+}
+
+func loadTypedFixture(t *testing.T, name, source string) typedProductionPackage {
+	t.Helper()
+	fset := token.NewFileSet()
+	filename := strings.ReplaceAll(name, " ", "_") + ".go"
+	file, err := parser.ParseFile(fset, filename, source, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatalf("parse fixture: %v", err)
+	}
+	info := &types.Info{
+		Types:      make(map[ast.Expr]types.TypeAndValue),
+		Defs:       make(map[*ast.Ident]types.Object),
+		Uses:       make(map[*ast.Ident]types.Object),
+		Selections: make(map[*ast.SelectorExpr]*types.Selection),
+	}
+	packagePath := "example.invalid/" + strings.ReplaceAll(name, " ", "-")
+	checked, err := (&types.Config{
+		GoVersion: "go1.22",
+		Importer:  fixtureImporter{api: newFixtureAPIPackage()},
+	}).Check(packagePath, fset, []*ast.File{file}, info)
+	if err != nil {
+		t.Fatalf("type-check fixture: %v", err)
+	}
+	return typedProductionPackage{path: checked.Path(), fset: fset, syntax: []*ast.File{file}, info: info}
+}
+
+func newFixtureAPIPackage() *types.Package {
+	apiPackage := types.NewPackage(canonicalAPIPath, "api")
+	ski := types.NewVar(token.NoPos, apiPackage, "Ski", types.Typ[types.String])
+	entryName := types.NewTypeName(token.NoPos, apiPackage, "MdnsEntry", nil)
+	types.NewNamed(entryName, types.NewStruct([]*types.Var{ski}, []string{""}), nil)
+	apiPackage.Scope().Insert(entryName)
+	apiPackage.MarkComplete()
+	return apiPackage
+}
+
+func enclosingFunctionDeclaration(parents map[ast.Node]ast.Node, node ast.Node) *ast.FuncDecl {
+	for current := node; current != nil; current = parents[current] {
+		if declaration, ok := current.(*ast.FuncDecl); ok {
+			return declaration
+		}
+	}
+	return nil
 }
 
 func enclosingFunction(parents map[ast.Node]ast.Node, node ast.Node) string {

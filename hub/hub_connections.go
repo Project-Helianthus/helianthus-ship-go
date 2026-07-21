@@ -366,8 +366,8 @@ func (h *Hub) gatedDialContext(
 		return nil, nil, nil, outgoingAttemptDeniedError{}
 	}
 
-	gate, gateGeneration, authority, admission, requireAdmission, admissionValid := h.outgoingAttemptGateSnapshot(remoteService)
-	if !admissionValid {
+	gate, gateGeneration, authority, active := h.outgoingAttemptGateSnapshot(remoteService)
+	if !active {
 		return nil, nil, nil, outgoingAttemptDeniedError{}
 	}
 	permit := api.OutgoingAttemptPermit{Context: context.Background()}
@@ -456,8 +456,6 @@ func (h *Hub) gatedDialContext(
 			remoteService.SKI(),
 			gateGeneration,
 			authority,
-			admission,
-			requireAdmission,
 			expectedMetadata,
 			permit.Context,
 		)
@@ -698,13 +696,6 @@ func (h *Hub) prepareConnectionInitation(ski string, counter int, entry *api.Mdn
 	if success, err := h.initateConnectionWithError(service, entry); !success && !isOutgoingAttemptDenied(err) {
 		h.checkAutoReannounce()
 	}
-}
-
-// attempt to establish a connection to a remote service
-// returns true if successful
-func (h *Hub) initateConnection(remoteService *api.ServiceDetails, entry *api.MdnsEntry) bool {
-	success, _ := h.initateConnectionWithError(remoteService, entry)
-	return success
 }
 
 func (h *Hub) initateConnectionWithError(remoteService *api.ServiceDetails, entry *api.MdnsEntry) (bool, error) {
