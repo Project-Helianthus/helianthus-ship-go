@@ -22,6 +22,53 @@ type productionFile struct {
 	file *ast.File
 }
 
+func TestOutboundPairingAPIIsAbsentFromProductionTree(t *testing.T) {
+	_, fset, files := loadProductionFiles(t)
+	forbidden := map[string]struct{}{
+		"OutboundPairingController":             {},
+		"QueueRemoteSKI":                        {},
+		"RemoteEndpoint":                        {},
+		"ReportRemoteEndpoint":                  {},
+		"cacheRemoteEndpoint":                   {},
+		"createOutboundAdmission":               {},
+		"hasCurrentOutboundAdmission":           {},
+		"invalidateAllOutboundAdmissionsLocked": {},
+		"outboundAdmissions":                    {},
+		"outboundPairingAdmission":              {},
+		"promoteOutboundTrust":                  {},
+		"validOutboundSKI":                      {},
+		"validRemoteEndpoint":                   {},
+	}
+
+	var declarations []string
+	for _, parsed := range files {
+		ast.Inspect(parsed.file, func(node ast.Node) bool {
+			var names []*ast.Ident
+			switch declaration := node.(type) {
+			case *ast.FuncDecl:
+				names = []*ast.Ident{declaration.Name}
+			case *ast.TypeSpec:
+				names = []*ast.Ident{declaration.Name}
+			case *ast.ValueSpec:
+				names = declaration.Names
+			case *ast.Field:
+				names = declaration.Names
+			}
+			for _, name := range names {
+				if _, found := forbidden[name.Name]; found {
+					declarations = append(declarations, fset.Position(name.Pos()).String())
+				}
+			}
+			return true
+		})
+	}
+
+	sort.Strings(declarations)
+	if len(declarations) != 0 {
+		t.Errorf("removed outbound pairing declarations remain: %v", declarations)
+	}
+}
+
 func TestOutgoingAttemptAPIIsClosedAndAdditive(t *testing.T) {
 	root, fset, files := loadProductionFiles(t)
 
