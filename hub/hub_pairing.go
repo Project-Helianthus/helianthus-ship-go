@@ -109,7 +109,7 @@ func (h *Hub) checkHasStarted() bool {
 func (h *Hub) RegisterRemoteSKI(ski string) {
 	ski = util.NormalizeSKI(ski)
 	service := h.ServiceForSKI(ski)
-	h.promoteOutboundTrust(ski, service)
+	service.SetTrusted(true)
 
 	// if the hub has not started, simply add it
 	if !h.checkHasStarted() {

@@ -366,8 +366,8 @@ func (h *Hub) gatedDialContext(
 		return nil, nil, nil, outgoingAttemptDeniedError{}
 	}
 
-	gate, gateGeneration, authority, admission, requireAdmission, admissionValid := h.outgoingAttemptGateSnapshot(remoteService)
-	if !admissionValid {
+	gate, gateGeneration, authority, active := h.outgoingAttemptGateSnapshot(remoteService)
+	if !active {
 		return nil, nil, nil, outgoingAttemptDeniedError{}
 	}
 	permit := api.OutgoingAttemptPermit{Context: context.Background()}
@@ -456,8 +456,6 @@ func (h *Hub) gatedDialContext(
 			remoteService.SKI(),
 			gateGeneration,
 			authority,
-			admission,
-			requireAdmission,
 			expectedMetadata,
 			permit.Context,
 		)
