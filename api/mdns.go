@@ -5,31 +5,22 @@ import "net"
 /* Mdns */
 
 type MdnsEntry struct {
-	CandidateRef        string
-	ObservationRevision uint64
-	Name                string
-	Ski                 string
-	Identifier          string   // mandatory
-	Path                string   // mandatory
-	Register            bool     // mandatory
-	Brand               string   // optional
-	Type                string   // optional
-	Model               string   // optional
-	Host                string   // mandatory
-	Port                int      // mandatory
-	Addresses           []net.IP // mandatory
+	Name       string
+	Ski        string
+	Identifier string   // mandatory
+	Path       string   // mandatory
+	Register   bool     // mandatory
+	Brand      string   // optional
+	Type       string   // optional
+	Model      string   // optional
+	Host       string   // mandatory
+	Port       int      // mandatory
+	Addresses  []net.IP // mandatory
 }
 
 // implemented by Hub, used by mdns
 type MdnsReportInterface interface {
 	ReportMdnsEntries(entries map[string]*MdnsEntry, newEntries bool)
-}
-
-// MdnsRevisionReportInterface is the optional revision-aware reporting
-// capability. It lets an empty discovery snapshot invalidate previously
-// observed candidate capabilities without changing the legacy callback.
-type MdnsRevisionReportInterface interface {
-	ReportMdnsEntriesRevision(entries map[string]*MdnsEntry, newEntries bool, observationRevision uint64)
 }
 
 // implemented by mdns, used by Hub

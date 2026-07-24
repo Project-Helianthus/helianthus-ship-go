@@ -4,6 +4,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/Project-Helianthus/helianthus-ship-go/api"
 	"github.com/Project-Helianthus/helianthus-ship-go/logging"
 	"github.com/Project-Helianthus/helianthus-ship-go/model"
 )
@@ -24,17 +25,10 @@ func (c *ShipConnection) handleShipMessage(timeout bool, message []byte) {
 				}
 
 				_ = c.sendShipModel(model.MsgTypeEnd, closeMessage)
-
-				// wait a bit to let it send
-				<-time.After(500 * time.Millisecond)
-
-				//
-				c.dataWriter.CloseDataConnection(4001, "close")
-				c.reportConnectionClosed(c.getState() == model.SmeStateComplete)
+				c.CloseConnection(false, 4001, "remote close announce")
 			case model.ConnectionClosePhaseTypeConfirm:
 				// we got a confirmation so close this connection
-				c.dataWriter.CloseDataConnection(4001, "close")
-				c.reportConnectionClosed(c.getState() == model.SmeStateComplete)
+				c.CloseConnection(false, 4001, "remote close confirm")
 			}
 
 			return
@@ -45,7 +39,12 @@ func (c *ShipConnection) handleShipMessage(timeout bool, message []byte) {
 }
 
 // set a new handshake state and handle timers if needed
-func (c *ShipConnection) setState(newState model.ShipMessageExchangeState, err error) {
+func (c *ShipConnection) setState(newState model.ShipMessageExchangeState, err error) bool {
+	c.pairingApprovalMux.Lock()
+	if c.pairingClosing || c.pairingTerminal {
+		c.pairingApprovalMux.Unlock()
+		return false
+	}
 	c.mux.Lock()
 
 	oldState := c.smeState
@@ -75,11 +74,19 @@ func (c *ShipConnection) setState(newState model.ShipMessageExchangeState, err e
 			State: newState,
 			Error: err,
 		}
+		_, shouldDrain := c.enqueuePairingEffect(func() {
+			c.reportShipHandshakeStateUpdate(state)
+		})
 		c.mux.Unlock()
-		c.reportShipHandshakeStateUpdate(state)
-		return
+		c.pairingApprovalMux.Unlock()
+		if shouldDrain {
+			c.drainPairingEffects()
+		}
+		return true
 	}
 	c.mux.Unlock()
+	c.pairingApprovalMux.Unlock()
+	return true
 }
 
 func (c *ShipConnection) getState() model.ShipMessageExchangeState {
@@ -91,6 +98,9 @@ func (c *ShipConnection) getState() model.ShipMessageExchangeState {
 
 // handle handshake state transitions
 func (c *ShipConnection) handleState(timeout bool, message []byte) {
+	if !c.pairingEffectAllowed() {
+		return
+	}
 	switch c.getState() {
 	case model.SmeStateError:
 		logging.Log().Debug(c.RemoteSKI(), "connection is in error state")
@@ -195,34 +205,97 @@ func (c *ShipConnection) handleState(timeout bool, message []byte) {
 
 // set a state and trigger handling it
 func (c *ShipConnection) setAndHandleState(state model.ShipMessageExchangeState) {
-	c.setState(state, nil)
+	if !c.setState(state, nil) {
+		return
+	}
 	c.handleState(false, nil)
 }
 
 // SHIP handshake is approved, now set the new state and the SPINE read handler
 func (c *ShipConnection) approveHandshake() {
+	c.pairingApprovalMux.Lock()
+	if c.pairingClosing || c.pairingTerminal || c.spineSetupStarted {
+		c.pairingApprovalMux.Unlock()
+		return
+	}
+	if c.requirePairingApproval {
+		if !c.pairingCommitStarted || !c.pairingApprovalRequested || c.pairingApprovalReleased {
+			c.pairingApprovalMux.Unlock()
+			return
+		}
+		c.pairingApprovalReleased = true
+	}
+	c.spineSetupStarted = true
+	c.pairingApprovalMux.Unlock()
+
 	// Report to SPINE local device about this remote device connection
-	c.dataReader = c.infoProvider.SetupRemoteDevice(c.remoteSKI, c)
+	var reader api.ShipConnectionDataReaderInterface
+	c.runPairingEffect(func() {
+		if c.pairingEffectAllowed() {
+			reader = c.infoProvider.SetupRemoteDevice(c.remoteSKI, c)
+		}
+	}, true)
 	c.stopHandshakeTimer()
-	c.setState(model.SmeStateComplete, nil)
-	c.processBufferedSpineMessages()
+
+	c.spineDispatchMux.Lock()
+	c.pairingApprovalMux.Lock()
+	if c.pairingClosing || c.pairingTerminal {
+		c.pairingApprovalMux.Unlock()
+		c.spineDispatchMux.Unlock()
+		return
+	}
+	c.mux.Lock()
+	oldState := c.smeState
+	c.smeState = model.SmeStateComplete
+	c.smeError = nil
+	c.bufferMux.Lock()
+	c.dataReader = reader
+	buffered := c.spineBuffer
+	c.spineBuffer = nil
+	c.spineBufferBytes = 0
+	c.bufferMux.Unlock()
+	c.mux.Unlock()
+
+	var tasks []func()
+	if oldState != model.SmeStateComplete {
+		tasks = append(tasks, func() {
+			if c.spineDispatchTerminated() {
+				return
+			}
+			logging.Log().Trace(c.RemoteSKI(), "SHIP state changed to:", model.SmeStateComplete)
+			c.reportShipHandshakeStateUpdate(model.ShipState{State: model.SmeStateComplete})
+		})
+	}
+	for _, item := range buffered {
+		payload := append([]byte(nil), item...)
+		tasks = append(tasks, func() {
+			if !c.spineDispatchTerminated() {
+				reader.HandleShipPayloadMessage(payload)
+			}
+		})
+	}
+	shouldDrain := c.enqueueSpineDispatchLocked(tasks...)
+	c.pairingApprovalMux.Unlock()
+	c.spineDispatchMux.Unlock()
+	if shouldDrain {
+		c.drainSpineDispatchQueue()
+	}
 }
 
 // end the handshake process because of an error
 func (c *ShipConnection) endHandshakeWithError(err error) {
 	c.stopHandshakeTimer()
 
-	c.setState(model.SmeStateError, err)
+	if c.testHooks != nil && c.testHooks.beforeHandshakeErrorState != nil {
+		c.testHooks.beforeHandshakeErrorState()
+	}
+	if !c.setState(model.SmeStateError, err) {
+		return
+	}
 
 	logging.Log().Debug(c.RemoteSKI(), "SHIP handshake error:", err)
 
 	c.CloseConnection(true, 0, err.Error())
-
-	state := model.ShipState{
-		State: model.SmeStateError,
-		Error: err,
-	}
-	c.reportShipHandshakeStateUpdate(state)
 }
 
 // set the handshake timer to a new duration and start the channel

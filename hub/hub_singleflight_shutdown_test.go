@@ -38,6 +38,7 @@ func TestHubSingleFlightReservationClearsAfterTerminalFailure(t *testing.T) {
 			outgoingAttemptTestHost,
 			outgoingAttemptTestPort,
 			outgoingAttemptTestPath,
+			nil,
 		)
 		if !errors.Is(err, errAttemptTestDial) {
 			t.Fatalf("terminal failure %d = %v, want %v", attempt, err, errAttemptTestDial)
@@ -66,7 +67,13 @@ func TestHubShutdownCancelsBlockedGatedDialsWithoutLateRegistration(t *testing.T
 
 	result := make(chan error, 1)
 	go func() {
-		result <- hub.connectFoundService(remote, outgoingAttemptTestHost, outgoingAttemptTestPort, outgoingAttemptTestPath)
+		result <- hub.connectFoundService(
+			remote,
+			outgoingAttemptTestHost,
+			outgoingAttemptTestPort,
+			outgoingAttemptTestPath,
+			nil,
+		)
 	}()
 	waitForSignal(t, dialer.started)
 

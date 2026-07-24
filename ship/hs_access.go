@@ -64,25 +64,32 @@ func (c *ShipConnection) handshakeAccessMethods_Request(message []byte) {
 			return
 		}
 
-		// Save the SHIP ID. For a selected outgoing candidate, the approval
-		// boundary is reached before the callback so a synchronous durable trust
-		// commit can release the hold without racing this state transition.
+		// Save the SHIP ID. The approved state is published only after the
+		// identity callback returns; synchronous trust approval is latched until
+		// both callbacks have completed.
 		shipIDWasUnknown := len(c.remoteShipID) == 0
 		if len(c.remoteShipID) == 0 {
 			c.remoteShipID = *accessMethods.AccessMethods.Id
 		}
 
 		c.stopHandshakeTimer()
-		c.setState(model.SmeStateApproved, nil)
 		shouldReportShipID := shipIDWasUnknown || c.pairingApprovalPending()
-		if shouldReportShipID && !c.beginPairingCommit() {
+		if c.testHooks != nil && c.testHooks.beforePairingCommit != nil {
+			c.testHooks.beforePairingCommit()
+		}
+		if !c.beginPairingCommit() {
 			return
 		}
 		if shouldReportShipID {
-			c.infoProvider.ReportServiceShipID(c.remoteSKI, c.remoteShipID)
+			if !c.reportServiceShipID() {
+				return
+			}
 		}
-		if c.getState() != model.SmeStateApproved || c.pairingApprovalPending() {
+		if !c.publishPairingApproved() {
 			return
+		}
+		if c.completePairingCommitCallback() {
+			c.approveHandshake()
 		}
 		c.approveHandshake()
 		return

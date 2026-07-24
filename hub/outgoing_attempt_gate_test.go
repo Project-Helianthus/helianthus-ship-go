@@ -334,7 +334,7 @@ func TestOutgoingAttemptGateDenialsFailClosed(t *testing.T) {
 			dialer := &fakePeerDialer{err: errAttemptTestDial}
 			hub, _, remote := newAttemptTestHub(t, gate, dialer)
 
-			err := hub.connectFoundService(remote, "private-peer.local", "4712", "/private-path")
+			err := hub.connectFoundService(remote, "private-peer.local", "4712", "/private-path", nil)
 			assertTypedAttemptDenial(t, err)
 			for _, privateValue := range []string{"private-peer.local", "/private-path", errPrivateGate.Error(), "panic detail"} {
 				if strings.Contains(err.Error(), privateValue) {
@@ -365,7 +365,7 @@ func TestOutgoingAttemptGateSetterRejectsTypedNil(t *testing.T) {
 	if err := setter.SetOutgoingAttemptGate(typedNil); !errors.Is(err, api.ErrInvalidOutgoingAttemptGate) {
 		t.Fatalf("typed-nil installation error = %v, want %v", err, api.ErrInvalidOutgoingAttemptGate)
 	}
-	if hub.configuredOutgoingAttemptGate() != nil {
+	if outgoingAttemptGateForTest(hub) != nil {
 		t.Fatal("typed-nil installation changed the configured gate")
 	}
 
@@ -376,13 +376,13 @@ func TestOutgoingAttemptGateSetterRejectsTypedNil(t *testing.T) {
 	if err := setter.SetOutgoingAttemptGate(typedNil); !errors.Is(err, api.ErrInvalidOutgoingAttemptGate) {
 		t.Fatalf("typed-nil replacement error = %v, want %v", err, api.ErrInvalidOutgoingAttemptGate)
 	}
-	if got := hub.configuredOutgoingAttemptGate(); got != valid {
+	if got := outgoingAttemptGateForTest(hub); got != valid {
 		t.Fatal("typed-nil replacement displaced the valid gate")
 	}
 	if err := setter.SetOutgoingAttemptGate(nil); err != nil {
 		t.Fatalf("remove optional gate: %v", err)
 	}
-	if hub.configuredOutgoingAttemptGate() != nil {
+	if outgoingAttemptGateForTest(hub) != nil {
 		t.Fatal("nil removal left a configured gate")
 	}
 }
@@ -394,9 +394,15 @@ func TestOutgoingAttemptGateSetterRejectsReaderWithoutAttemptCallbacks(t *testin
 	if err := hub.SetOutgoingAttemptGate(gate); !errors.Is(err, api.ErrInvalidOutgoingAttemptGate) {
 		t.Fatalf("legacy-only reader installation error = %v, want %v", err, api.ErrInvalidOutgoingAttemptGate)
 	}
-	if hub.configuredOutgoingAttemptGate() != nil {
+	if outgoingAttemptGateForTest(hub) != nil {
 		t.Fatal("legacy-only reader installation changed the configured gate")
 	}
+}
+
+func outgoingAttemptGateForTest(hub *Hub) api.OutgoingAttemptGate {
+	hub.muxAttemptGate.RLock()
+	defer hub.muxAttemptGate.RUnlock()
+	return hub.outgoingAttemptGate
 }
 
 func TestTypedDenialSuppressesAddressRetryAndAutoReannounce(t *testing.T) {
@@ -526,7 +532,7 @@ func TestNoGatePreservesUpstreamRawIPv6URLConstruction(t *testing.T) {
 	dialer := &fakePeerDialer{err: errAttemptTestDial}
 	hub, _, remote := newAttemptTestHub(t, nil, dialer)
 
-	err := hub.connectFoundService(remote, "2001:db8::77", "4712", "/ship/")
+	err := hub.connectFoundService(remote, "2001:db8::77", "4712", "/ship/", nil)
 	if !errors.Is(err, errAttemptTestDial) {
 		t.Fatalf("ungated IPv6 error = %v, want %v", err, errAttemptTestDial)
 	}
@@ -563,7 +569,7 @@ func TestPreparedHandlesAreSingleUseAcrossFallback(t *testing.T) {
 			dialer := &fakePeerDialer{err: errAttemptTestDial}
 			hub, _, remote := newAttemptTestHub(t, gate, dialer)
 
-			err := hub.connectFoundService(remote, "peer.local", "4712", "/ship/")
+			err := hub.connectFoundService(remote, "peer.local", "4712", "/ship/", nil)
 			assertTypedAttemptDenial(t, err)
 			requests, authorized, _, aborted := gate.snapshot()
 			calls, _ := dialer.snapshot()
@@ -583,7 +589,12 @@ func TestAbortPreparedOnlyCleansUnlaunchedReservation(t *testing.T) {
 		dialer := &fakePeerDialer{err: errAttemptTestDial}
 		hub, _, remote := newAttemptTestHub(t, gate, dialer)
 
-		_, _, _, err := hub.gatedDialContext(remote, "peer.local", "4712", "/ship/")
+		_, response, _, err := hub.gatedDialContextWithExpectedSKI(remote, "peer.local", "4712", "/ship/", "", nil)
+		if response != nil && response.Body != nil {
+			t.Cleanup(func() {
+				_ = response.Body.Close()
+			})
+		}
 		assertTypedAttemptDenial(t, err)
 		_, _, _, aborted := gate.snapshot()
 		calls, peerEffects := dialer.snapshot()
@@ -597,7 +608,12 @@ func TestAbortPreparedOnlyCleansUnlaunchedReservation(t *testing.T) {
 		dialer := &fakePeerDialer{err: errAttemptTestDial}
 		hub, _, remote := newAttemptTestHub(t, gate, dialer)
 
-		_, _, attempt, err := hub.gatedDialContext(remote, "peer.local", "4712", "/ship/")
+		_, response, attempt, err := hub.gatedDialContextWithExpectedSKI(remote, "peer.local", "4712", "/ship/", "", nil)
+		if response != nil && response.Body != nil {
+			t.Cleanup(func() {
+				_ = response.Body.Close()
+			})
+		}
 		if !errors.Is(err, errAttemptTestDial) {
 			t.Fatalf("dial error = %v, want %v", err, errAttemptTestDial)
 		}
@@ -617,7 +633,7 @@ func TestCanceledPermitContextPreventsPeerEffect(t *testing.T) {
 	dialer := &fakePeerDialer{err: errAttemptTestDial}
 	hub, _, remote := newAttemptTestHub(t, gate, dialer)
 
-	err := hub.connectFoundService(remote, "peer.local", "4712", "/ship/")
+	err := hub.connectFoundService(remote, "peer.local", "4712", "/ship/", nil)
 	assertTypedAttemptDenial(t, err)
 	_, _, permits, _ := gate.snapshot()
 	calls, peerEffects := dialer.snapshot()
@@ -658,7 +674,17 @@ func TestHubInvalidationRechecksTrustedAttemptImmediatelyBeforeDial(t *testing.T
 			remote.SetTrusted(true)
 			result := make(chan error, 1)
 			go func() {
-				_, _, _, err := hub.gatedDialContext(remote, "peer.local", "4712", "/ship/")
+				_, response, _, err := hub.gatedDialContextWithExpectedSKI(
+					remote,
+					"peer.local",
+					"4712",
+					"/ship/",
+					"",
+					nil,
+				)
+				if response != nil && response.Body != nil {
+					_ = response.Body.Close()
+				}
 				result <- err
 			}()
 
@@ -681,6 +707,109 @@ func TestHubInvalidationRechecksTrustedAttemptImmediatelyBeforeDial(t *testing.T
 			}
 			assertTypedAttemptDenial(t, err)
 		})
+	}
+}
+
+func TestUnregisterBetweenReconnectEligibilityAndLaunchDeniesBeforePrepare(t *testing.T) {
+	gate := newScriptedAttemptGate(gatePermit)
+	dialer := &fakePeerDialer{err: errAttemptTestDial}
+	hub, _, remote := newAttemptTestHub(t, gate, dialer)
+	remote.SetTrusted(true)
+
+	authority, eligible := hub.outboundReconnectAuthority(remote)
+	if !eligible || authority == nil {
+		t.Fatalf("trusted reconnect authority = %#v eligible=%t, want protected eligibility", authority, eligible)
+	}
+	hub.UnregisterRemoteSKI(remote.SKI())
+
+	err := hub.connectFoundServiceWithOptions(
+		remote,
+		"peer.local",
+		"4712",
+		"/ship/",
+		"",
+		true,
+		false,
+		authority,
+	)
+	assertTypedAttemptDenial(t, err)
+	requests, authorized, permits, aborted := gate.snapshot()
+	calls, peerEffects := dialer.snapshot()
+	if len(requests) != 0 || len(authorized) != 0 || len(permits) != 0 || len(aborted) != 0 {
+		t.Fatalf(
+			"stale reconnect reached gate request/authorize/permit/abort = %d/%d/%d/%d, want zero",
+			len(requests),
+			len(authorized),
+			len(permits),
+			len(aborted),
+		)
+	}
+	if len(calls) != 0 || peerEffects != 0 {
+		t.Fatalf("stale reconnect reached dialer/peer = %d/%d, want zero", len(calls), peerEffects)
+	}
+}
+
+func TestUngatedReconnectIsCanceledByUnregistration(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	dialer := &fakePeerDialer{
+		err:                 errAttemptTestDial,
+		started:             make(chan struct{}),
+		waitForCancellation: true,
+		release:             release,
+	}
+	hub, _, remote := newAttemptTestHub(t, nil, dialer)
+	remote.SetTrusted(true)
+	authority, eligible := hub.outboundReconnectAuthority(remote)
+	if !eligible || authority == nil {
+		t.Fatalf("ungated trusted authority = %#v eligible=%t, want protected eligibility", authority, eligible)
+	}
+
+	result := make(chan error, 1)
+	go func() {
+		result <- hub.connectFoundService(remote, "peer.local", "4712", "/ship/", authority)
+	}()
+	waitForSignal(t, dialer.started)
+	hub.UnregisterRemoteSKI(remote.SKI())
+
+	err := waitForError(t, result)
+	assertTypedAttemptDenial(t, err)
+	calls, peerEffects := dialer.snapshot()
+	if len(calls) != 1 {
+		t.Fatalf("ungated canceled dial calls = %d, want one", len(calls))
+	}
+	if calls[0].context.Err() == nil {
+		t.Fatal("ungated reconnect dial context remained active after unregistration")
+	}
+	if peerEffects != 0 {
+		t.Fatalf("ungated canceled reconnect reached peer %d times, want zero", peerEffects)
+	}
+}
+
+func TestStaleUngatedHandshakeCallbackCannotRestoreTrust(t *testing.T) {
+	hub, _, remote := newAttemptTestHub(t, nil, &fakePeerDialer{err: errAttemptTestDial})
+	remote.SetTrusted(true)
+	authority, eligible := hub.outboundReconnectAuthority(remote)
+	if !eligible || authority == nil {
+		t.Fatalf("ungated trusted authority = %#v eligible=%t, want protected eligibility", authority, eligible)
+	}
+	_, metadata, registered := hub.registerInternalOutboundAttemptForLaunch(remote.SKI(), authority)
+	if !registered {
+		t.Fatal("register internal reconnect attempt")
+	}
+
+	hub.UnregisterRemoteSKI(remote.SKI())
+	hub.HandleShipHandshakeStateUpdateWithAttempt(
+		remote.SKI(),
+		model.ShipState{State: model.SmeHelloStateOk},
+		metadata,
+	)
+
+	if remote.Trusted() {
+		t.Fatal("stale ungated handshake callback restored trust after unregistration")
+	}
+	if state := remote.ConnectionStateDetail().State(); state != api.ConnectionStateNone {
+		t.Fatalf("stale ungated callback state = %v, want none", state)
 	}
 }
 
@@ -716,7 +845,17 @@ func TestHubCancellationInterruptsContextBlockedGatedDialWithoutDeadlock(t *test
 			remote.SetTrusted(true)
 			result := make(chan error, 1)
 			go func() {
-				_, _, _, err := hub.gatedDialContext(remote, "peer.local", "4712", "/ship/")
+				_, response, _, err := hub.gatedDialContextWithExpectedSKI(
+					remote,
+					"peer.local",
+					"4712",
+					"/ship/",
+					"",
+					nil,
+				)
+				if response != nil && response.Body != nil {
+					_ = response.Body.Close()
+				}
 				result <- err
 			}()
 
@@ -757,7 +896,19 @@ func TestTrustedReconnectStillDialsWhenNotInvalidated(t *testing.T) {
 	hub, _, remote := newAttemptTestHub(t, gate, dialer)
 	remote.SetTrusted(true)
 
-	connection, _, attempt, err := hub.gatedDialContext(remote, "peer.local", "4712", "/ship/")
+	connection, response, attempt, err := hub.gatedDialContextWithExpectedSKI(
+		remote,
+		"peer.local",
+		"4712",
+		"/ship/",
+		"",
+		nil,
+	)
+	if response != nil && response.Body != nil {
+		t.Cleanup(func() {
+			_ = response.Body.Close()
+		})
+	}
 	if err != nil {
 		t.Fatalf("non-revoked trusted reconnect: %v", err)
 	}

@@ -466,14 +466,14 @@ func (s *HubSuite) Test_ServeHTTP_02() {
 func (s *HubSuite) Test_ConnectFoundService_01() {
 	service := s.sut.ServiceForSKI(s.remoteSki)
 
-	err := s.sut.connectFoundService(service, "localhost", "80", "/ship")
+	err := s.sut.connectFoundService(service, "localhost", "80", "/ship", nil)
 	assert.NotNil(s.T(), err)
 
 	server := httptest.NewServer(s.sut)
 	url, err := url.Parse(server.URL)
 	assert.Nil(s.T(), err)
 
-	err = s.sut.connectFoundService(service, url.Hostname(), url.Port(), url.Path)
+	err = s.sut.connectFoundService(service, url.Hostname(), url.Port(), url.Path, nil)
 	assert.NotNil(s.T(), err)
 
 	server.CloseClientConnections()
@@ -498,7 +498,7 @@ func (s *HubSuite) Test_ConnectFoundService_02() {
 	url, err := url.Parse(server.URL)
 	assert.Nil(s.T(), err)
 
-	err = s.sut.connectFoundService(service, url.Hostname(), url.Port(), url.Path)
+	err = s.sut.connectFoundService(service, url.Hostname(), url.Port(), url.Path, nil)
 	assert.NotNil(s.T(), err)
 
 	server.CloseClientConnections()
@@ -522,7 +522,7 @@ func (s *HubSuite) Test_ConnectFoundService_03() {
 	url, err := url.Parse(server.URL)
 	assert.Nil(s.T(), err)
 
-	err = s.sut.connectFoundService(service, url.Hostname(), url.Port(), url.Path)
+	err = s.sut.connectFoundService(service, url.Hostname(), url.Port(), url.Path, nil)
 	assert.NotNil(s.T(), err)
 
 	time.Sleep(time.Second)

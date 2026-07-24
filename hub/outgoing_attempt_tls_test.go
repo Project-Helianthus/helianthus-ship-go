@@ -435,7 +435,7 @@ func TestRealTLSPeerDrivesAcceptRegistrationAndTerminalCallback(t *testing.T) {
 	}
 	remote := hub.ServiceForSKI(peer.remoteSKI)
 
-	if err := hub.connectFoundService(remote, peer.host, peer.port, "/ship/"); err != nil {
+	if err := hub.connectFoundService(remote, peer.host, peer.port, "/ship/", nil); err != nil {
 		t.Fatal("connect to local TLS peer failed")
 	}
 	select {
@@ -479,7 +479,7 @@ func TestAuthorizedCertificateValidationFailureTerminalizesOnce(t *testing.T) {
 		t.Fatalf("install durable gate: %v", err)
 	}
 
-	err := hub.connectFoundService(hub.ServiceForSKI("different-ski"), peer.host, peer.port, "/ship/")
+	err := hub.connectFoundService(hub.ServiceForSKI("different-ski"), peer.host, peer.port, "/ship/", nil)
 	if err == nil {
 		t.Fatal("certificate mismatch unexpectedly connected")
 	}
@@ -505,7 +505,7 @@ func TestAuthorizedDuplicateRejectionTerminalizesOnce(t *testing.T) {
 		},
 	}
 
-	err := hub.connectFoundService(hub.ServiceForSKI(peer.remoteSKI), peer.host, peer.port, "/ship/")
+	err := hub.connectFoundService(hub.ServiceForSKI(peer.remoteSKI), peer.host, peer.port, "/ship/", nil)
 	if err == nil {
 		t.Fatal("duplicate outgoing connection unexpectedly replaced active connection")
 	}

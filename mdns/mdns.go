@@ -12,6 +12,7 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -69,6 +70,8 @@ type MdnsManager struct {
 	// The currently available DNS-SD observations, keyed by exact service
 	// identity rather than SKI so colliding advertisements remain visible.
 	entries map[string]*api.MdnsEntry
+	// Candidate capabilities are kept out of the stable MdnsEntry shape.
+	candidateRefs map[string]string
 	// Candidate references are process-local capabilities. The secret and
 	// generation counters are deliberately never persisted.
 	candidateSecret     [32]byte
@@ -118,6 +121,7 @@ func NewMDNS(
 		ifaces:            ifaces,
 		providerSelection: providerSelection,
 		entries:           make(map[string]*api.MdnsEntry),
+		candidateRefs:     make(map[string]string),
 		newAvahiProvider: func(indexes []int32) api.MdnsProviderInterface {
 			return NewAvahiProvider(indexes)
 		},
@@ -458,57 +462,63 @@ func (m *MdnsManager) registrationAvailable() bool {
 	return m.autoaccept || m.pairingRegistration
 }
 
-func (m *MdnsManager) mdnsEntries() map[string]*api.MdnsEntry {
+func (m *MdnsManager) copyMdnsSnapshot() (
+	map[string]*api.MdnsEntry,
+	[]api.PairingCandidateObservation,
+	uint64,
+) {
 	m.mux.Lock()
 	defer m.mux.Unlock()
-
-	return m.entries
-}
-
-func (m *MdnsManager) copyMdnsEntries() map[string]*api.MdnsEntry {
-	m.mux.Lock()
-	defer m.mux.Unlock()
-	return m.copyMdnsEntriesLocked()
-}
-
-func (m *MdnsManager) copyMdnsSnapshot() (map[string]*api.MdnsEntry, uint64) {
-	m.mux.Lock()
-	defer m.mux.Unlock()
-	return m.copyMdnsEntriesLocked(), m.observationRevision
+	return m.copyMdnsEntriesLocked(), m.copyPairingCandidatesLocked(), m.observationRevision
 }
 
 func (m *MdnsManager) copyMdnsEntriesLocked() map[string]*api.MdnsEntry {
 	mdnsEntries := make(map[string]*api.MdnsEntry)
-	for k, v := range m.entries {
+	observationKeys := make([]string, 0, len(m.entries))
+	for observationKey := range m.entries {
+		observationKeys = append(observationKeys, observationKey)
+	}
+	sort.Strings(observationKeys)
+	for _, observationKey := range observationKeys {
+		v := m.entries[observationKey]
+		if v == nil || v.Ski == "" {
+			continue
+		}
+		if _, exists := mdnsEntries[v.Ski]; exists {
+			continue
+		}
 		newEntry := &api.MdnsEntry{}
 		util.DeepCopy[*api.MdnsEntry](v, newEntry)
-		newEntry.ObservationRevision = m.observationRevision
-		mdnsEntries[k] = newEntry
+		mdnsEntries[v.Ski] = newEntry
 	}
 
 	return mdnsEntries
 }
 
-func (m *MdnsManager) mdnsEntry(ski string) (*api.MdnsEntry, bool) {
-	m.mux.Lock()
-	defer m.mux.Unlock()
-
-	entry, ok := m.entries[ski]
-	return entry, ok
-}
-
-func (m *MdnsManager) setMdnsEntry(ski string, entry *api.MdnsEntry) {
-	m.mux.Lock()
-	defer m.mux.Unlock()
-
-	m.entries[ski] = entry
-}
-
-func (m *MdnsManager) removeMdnsEntry(ski string) {
-	m.mux.Lock()
-	defer m.mux.Unlock()
-
-	delete(m.entries, ski)
+func (m *MdnsManager) copyPairingCandidatesLocked() []api.PairingCandidateObservation {
+	candidates := make([]api.PairingCandidateObservation, 0, len(m.candidateRefs))
+	for observationKey, candidateRef := range m.candidateRefs {
+		entry := m.entries[observationKey]
+		if candidateRef == "" || entry == nil {
+			continue
+		}
+		candidates = append(candidates, api.PairingCandidateObservation{
+			CandidateRef: candidateRef,
+			Name:         entry.Name,
+			SKI:          entry.Ski,
+			Identifier:   entry.Identifier,
+			Brand:        entry.Brand,
+			Type:         entry.Type,
+			Model:        entry.Model,
+			Path:         entry.Path,
+			Port:         entry.Port,
+			Addresses:    append([]net.IP(nil), entry.Addresses...),
+		})
+	}
+	sort.Slice(candidates, func(left, right int) bool {
+		return candidates[left].CandidateRef < candidates[right].CandidateRef
+	})
+	return candidates
 }
 
 func mdnsObservationKey(name, host string, port int, elements map[string]string) string {
@@ -617,47 +627,35 @@ func (m *MdnsManager) processMdnsEntry(elements map[string]string, name, host st
 	switch {
 	case remove && exists:
 		delete(m.entries, observationKey)
+		delete(m.candidateRefs, observationKey)
 		updated = true
 		logging.Log().Debug("mdns: remove - ski:", ski, "name:", name, "brand:", brand, "model:", model, "typ:", deviceType, "identifier:", identifier, "register:", register, "host:", host, "port:", port, "addresses:", addresses)
 	case exists && !remove:
-		merged := append([]net.IP(nil), entry.Addresses...)
-		for _, address := range addresses {
-			found := false
-			for _, current := range merged {
-				if current.Equal(address) {
-					found = true
-					break
-				}
-			}
-			if !found {
-				merged = append(merged, address)
-			}
-		}
-		if !sameIPList(entry.Addresses, merged) || entry.Register != (register == "true") || entry.Brand != brand || entry.Type != deviceType || entry.Model != model {
-			entry.Addresses = merged
+		if !sameIPList(entry.Addresses, addresses) || entry.Register != (register == "true") || entry.Brand != brand || entry.Type != deviceType || entry.Model != model {
+			entry.Addresses = append([]net.IP(nil), addresses...)
 			entry.Register = register == "true"
 			entry.Brand = brand
 			entry.Type = deviceType
 			entry.Model = model
-			entry.CandidateRef = m.nextCandidateRefLocked(observationKey)
+			m.candidateRefs[observationKey] = m.nextCandidateRefLocked(observationKey)
 			updated = true
 			logging.Log().Debug("mdns: update - ski:", ski, "name:", name, "brand:", brand, "model:", model, "typ:", deviceType, "identifier:", identifier, "register:", register, "host:", host, "port:", port, "addresses:", addresses)
 		}
 	case !exists && !remove:
 		m.entries[observationKey] = &api.MdnsEntry{
-			CandidateRef: m.nextCandidateRefLocked(observationKey),
-			Name:         name,
-			Ski:          ski,
-			Identifier:   identifier,
-			Path:         path,
-			Register:     register == "true",
-			Brand:        brand,
-			Type:         deviceType,
-			Model:        model,
-			Host:         host,
-			Port:         port,
-			Addresses:    append([]net.IP(nil), addresses...),
+			Name:       name,
+			Ski:        ski,
+			Identifier: identifier,
+			Path:       path,
+			Register:   register == "true",
+			Brand:      brand,
+			Type:       deviceType,
+			Model:      model,
+			Host:       host,
+			Port:       port,
+			Addresses:  append([]net.IP(nil), addresses...),
 		}
+		m.candidateRefs[observationKey] = m.nextCandidateRefLocked(observationKey)
 		updated = true
 		logging.Log().Debug("mdns: new - ski:", ski, "name:", name, "brand:", brand, "model:", model, "typ:", deviceType, "identifier:", identifier, "register:", register, "host:", host, "port:", port, "addresses:", addresses)
 	}
@@ -669,11 +667,12 @@ func (m *MdnsManager) processMdnsEntry(elements map[string]string, name, host st
 		}
 	}
 	entries := m.copyMdnsEntriesLocked()
+	candidates := m.copyPairingCandidatesLocked()
 	revision := m.observationRevision
 	m.mux.Unlock()
 
 	if m.report != nil && updated {
-		m.reportEntries(entries, true, revision)
+		m.reportEntries(entries, candidates, true, revision)
 	}
 }
 
@@ -682,13 +681,18 @@ func (m *MdnsManager) RequestMdnsEntries() {
 		return
 	}
 
-	entries, revision := m.copyMdnsSnapshot()
-	m.reportEntries(entries, false, revision)
+	entries, candidates, revision := m.copyMdnsSnapshot()
+	m.reportEntries(entries, candidates, false, revision)
 }
 
-func (m *MdnsManager) reportEntries(entries map[string]*api.MdnsEntry, newEntries bool, revision uint64) {
-	if revisionReport, ok := m.report.(api.MdnsRevisionReportInterface); ok {
-		go revisionReport.ReportMdnsEntriesRevision(entries, newEntries, revision)
+func (m *MdnsManager) reportEntries(
+	entries map[string]*api.MdnsEntry,
+	candidates []api.PairingCandidateObservation,
+	newEntries bool,
+	revision uint64,
+) {
+	if candidateReport, ok := m.report.(api.PairingCandidateMdnsReportInterface); ok {
+		go candidateReport.ReportMdnsEntriesWithCandidates(entries, newEntries, candidates, revision)
 		return
 	}
 	go m.report.ReportMdnsEntries(entries, newEntries)

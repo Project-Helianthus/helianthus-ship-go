@@ -3,6 +3,7 @@ package mdns
 import (
 	"fmt"
 	"net"
+	"sort"
 	"sync"
 	"time"
 
@@ -18,6 +19,14 @@ type mdnsServiceData struct {
 	Port int
 	// the service txt
 	Txt []string
+}
+
+type avahiServiceObservation struct {
+	elements  map[string]string
+	name      string
+	host      string
+	addresses []net.IP
+	port      int
 }
 
 type AvahiProvider struct {
@@ -37,7 +46,8 @@ type AvahiProvider struct {
 	resolveCB api.MdnsResolveCB
 
 	// Used to store the service elements for each service, so that we can recall them when a service is removed
-	serviceElements map[string]map[string]string
+	serviceElements     map[string]map[string]string
+	serviceObservations map[string]avahiServiceObservation
 
 	shutdownChan                      chan struct{}
 	addServiceChan, removeServiceChan chan avahi.Service
@@ -48,10 +58,11 @@ type AvahiProvider struct {
 
 func NewAvahiProvider(ifaceIndexes []int32) *AvahiProvider {
 	return &AvahiProvider{
-		avServer:        avahi.ServerNew(),
-		setupSuccessful: false,
-		ifaceIndexes:    ifaceIndexes,
-		serviceElements: make(map[string]map[string]string),
+		avServer:            avahi.ServerNew(),
+		setupSuccessful:     false,
+		ifaceIndexes:        ifaceIndexes,
+		serviceElements:     make(map[string]map[string]string),
+		serviceObservations: make(map[string]avahiServiceObservation),
 	}
 }
 
@@ -317,12 +328,37 @@ func (a *AvahiProvider) processService(service avahi.Service, remove bool, cb ap
 func (a *AvahiProvider) processRemovedService(service avahi.Service, cb api.MdnsResolveCB) error {
 	logging.Log().Tracef("mdns: avahi - process remove service: %v", service)
 
-	// get the elements for the service
-	a.muxEl.RLock()
-	elements := a.serviceElements[getServiceUniqueKey(service)]
-	a.muxEl.RUnlock()
+	key := getServiceUniqueKey(service)
+	a.muxEl.Lock()
+	observation, exists := a.serviceObservations[key]
+	if !exists {
+		a.muxEl.Unlock()
+		return nil
+	}
+	delete(a.serviceElements, key)
+	delete(a.serviceObservations, key)
+	survivor, remainingAddresses, hasSurvivor := a.survivingObservationLocked(observation)
+	a.muxEl.Unlock()
 
-	cb(elements, service.Name, service.Host, nil, -1, true)
+	if hasSurvivor {
+		cb(
+			survivor.elements,
+			survivor.name,
+			survivor.host,
+			remainingAddresses,
+			survivor.port,
+			false,
+		)
+		return nil
+	}
+	cb(
+		observation.elements,
+		observation.name,
+		observation.host,
+		nil,
+		observation.port,
+		true,
+	)
 
 	return nil
 }
@@ -343,14 +379,67 @@ func (a *AvahiProvider) processAddedService(service avahi.Service, cb api.MdnsRe
 		return fmt.Errorf("service provides unusable address: %s", service.Name)
 	}
 
-	// add the elements to the map
+	observation := avahiServiceObservation{
+		elements:  elements,
+		name:      service.Name,
+		host:      service.Host,
+		addresses: []net.IP{append(net.IP(nil), address...)},
+		port:      int(service.Port),
+	}
 	a.muxEl.Lock()
-	a.serviceElements[getServiceUniqueKey(service)] = elements
+	key := getServiceUniqueKey(service)
+	a.serviceElements[key] = elements
+	a.serviceObservations[key] = observation
+	addresses := a.observationAddressesLocked(observation)
 	a.muxEl.Unlock()
 
-	cb(elements, service.Name, service.Host, []net.IP{address}, int(service.Port), false)
+	cb(elements, service.Name, service.Host, addresses, int(service.Port), false)
 
 	return nil
+}
+
+func (a *AvahiProvider) observationAddressesLocked(reference avahiServiceObservation) []net.IP {
+	referenceKey := mdnsObservationKey(reference.name, reference.host, reference.port, reference.elements)
+	var addresses []net.IP
+	for _, observation := range a.serviceObservations {
+		if mdnsObservationKey(observation.name, observation.host, observation.port, observation.elements) != referenceKey {
+			continue
+		}
+		for _, address := range observation.addresses {
+			found := false
+			for _, current := range addresses {
+				if current.Equal(address) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				addresses = append(addresses, append(net.IP(nil), address...))
+			}
+		}
+	}
+	sort.Slice(addresses, func(left, right int) bool {
+		return addresses[left].String() < addresses[right].String()
+	})
+	return addresses
+}
+
+func (a *AvahiProvider) survivingObservationLocked(
+	reference avahiServiceObservation,
+) (avahiServiceObservation, []net.IP, bool) {
+	referenceKey := mdnsObservationKey(reference.name, reference.host, reference.port, reference.elements)
+	keys := make([]string, 0, len(a.serviceObservations))
+	for key, observation := range a.serviceObservations {
+		if mdnsObservationKey(observation.name, observation.host, observation.port, observation.elements) == referenceKey {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) == 0 {
+		return avahiServiceObservation{}, nil, false
+	}
+	sort.Strings(keys)
+	survivor := a.serviceObservations[keys[0]]
+	return survivor, a.observationAddressesLocked(survivor), true
 }
 
 // Create a unique key for a ship service

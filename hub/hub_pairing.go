@@ -93,7 +93,6 @@ func (h *Hub) SetPairingRegistration(available bool) error {
 		h.muxReg.Unlock()
 		return err
 	}
-	h.pairingRegistration = available
 	h.muxReg.Unlock()
 	return nil
 }
@@ -139,36 +138,17 @@ func (h *Hub) QueuePairingCandidate(candidateRef, expectedSKI string) error {
 		h.muxReg.Unlock()
 		return api.ErrPairingCandidateActive
 	}
-	h.muxReg.Unlock()
-
-	if h.configuredOutgoingAttemptGate() == nil {
+	if h.testHooks != nil && h.testHooks.beforePairingCandidateAdmission != nil {
+		h.testHooks.beforePairingCandidateAdmission()
+	}
+	h.muxAttemptGate.Lock()
+	if h.outgoingAttemptGate == nil || isNilOutgoingAttemptValue(h.outgoingAttemptGate) {
+		h.muxAttemptGate.Unlock()
+		h.muxReg.Unlock()
 		return api.ErrOutgoingAttemptGateRequired
 	}
-
-	h.muxReg.Lock()
-	// Revalidate after the gate lookup so a newer discovery report cannot swap
-	// the capability while selection is being admitted.
-	current, exists := h.visiblePairingCandidates[candidateRef]
-	if !exists || current.ski != validatedSKI || current.revision != entry.revision {
-		h.muxReg.Unlock()
-		return api.ErrPairingCandidateUnavailable
-	}
-	if _, consumed := h.consumedPairingCandidates[candidateRef]; consumed {
-		h.muxReg.Unlock()
-		return api.ErrPairingCandidateConsumed
-	}
-	if service.Trusted() {
-		h.muxReg.Unlock()
-		return api.ErrRemoteAlreadyTrusted
-	}
-	if h.activePairingCandidates[validatedSKI] != nil {
-		h.muxReg.Unlock()
-		return api.ErrPairingCandidateActive
-	}
 	h.consumedPairingCandidates[candidateRef] = struct{}{}
-	h.muxAttemptGate.Lock()
-	candidateAuthority := h.currentOutboundAuthorityLocked(validatedSKI)
-	h.muxAttemptGate.Unlock()
+	candidateAuthority := h.rotateOutboundAuthorityLocked(validatedSKI)
 	activeCandidate := &activePairingCandidate{
 		service:   service,
 		authority: candidateAuthority,
@@ -176,15 +156,18 @@ func (h *Hub) QueuePairingCandidate(candidateRef, expectedSKI string) error {
 	h.activePairingCandidates[validatedSKI] = activeCandidate
 	service.SetShipID("")
 	service.ConnectionStateDetail().SetState(api.ConnectionStateQueued)
+	h.muxAttemptGate.Unlock()
 	h.muxReg.Unlock()
 
-	if h.hubReader != nil {
-		h.hubReader.ServicePairingDetailUpdate(validatedSKI, service.ConnectionStateDetail())
-	}
+	h.publishPairingDetail(validatedSKI, service.ConnectionStateDetail())
 
 	port := strconv.Itoa(entry.port)
 	path := entry.path
-	h.launchPairingCandidate(func() {
+	launch := func(run func()) { go run() }
+	if h.testHooks != nil && h.testHooks.launchPairingCandidate != nil {
+		launch = h.testHooks.launchPairingCandidate
+	}
+	launch(func() {
 		h.muxReg.Lock()
 		active := h.activePairingCandidates[validatedSKI] == activeCandidate
 		h.muxReg.Unlock()
@@ -268,22 +251,31 @@ func (h *Hub) retireActivePairingCandidateLocked(
 		return nil
 	}
 
-	h.beforePairingCandidateRetire()
-	h.rotateOutboundAuthorityLocked(ski)
+	if h.testHooks != nil && h.testHooks.beforePairingCandidateRetire != nil {
+		h.testHooks.beforePairingCandidateRetire()
+	}
+	retirementAuthority := h.rotateOutboundAuthorityLocked(ski)
 	active.service.ConnectionStateDetail().SetState(api.ConnectionStateNone)
 	delete(h.activePairingCandidates, ski)
-	return &pairingCandidateRetirement{ski: ski, service: active.service}
+	return &pairingCandidateRetirement{
+		ski:       ski,
+		service:   active.service,
+		authority: retirementAuthority,
+	}
 }
 
 func (h *Hub) finishPairingCandidateRetirements(retirements []pairingCandidateRetirement) {
 	for _, retirement := range retirements {
-		h.removeConnectionAttemptCounter(retirement.ski)
-		if h.hubReader != nil {
-			h.hubReader.ServicePairingDetailUpdate(
-				retirement.ski,
-				retirement.service.ConnectionStateDetail(),
-			)
+		h.muxReg.Lock()
+		h.muxAttemptGate.RLock()
+		removeRetryState := h.outboundAuthorities[retirement.ski] == retirement.authority &&
+			!retirement.service.Trusted()
+		if removeRetryState {
+			h.removeConnectionAttemptCounter(retirement.ski)
 		}
+		h.muxAttemptGate.RUnlock()
+		h.muxReg.Unlock()
+		h.publishPairingDetail(retirement.ski, retirement.service.ConnectionStateDetail())
 	}
 }
 
@@ -307,6 +299,9 @@ func (h *Hub) checkHasStarted() bool {
 func (h *Hub) RegisterRemoteSKI(ski string) {
 	ski = util.NormalizeSKI(ski)
 	service := h.ServiceForSKI(ski)
+	if h.testHooks != nil && h.testHooks.afterRegisterRemoteServiceLookup != nil {
+		h.testHooks.afterRegisterRemoteServiceLookup()
+	}
 	h.muxReg.Lock()
 	service.SetTrusted(true)
 	delete(h.activePairingCandidates, ski)
@@ -331,7 +326,7 @@ func (h *Hub) RegisterRemoteSKI(ski string) {
 	// locally initiated
 	service.ConnectionStateDetail().SetState(api.ConnectionStateQueued)
 
-	h.hubReader.ServicePairingDetailUpdate(ski, service.ConnectionStateDetail())
+	h.publishPairingDetail(ski, service.ConnectionStateDetail())
 
 	h.mdns.RequestMdnsEntries()
 }
@@ -344,7 +339,7 @@ func (h *Hub) UnregisterRemoteSKI(ski string) {
 
 	h.removeConnectionAttemptCounter(ski)
 
-	h.hubReader.ServicePairingDetailUpdate(ski, service.ConnectionStateDetail())
+	h.publishPairingDetail(ski, service.ConnectionStateDetail())
 
 	if existingC := h.connectionForSKI(ski); existingC != nil {
 		existingC.CloseConnection(true, 4500, "User close")
@@ -373,5 +368,5 @@ func (h *Hub) CancelPairingWithSKI(ski string) {
 		existingC.AbortPendingHandshake()
 	}
 
-	h.hubReader.ServicePairingDetailUpdate(ski, service.ConnectionStateDetail())
+	h.publishPairingDetail(ski, service.ConnectionStateDetail())
 }
