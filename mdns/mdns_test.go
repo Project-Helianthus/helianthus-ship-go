@@ -340,42 +340,23 @@ func (s *MdnsSuite) Test_Shutdown_NoStart() {
 	s.sut.Shutdown()
 }
 
-func (s *MdnsSuite) Test_MdnsEntry() {
-	testSki := "test"
-
-	entries := s.sut.mdnsEntries()
-	assert.Equal(s.T(), 0, len(entries))
-
-	entry := &api.MdnsEntry{
-		Ski: testSki,
-	}
-
-	s.sut.setMdnsEntry(testSki, entry)
-	entries = s.sut.mdnsEntries()
-	assert.Equal(s.T(), 1, len(entries))
-
-	theEntry, ok := s.sut.mdnsEntry(testSki)
-	assert.Equal(s.T(), true, ok)
-	assert.NotNil(s.T(), theEntry)
-
-	copyEntries := s.sut.copyMdnsEntries()
-	assert.Equal(s.T(), 1, len(copyEntries))
-
-	s.sut.removeMdnsEntry(testSki)
-	entries = s.sut.mdnsEntries()
-	assert.Equal(s.T(), 0, len(entries))
-	assert.Equal(s.T(), 1, len(copyEntries))
+func mdnsEntryCountForTest(manager *MdnsManager) int {
+	manager.mux.Lock()
+	defer manager.mux.Unlock()
+	return len(manager.entries)
 }
 
 func (s *MdnsSuite) Test_MdnsEntries() {
-	testSki := "test"
-
-	entry := &api.MdnsEntry{
-		Ski: testSki,
-	}
-	s.sut.setMdnsEntry(testSki, entry)
-	entries := s.sut.mdnsEntries()
-	assert.Equal(s.T(), 1, len(entries))
+	const testSKI = "0123456789abcdef0123456789abcdef01234567"
+	s.sut.processMdnsEntry(
+		pairingCandidateElements(testSKI),
+		"test",
+		"test.local",
+		[]net.IP{net.ParseIP("192.0.2.10")},
+		4712,
+		false,
+	)
+	assert.Equal(s.T(), 1, mdnsEntryCountForTest(s.sut))
 
 	err := s.sut.Start(s.mdnsSearch)
 	assert.Nil(s.T(), err)
@@ -388,6 +369,8 @@ func (s *MdnsSuite) Test_MdnsEntries() {
 }
 
 func (s *MdnsSuite) Test_ProcessMdnsEntry() {
+	const remoteSKI = "0123456789abcdef0123456789abcdef01234567"
+
 	err := s.sut.Start(s.mdnsSearch)
 	assert.Nil(s.T(), err)
 
@@ -401,46 +384,46 @@ func (s *MdnsSuite) Test_ProcessMdnsEntry() {
 	port := 4567
 
 	s.sut.processMdnsEntry(elements, name, host, ips, port, false)
-	assert.Equal(s.T(), 0, len(s.sut.mdnsEntries()))
+	assert.Equal(s.T(), 0, mdnsEntryCountForTest(s.sut))
 
 	elements["txtvers"] = "2"
 	elements["id"] = "id"
 	elements["path"] = "/ship"
-	elements["ski"] = "testski"
+	elements["ski"] = remoteSKI
 	elements["register"] = "falsee"
 
 	s.sut.processMdnsEntry(elements, name, host, ips, port, false)
-	assert.Equal(s.T(), 0, len(s.sut.mdnsEntries()))
+	assert.Equal(s.T(), 0, mdnsEntryCountForTest(s.sut))
 
 	elements["txtvers"] = "1"
 	s.sut.processMdnsEntry(elements, name, host, ips, port, false)
-	assert.Equal(s.T(), 0, len(s.sut.mdnsEntries()))
+	assert.Equal(s.T(), 0, mdnsEntryCountForTest(s.sut))
 
 	elements["ski"] = s.sut.ski
 	s.sut.processMdnsEntry(elements, name, host, ips, port, false)
-	assert.Equal(s.T(), 0, len(s.sut.mdnsEntries()))
+	assert.Equal(s.T(), 0, mdnsEntryCountForTest(s.sut))
 
-	elements["ski"] = "testski"
+	elements["ski"] = remoteSKI
 	s.sut.processMdnsEntry(elements, name, host, ips, port, false)
-	assert.Equal(s.T(), 0, len(s.sut.mdnsEntries()))
+	assert.Equal(s.T(), 0, mdnsEntryCountForTest(s.sut))
 
 	elements["register"] = "false"
 	s.sut.processMdnsEntry(elements, name, host, ips, port, false)
-	assert.Equal(s.T(), 1, len(s.sut.mdnsEntries()))
+	assert.Equal(s.T(), 1, mdnsEntryCountForTest(s.sut))
 
 	elements["brand"] = "brand"
 	elements["type"] = "type"
 	elements["model"] = "model"
 	s.sut.processMdnsEntry(elements, name, host, ips, port, false)
-	assert.Equal(s.T(), 1, len(s.sut.mdnsEntries()))
+	assert.Equal(s.T(), 1, mdnsEntryCountForTest(s.sut))
 
 	ips = []net.IP{[]byte("127.0.0.1"), []byte{0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}}
 	s.sut.processMdnsEntry(elements, name, host, ips, port, false)
-	assert.Equal(s.T(), 1, len(s.sut.mdnsEntries()))
+	assert.Equal(s.T(), 1, mdnsEntryCountForTest(s.sut))
 
 	s.sut.processMdnsEntry(elements, name, host, ips, port, false)
-	assert.Equal(s.T(), 1, len(s.sut.mdnsEntries()))
+	assert.Equal(s.T(), 1, mdnsEntryCountForTest(s.sut))
 
 	s.sut.processMdnsEntry(elements, name, host, ips, port, true)
-	assert.Equal(s.T(), 0, len(s.sut.mdnsEntries()))
+	assert.Equal(s.T(), 0, mdnsEntryCountForTest(s.sut))
 }

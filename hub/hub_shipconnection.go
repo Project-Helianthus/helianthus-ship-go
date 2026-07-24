@@ -6,6 +6,7 @@ import (
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
 	"github.com/Project-Helianthus/helianthus-ship-go/model"
+	"github.com/Project-Helianthus/helianthus-ship-go/util"
 )
 
 var _ api.ShipConnectionInfoProviderInterface = (*Hub)(nil)
@@ -48,9 +49,21 @@ func (h *Hub) HandleConnectionClosedWithAttempt(
 	metadata api.OutgoingAttemptMetadata,
 ) {
 	remoteSKI := connection.RemoteSKI()
-	h.releaseOutboundAttemptForConnection(remoteSKI, connection, metadata)
+	retirement := h.claimClosedOutboundAttempt(remoteSKI, connection, metadata)
+	if retirement != nil {
+		h.finishPairingCandidateRetirements([]pairingCandidateRetirement{*retirement})
+	}
+	if metadata.Scope == internalOutgoingAttemptScope {
+		if handshakeCompleted {
+			h.removeConnectionAttemptCounter(remoteSKI)
+		}
+		h.hubReader.RemoteSKIDisconnected(remoteSKI)
+		if handshakeCompleted || h.IsRemoteServiceForSKIPaired(remoteSKI) {
+			h.checkAutoReannounce()
+		}
+		return
+	}
 	if reader, ok := h.hubReader.(api.OutgoingAttemptHubReaderInterface); ok {
-		h.removeExactConnection(connection)
 		reader.OutgoingAttemptConnectionClosed(remoteSKI, handshakeCompleted, metadata)
 		if handshakeCompleted || h.IsRemoteServiceForSKIPaired(remoteSKI) {
 			h.checkAutoReannounce()
@@ -58,6 +71,29 @@ func (h *Hub) HandleConnectionClosedWithAttempt(
 		return
 	}
 	h.HandleConnectionClosed(connection, handshakeCompleted)
+}
+
+func (h *Hub) claimClosedOutboundAttempt(
+	remoteSKI string,
+	connection api.ShipConnectionInterface,
+	metadata api.OutgoingAttemptMetadata,
+) *pairingCandidateRetirement {
+	h.muxReg.Lock()
+	h.muxAttemptGate.Lock()
+	h.removeExactConnection(connection)
+	if h.testHooks != nil && h.testHooks.beforeOutboundAttemptRelease != nil {
+		h.testHooks.beforeOutboundAttemptRelease()
+	}
+	removed, releasedAuthority := h.releaseOutboundAttemptForConnectionLocked(remoteSKI, connection, metadata)
+	var retirement *pairingCandidateRetirement
+	if releasedAuthority != nil {
+		retirement = h.retireActivePairingCandidateLocked(remoteSKI, nil, releasedAuthority)
+	}
+	h.muxAttemptGate.Unlock()
+	h.muxReg.Unlock()
+
+	cancelOutboundAttemptRegistrations(removed)
+	return retirement
 }
 
 func (h *Hub) removeExactConnection(connection api.ShipConnectionInterface) {
@@ -113,7 +149,10 @@ func (h *Hub) HandleShipHandshakeStateUpdate(ski string, state model.ShipState) 
 	// overwrite service Paired value
 	if state.State == model.SmeHelloStateOk {
 		service := h.ServiceForSKI(ski)
+		h.muxReg.Lock()
 		service.SetTrusted(true)
+		delete(h.activePairingCandidates, ski)
+		h.muxReg.Unlock()
 	}
 
 	pairingState := h.mapShipMessageExchangeState(state.State, ski)
@@ -133,10 +172,7 @@ func (h *Hub) HandleShipHandshakeStateUpdate(ski string, state model.ShipState) 
 		// always send a delayed update, as the processing of the new state has to be done
 		// and the SHIP message has to be received by the other service before
 		// acting upon the new state is safe
-		go func() {
-			<-time.After(time.Millisecond * 500)
-			h.hubReader.ServicePairingDetailUpdate(ski, pairingDetail)
-		}()
+		go h.publishCurrentPairingDetailAfterDelay(ski, pairingDetail, api.OutgoingAttemptMetadata{}, false)
 	}
 }
 
@@ -145,6 +181,10 @@ func (h *Hub) HandleShipHandshakeStateUpdateWithAttempt(
 	state model.ShipState,
 	metadata api.OutgoingAttemptMetadata,
 ) {
+	if metadata.Scope == internalOutgoingAttemptScope {
+		h.handleInternalShipHandshakeStateUpdate(ski, state, metadata)
+		return
+	}
 	if reader, ok := h.hubReader.(api.OutgoingAttemptHubReaderInterface); ok {
 		reader.OutgoingAttemptHandshakeStateUpdate(ski, state, metadata)
 		return
@@ -152,7 +192,154 @@ func (h *Hub) HandleShipHandshakeStateUpdateWithAttempt(
 	h.HandleShipHandshakeStateUpdate(ski, state)
 }
 
+func (h *Hub) handleInternalShipHandshakeStateUpdate(
+	ski string,
+	state model.ShipState,
+	metadata api.OutgoingAttemptMetadata,
+) {
+	ski = util.NormalizeSKI(ski)
+	pairingState := h.mapShipMessageExchangeState(state.State, ski)
+	if state.Error != nil && !errors.Is(state.Error, api.ErrConnectionNotFound) {
+		pairingState = api.ConnectionStateError
+	}
+	pairingDetail := api.NewConnectionStateDetail(pairingState, state.Error)
+
+	h.muxReg.Lock()
+	h.muxAttemptGate.RLock()
+	if !h.internalOutboundAttemptActiveLocked(ski, metadata) {
+		h.muxAttemptGate.RUnlock()
+		h.muxReg.Unlock()
+		return
+	}
+	service := h.remoteServices[ski]
+	existingDetails := service.ConnectionStateDetail()
+	changed := existingDetails.State() != pairingState || !errors.Is(existingDetails.Error(), state.Error)
+	if changed {
+		service.SetConnectionStateDetail(pairingDetail)
+	}
+	h.muxAttemptGate.RUnlock()
+	h.muxReg.Unlock()
+
+	if changed {
+		go h.publishCurrentPairingDetailAfterDelay(ski, pairingDetail, metadata, true)
+	}
+}
+
+func (h *Hub) publishCurrentPairingDetailAfterDelay(
+	ski string,
+	detail *api.ConnectionStateDetail,
+	metadata api.OutgoingAttemptMetadata,
+	requireInternalAttempt bool,
+) {
+	<-time.After(time.Millisecond * 500)
+
+	h.muxReg.Lock()
+	if requireInternalAttempt {
+		h.muxAttemptGate.RLock()
+		if !h.internalOutboundAttemptActiveLocked(ski, metadata) {
+			h.muxAttemptGate.RUnlock()
+			h.muxReg.Unlock()
+			return
+		}
+	}
+	service := h.remoteServices[ski]
+	current := service != nil && pairingDetailsEqual(service.ConnectionStateDetail(), detail)
+	if !current {
+		if requireInternalAttempt {
+			h.muxAttemptGate.RUnlock()
+		}
+		h.muxReg.Unlock()
+		return
+	}
+	shouldDrain := h.enqueuePairingDetailLocked(ski, detail)
+	if requireInternalAttempt {
+		h.muxAttemptGate.RUnlock()
+	}
+	h.muxReg.Unlock()
+	if shouldDrain {
+		h.drainPairingNotifications()
+	}
+}
+
+func pairingDetailsEqual(left, right *api.ConnectionStateDetail) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.State() == right.State() && errors.Is(left.Error(), right.Error())
+}
+
+func snapshotPairingDetail(detail *api.ConnectionStateDetail) *api.ConnectionStateDetail {
+	if detail == nil {
+		return nil
+	}
+	return api.NewConnectionStateDetail(detail.State(), detail.Error())
+}
+
+func (h *Hub) publishPairingDetail(ski string, detail *api.ConnectionStateDetail) {
+	if h.hubReader == nil {
+		return
+	}
+	h.pairingNotificationMux.Lock()
+	shouldDrain := h.enqueuePairingDetailLockedWithoutMutex(ski, snapshotPairingDetail(detail))
+	h.pairingNotificationMux.Unlock()
+	if shouldDrain {
+		h.drainPairingNotifications()
+	}
+}
+
+// enqueuePairingDetailLocked is called while the state locks establishing the
+// notification order are held.
+func (h *Hub) enqueuePairingDetailLocked(ski string, detail *api.ConnectionStateDetail) bool {
+	h.pairingNotificationMux.Lock()
+	defer h.pairingNotificationMux.Unlock()
+	return h.enqueuePairingDetailLockedWithoutMutex(ski, snapshotPairingDetail(detail))
+}
+
+func (h *Hub) enqueuePairingDetailLockedWithoutMutex(
+	ski string,
+	detail *api.ConnectionStateDetail,
+) bool {
+	h.pairingNotificationQueue = append(h.pairingNotificationQueue, func() {
+		h.hubReader.ServicePairingDetailUpdate(ski, detail)
+	})
+	if h.pairingNotificationDraining {
+		return false
+	}
+	h.pairingNotificationDraining = true
+	return true
+}
+
+func (h *Hub) drainPairingNotifications() {
+	for {
+		h.pairingNotificationMux.Lock()
+		if len(h.pairingNotificationQueue) == 0 {
+			h.pairingNotificationDraining = false
+			h.pairingNotificationMux.Unlock()
+			return
+		}
+		task := h.pairingNotificationQueue[0]
+		h.pairingNotificationQueue[0] = nil
+		h.pairingNotificationQueue = h.pairingNotificationQueue[1:]
+		h.pairingNotificationMux.Unlock()
+		task()
+	}
+}
+
+type publicShipDataWriter struct {
+	writer api.ShipConnectionDataWriterInterface
+}
+
+func (w publicShipDataWriter) WriteShipMessageWithPayload(message []byte) {
+	w.writer.WriteShipMessageWithPayload(message)
+}
+
 // report an approved handshake by a remote device
 func (h *Hub) SetupRemoteDevice(ski string, writeI api.ShipConnectionDataWriterInterface) api.ShipConnectionDataReaderInterface {
+	if attempt, ok := writeI.(api.OutgoingAttemptConnectionInterface); ok {
+		if metadata, hasMetadata := attempt.OutgoingAttemptMetadata(); hasMetadata &&
+			metadata.Scope == internalOutgoingAttemptScope {
+			writeI = publicShipDataWriter{writer: writeI}
+		}
+	}
 	return h.hubReader.SetupRemoteDevice(ski, writeI)
 }

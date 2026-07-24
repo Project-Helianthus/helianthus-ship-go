@@ -159,7 +159,7 @@ func TestTerminalCallbackPanicSuppressesFallbackAndKeepsReservationForRecovery(t
 		t.Fatalf("install durable gate: %v", err)
 	}
 
-	err := hub.connectFoundService(hub.ServiceForSKI("remote-ski"), "peer.local", "4712", "/ship/")
+	err := hub.connectFoundService(hub.ServiceForSKI("remote-ski"), "peer.local", "4712", "/ship/", nil)
 	assertTypedAttemptDenial(t, err)
 	requests, terminals, _, active := model.snapshotLifecycle()
 	if len(requests) != 1 || len(terminals) != 0 || active != 1 || dialer.count() != 1 {
@@ -246,7 +246,7 @@ func TestAuthorizedPreconstructionFailuresTerminalizeBeforeFallback(t *testing.T
 			}
 			remote := hub.ServiceForSKI("remote-ski")
 
-			err := hub.connectFoundService(remote, "peer.local", "4712", "/ship/")
+			err := hub.connectFoundService(remote, "peer.local", "4712", "/ship/", nil)
 			if err == nil || isOutgoingAttemptDenied(err) {
 				t.Fatalf("authorized failure = %T %v, want ordinary terminal failure", err, err)
 			}
@@ -280,7 +280,7 @@ func TestDeniedUnlaunchedReservationDoesNotInventTerminalResult(t *testing.T) {
 		t.Fatalf("install durable gate: %v", err)
 	}
 
-	err := hub.connectFoundService(hub.ServiceForSKI("remote-ski"), "peer.local", "4712", "/ship/")
+	err := hub.connectFoundService(hub.ServiceForSKI("remote-ski"), "peer.local", "4712", "/ship/", nil)
 	assertTypedAttemptDenial(t, err)
 	requests, terminals, _, active := model.snapshotLifecycle()
 	if len(requests) != 1 || len(terminals) != 0 || active != 0 || dialer.count() != 0 {

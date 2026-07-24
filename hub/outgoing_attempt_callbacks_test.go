@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
 	"github.com/Project-Helianthus/helianthus-ship-go/model"
@@ -14,16 +15,30 @@ type attemptAwareHubReader struct {
 
 	closedMetadata    []api.OutgoingAttemptMetadata
 	handshakeMetadata []api.OutgoingAttemptMetadata
+	setupWriter       api.ShipConnectionDataWriterInterface
+	pairingStates     []api.ConnectionState
 }
 
 func (*attemptAwareHubReader) RemoteSKIConnected(string)    {}
 func (*attemptAwareHubReader) RemoteSKIDisconnected(string) {}
-func (*attemptAwareHubReader) SetupRemoteDevice(string, api.ShipConnectionDataWriterInterface) api.ShipConnectionDataReaderInterface {
+func (r *attemptAwareHubReader) SetupRemoteDevice(
+	_ string,
+	writer api.ShipConnectionDataWriterInterface,
+) api.ShipConnectionDataReaderInterface {
+	r.mu.Lock()
+	r.setupWriter = writer
+	r.mu.Unlock()
 	return nil
 }
 func (*attemptAwareHubReader) VisibleRemoteServicesUpdated([]api.RemoteService) {}
 func (*attemptAwareHubReader) ServiceShipIDUpdate(string, string)               {}
-func (*attemptAwareHubReader) ServicePairingDetailUpdate(string, *api.ConnectionStateDetail) {
+func (r *attemptAwareHubReader) ServicePairingDetailUpdate(
+	_ string,
+	detail *api.ConnectionStateDetail,
+) {
+	r.mu.Lock()
+	r.pairingStates = append(r.pairingStates, detail.State())
+	r.mu.Unlock()
 }
 func (*attemptAwareHubReader) AllowWaitingForTrust(string) bool { return false }
 func (r *attemptAwareHubReader) OutgoingAttemptConnectionClosed(_ string, _ bool, metadata api.OutgoingAttemptMetadata) {
@@ -41,6 +56,75 @@ func (r *attemptAwareHubReader) snapshot() ([]api.OutgoingAttemptMetadata, []api
 	defer r.mu.Unlock()
 	return append([]api.OutgoingAttemptMetadata(nil), r.closedMetadata...),
 		append([]api.OutgoingAttemptMetadata(nil), r.handshakeMetadata...)
+}
+
+type attemptMetadataWriter struct {
+	metadata api.OutgoingAttemptMetadata
+}
+
+func (*attemptMetadataWriter) WriteShipMessageWithPayload([]byte) {}
+func (w *attemptMetadataWriter) OutgoingAttemptMetadata() (api.OutgoingAttemptMetadata, bool) {
+	return w.metadata, true
+}
+
+func TestInternalAttemptMetadataIsHiddenFromPublicSetupCallback(t *testing.T) {
+	reader := &attemptAwareHubReader{}
+	hub := NewHub(reader, &attemptTestMdns{}, 0, tls.Certificate{}, api.NewServiceDetails("local-ski"))
+	writer := &attemptMetadataWriter{
+		metadata: api.OutgoingAttemptMetadata{
+			AttemptID:    "ship-internal-1",
+			Scope:        internalOutgoingAttemptScope,
+			ControlEpoch: 17,
+		},
+	}
+
+	hub.SetupRemoteDevice("remote-ski", writer)
+	reader.mu.Lock()
+	publicWriter := reader.setupWriter
+	reader.mu.Unlock()
+	if publicWriter == nil {
+		t.Fatal("public setup callback did not receive a writer")
+	}
+	if _, leaked := publicWriter.(api.OutgoingAttemptConnectionInterface); leaked {
+		t.Fatal("internal outgoing attempt metadata leaked through public setup writer")
+	}
+	publicWriter.WriteShipMessageWithPayload([]byte("probe"))
+}
+
+func TestDelayedInternalPairingUpdateCannotFollowUnregister(t *testing.T) {
+	const remoteSKI = "13579bdf2468ace013579bdf2468ace013579bdf"
+	reader := &attemptAwareHubReader{}
+	hub := NewHub(reader, &attemptTestMdns{}, 0, tls.Certificate{}, api.NewServiceDetails("local-ski"))
+	remote := hub.ServiceForSKI(remoteSKI)
+	remote.SetTrusted(true)
+	authority, eligible := hub.outboundReconnectAuthority(remote)
+	if !eligible || authority == nil {
+		t.Fatal("trusted service did not receive reconnect authority")
+	}
+	_, metadata, registered := hub.registerInternalOutboundAttemptForLaunch(remoteSKI, authority)
+	if !registered {
+		t.Fatal("register internal reconnect attempt")
+	}
+
+	hub.HandleShipHandshakeStateUpdateWithAttempt(
+		remoteSKI,
+		model.ShipState{State: model.SmeStateComplete},
+		metadata,
+	)
+	hub.UnregisterRemoteSKI(remoteSKI)
+	time.Sleep(650 * time.Millisecond)
+
+	reader.mu.Lock()
+	states := append([]api.ConnectionState(nil), reader.pairingStates...)
+	reader.mu.Unlock()
+	if len(states) == 0 || states[len(states)-1] != api.ConnectionStateNone {
+		t.Fatalf("pairing states after unregister = %v, want terminal none", states)
+	}
+	for _, state := range states {
+		if state == api.ConnectionStateCompleted {
+			t.Fatalf("stale delayed pairing state published after unregister: %v", states)
+		}
+	}
 }
 
 var _ api.HubReaderInterface = (*attemptAwareHubReader)(nil)

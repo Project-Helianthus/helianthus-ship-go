@@ -17,6 +17,110 @@ func TestAvahi(t *testing.T) {
 	suite.Run(t, new(AvahiSuite))
 }
 
+func TestAvahiRemovalReplaysResolvedIdentityAndRetainsOtherInterfaces(t *testing.T) {
+	provider := NewAvahiProvider([]int32{avahi.InterfaceUnspec})
+	type callbackEvent struct {
+		elements  map[string]string
+		name      string
+		host      string
+		addresses []net.IP
+		port      int
+		remove    bool
+	}
+	var events []callbackEvent
+	callback := func(
+		elements map[string]string,
+		name,
+		host string,
+		addresses []net.IP,
+		port int,
+		remove bool,
+	) {
+		events = append(events, callbackEvent{
+			elements:  elements,
+			name:      name,
+			host:      host,
+			addresses: append([]net.IP(nil), addresses...),
+			port:      port,
+			remove:    remove,
+		})
+	}
+	service := avahi.Service{
+		Interface: 1,
+		Protocol:  0,
+		Name:      "VR940",
+		Type:      "_ship._tcp",
+		Domain:    "local",
+		Host:      "vr940.local",
+		Address:   "192.168.100.21",
+		Port:      4712,
+		Txt: [][]byte{
+			[]byte("txtvers=1"),
+			[]byte("id=vr940"),
+			[]byte("path=/ship/"),
+			[]byte("ski=b1b7197b064084e4cfef2365105d8d36ff185e5b"),
+			[]byte("register=true"),
+		},
+	}
+	if err := provider.processAddedService(service, callback); err != nil {
+		t.Fatalf("add first interface: %v", err)
+	}
+	second := service
+	second.Interface = 2
+	second.Address = "192.168.101.21"
+	second.Txt = append([][]byte(nil), service.Txt...)
+	second.Txt[4] = []byte("register=false")
+	second.Txt = append(second.Txt, []byte("model=surviving-interface"))
+	if err := provider.processAddedService(second, callback); err != nil {
+		t.Fatalf("add second interface: %v", err)
+	}
+
+	firstRemoval := service
+	firstRemoval.Host = ""
+	firstRemoval.Address = ""
+	firstRemoval.Port = 0
+	firstRemoval.Txt = nil
+	if err := provider.processRemovedService(firstRemoval, callback); err != nil {
+		t.Fatalf("remove first interface: %v", err)
+	}
+	if len(events) != 3 {
+		t.Fatalf("callback count after first removal = %d, want 3", len(events))
+	}
+	remaining := events[2]
+	if remaining.remove || remaining.name != service.Name || remaining.host != service.Host ||
+		remaining.port != int(service.Port) || remaining.elements["ski"] != "b1b7197b064084e4cfef2365105d8d36ff185e5b" ||
+		remaining.elements["register"] != "false" || remaining.elements["model"] != "surviving-interface" ||
+		len(remaining.addresses) != 1 || !remaining.addresses[0].Equal(net.ParseIP(second.Address)) {
+		t.Fatalf("remaining interface callback = %#v, want resolved second interface", remaining)
+	}
+
+	secondRemoval := second
+	secondRemoval.Host = ""
+	secondRemoval.Address = ""
+	secondRemoval.Port = 0
+	secondRemoval.Txt = nil
+	if err := provider.processRemovedService(secondRemoval, callback); err != nil {
+		t.Fatalf("remove second interface: %v", err)
+	}
+	if len(events) != 4 {
+		t.Fatalf("callback count after final removal = %d, want 4", len(events))
+	}
+	withdrawn := events[3]
+	if !withdrawn.remove || withdrawn.name != service.Name || withdrawn.host != service.Host ||
+		withdrawn.port != int(service.Port) || withdrawn.elements["ski"] != "b1b7197b064084e4cfef2365105d8d36ff185e5b" ||
+		withdrawn.elements["register"] != "false" || withdrawn.elements["model"] != "surviving-interface" ||
+		len(withdrawn.addresses) != 0 {
+		t.Fatalf("final withdrawal callback = %#v, want complete resolved identity", withdrawn)
+	}
+	if len(provider.serviceElements) != 0 || len(provider.serviceObservations) != 0 {
+		t.Fatalf(
+			"Avahi caches after final withdrawal = elements:%d observations:%d, want empty",
+			len(provider.serviceElements),
+			len(provider.serviceObservations),
+		)
+	}
+}
+
 type AvahiSuite struct {
 	suite.Suite
 

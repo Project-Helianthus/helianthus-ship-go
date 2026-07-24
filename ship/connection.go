@@ -33,9 +33,19 @@ type ShipConnection struct {
 	// data provider
 	infoProvider api.ShipConnectionInfoProviderInterface
 
-	outgoingAttemptMetadata api.OutgoingAttemptMetadata
-	outgoingAttemptContext  context.Context
-	hasOutgoingAttempt      bool
+	outgoingAttemptMetadata   api.OutgoingAttemptMetadata
+	outgoingAttemptContext    context.Context
+	hasOutgoingAttempt        bool
+	requirePairingApproval    bool
+	pairingApprovalRequested  bool
+	pairingApprovalReleased   bool
+	pairingCommitStarted      bool
+	pairingCommitCallbackDone bool
+	pairingClosing            bool
+	pairingTerminal           bool
+	spineSetupStarted         bool
+	pairingApprovalMux        sync.Mutex
+	testHooks                 *shipConnectionTestHooks
 
 	// Where to pass incoming SPINE messages to
 	dataReader api.ShipConnectionDataReaderInterface
@@ -72,10 +82,28 @@ type ShipConnection struct {
 	initializeDataHandlerOnRun bool
 
 	// buffer for SPINE messages that came in before the handshake was completed
-	spineBuffer [][]byte
+	spineBuffer      [][]byte
+	spineBufferBytes int
 
-	mux       sync.Mutex
-	bufferMux sync.Mutex
+	mux                   sync.Mutex
+	bufferMux             sync.Mutex
+	spineDispatchMux      sync.Mutex
+	spineDispatching      bool
+	spineDispatchQueue    []func()
+	pairingEffectMux      sync.Mutex
+	pairingEffectQueue    []pairingEffectTask
+	pairingEffectDraining bool
+}
+
+type shipConnectionTestHooks struct {
+	beforePairingTerminalLock func()
+	beforePairingCommit       func()
+	beforeHandshakeErrorState func()
+}
+
+type pairingEffectTask struct {
+	run  func()
+	done chan struct{}
 }
 
 var _ api.ShipConnectionInterface = (*ShipConnection)(nil)
@@ -83,10 +111,16 @@ var _ api.OutgoingAttemptConnectionInterface = (*ShipConnection)(nil)
 
 var ErrInvalidOutgoingAttemptConnectionConfiguration = errors.New("invalid outgoing attempt connection configuration")
 
+const (
+	maxBufferedSpineMessages = 16
+	maxBufferedSpineBytes    = 16 * 1024
+)
+
 // OutgoingAttemptConnectionConfiguration binds an outgoing connection to its launch.
 type OutgoingAttemptConnectionConfiguration struct {
-	Metadata api.OutgoingAttemptMetadata
-	Context  context.Context
+	Metadata               api.OutgoingAttemptMetadata
+	Context                context.Context
+	RequirePairingApproval bool
 }
 
 func NewConnectionHandler(
@@ -126,6 +160,7 @@ func NewOutgoingConnectionHandler(
 	connection.outgoingAttemptMetadata = configuration.Metadata
 	connection.outgoingAttemptContext = configuration.Context
 	connection.hasOutgoingAttempt = true
+	connection.requirePairingApproval = configuration.RequirePairingApproval
 	connection.initializeDataHandlerOnRun = true
 	connection.setAttemptCancellationStop(context.AfterFunc(configuration.Context, func() {
 		connection.initializeDataProcessing()
@@ -253,7 +288,18 @@ func (c *ShipConnection) ShipHandshakeState() (model.ShipMessageExchangeState, e
 
 // invoked when pairing for a pending request is approved
 func (c *ShipConnection) ApprovePendingHandshake() {
+	if required, ready := c.requestPairingApproval(); required {
+		if ready {
+			c.approveHandshake()
+		}
+		return
+	}
+
 	state := c.getState()
+	if state == model.SmeStateApproved {
+		c.approveHandshake()
+		return
+	}
 	if state != model.SmeHelloStatePendingListen {
 		// TODO: what to do if the state is different?
 
@@ -273,6 +319,10 @@ func (c *ShipConnection) ApprovePendingHandshake() {
 // invoked when pairing for a pending request is denied
 func (c *ShipConnection) AbortPendingHandshake() {
 	state := c.getState()
+	if state == model.SmeStateApproved {
+		c.CloseConnection(false, 4452, "pairing approval aborted")
+		return
+	}
 	if state != model.SmeHelloStatePendingListen && state != model.SmeHelloStateReadyListen {
 		// TODO: what to do if the state is differnet?
 
@@ -285,51 +335,193 @@ func (c *ShipConnection) AbortPendingHandshake() {
 	c.setAndHandleState(model.SmeHelloStateAbort)
 }
 
-// close this ship connection
-func (c *ShipConnection) CloseConnection(safe bool, code int, reason string) {
-	c.shutdownOnce.Do(func() {
-		c.stopOutgoingAttemptCancellation()
-		c.stopHandshakeTimer()
+func (c *ShipConnection) pairingApprovalPending() bool {
+	c.pairingApprovalMux.Lock()
+	defer c.pairingApprovalMux.Unlock()
+	return c.requirePairingApproval && !c.pairingApprovalReleased
+}
 
-		// handshake is completed if approved or aborted
-		state := c.getState()
-		handshakeEnd := state == model.SmeStateComplete ||
-			state == model.SmeHelloStateAbortDone ||
-			state == model.SmeHelloStateRemoteAbortDone ||
-			state == model.SmeHelloStateRejected
+func (c *ShipConnection) requestPairingApproval() (required bool, ready bool) {
+	c.pairingApprovalMux.Lock()
+	defer c.pairingApprovalMux.Unlock()
+	if c.pairingCommitStarted && !c.pairingCommitCallbackDone &&
+		!c.pairingClosing && !c.pairingTerminal {
+		c.pairingApprovalRequested = true
+		return true, false
+	}
+	if !c.requirePairingApproval {
+		return false, false
+	}
+	if c.pairingClosing || c.pairingTerminal || c.pairingApprovalReleased {
+		return true, false
+	}
+	c.pairingApprovalRequested = true
+	return true, c.pairingCommitStarted && c.pairingCommitCallbackDone
+}
 
-		// this may not be used for Connection Data Exchange is entered!
-		if safe && state == model.SmeStateComplete {
-			// SHIP 13.4.7: Connection Termination Announce
-			closeMessage := model.ConnectionClose{
-				ConnectionClose: model.ConnectionCloseType{
-					Phase:   model.ConnectionClosePhaseTypeAnnounce,
-					MaxTime: util.Ptr(uint(500)),
-					Reason:  util.Ptr(model.ConnectionCloseReasonType(reason)),
-				},
-			}
+func (c *ShipConnection) beginPairingCommit() bool {
+	c.pairingApprovalMux.Lock()
+	defer c.pairingApprovalMux.Unlock()
+	if c.pairingClosing || c.pairingTerminal {
+		return false
+	}
+	c.pairingCommitStarted = true
+	c.pairingCommitCallbackDone = false
+	return true
+}
 
-			_ = c.sendShipModel(model.MsgTypeEnd, closeMessage)
+func (c *ShipConnection) completePairingCommitCallback() bool {
+	c.pairingApprovalMux.Lock()
+	defer c.pairingApprovalMux.Unlock()
+	if c.pairingClosing || c.pairingTerminal {
+		return false
+	}
+	c.pairingCommitCallbackDone = true
+	return c.pairingApprovalRequested
+}
 
-			go func() {
-				// wait a bit to let it send
-				<-time.After(500 * time.Millisecond)
+func (c *ShipConnection) pairingEffectAllowed() bool {
+	c.pairingApprovalMux.Lock()
+	defer c.pairingApprovalMux.Unlock()
+	return !c.pairingClosing && !c.pairingTerminal
+}
 
-				//
-				c.dataWriter.CloseDataConnection(4001, "close")
-				c.reportConnectionClosed(handshakeEnd)
-			}()
+// runPairingEffect serializes external pairing callbacks with terminal close.
+// Blocking effects must not be started reentrantly from another pairing effect;
+// reentrant CloseConnection is intentionally queued without waiting.
+func (c *ShipConnection) runPairingEffect(run func(), wait bool) {
+	task, shouldDrain := c.enqueuePairingEffect(run)
+	if shouldDrain {
+		c.drainPairingEffects()
+	}
+	if wait {
+		<-task.done
+	}
+}
+
+func (c *ShipConnection) enqueuePairingEffect(run func()) (pairingEffectTask, bool) {
+	task := pairingEffectTask{run: run, done: make(chan struct{})}
+	c.pairingEffectMux.Lock()
+	c.pairingEffectQueue = append(c.pairingEffectQueue, task)
+	if c.pairingEffectDraining {
+		c.pairingEffectMux.Unlock()
+		return task, false
+	}
+	c.pairingEffectDraining = true
+	c.pairingEffectMux.Unlock()
+	return task, true
+}
+
+func (c *ShipConnection) drainPairingEffects() {
+	for {
+		c.pairingEffectMux.Lock()
+		if len(c.pairingEffectQueue) == 0 {
+			c.pairingEffectDraining = false
+			c.pairingEffectMux.Unlock()
 			return
 		}
+		task := c.pairingEffectQueue[0]
+		c.pairingEffectQueue[0] = pairingEffectTask{}
+		c.pairingEffectQueue = c.pairingEffectQueue[1:]
+		c.pairingEffectMux.Unlock()
 
-		closeCode := 4001
-		if code != 0 {
-			closeCode = code
+		task.run()
+		close(task.done)
+	}
+}
+
+func (c *ShipConnection) reportServiceShipID() bool {
+	reported := false
+	c.runPairingEffect(func() {
+		if !c.pairingEffectAllowed() {
+			return
 		}
-		c.dataWriter.CloseDataConnection(closeCode, reason)
+		c.infoProvider.ReportServiceShipID(c.remoteSKI, c.remoteShipID)
+		reported = true
+	}, true)
+	return reported
+}
 
-		c.reportConnectionClosed(handshakeEnd)
+func (c *ShipConnection) publishPairingApproved() bool {
+	published := false
+	c.runPairingEffect(func() {
+		if !c.pairingEffectAllowed() {
+			return
+		}
+		c.setState(model.SmeStateApproved, nil)
+		published = true
+	}, true)
+	return published
+}
+
+// close this ship connection
+func (c *ShipConnection) CloseConnection(safe bool, code int, reason string) {
+	closeClaimed := false
+	c.shutdownOnce.Do(func() {
+		closeClaimed = true
 	})
+	if !closeClaimed {
+		return
+	}
+	c.pairingApprovalMux.Lock()
+	c.pairingClosing = true
+	c.pairingApprovalMux.Unlock()
+	c.runPairingEffect(func() {
+		c.closeConnection(safe, code, reason)
+	}, false)
+}
+
+func (c *ShipConnection) closeConnection(safe bool, code int, reason string) {
+	if c.testHooks != nil && c.testHooks.beforePairingTerminalLock != nil {
+		c.testHooks.beforePairingTerminalLock()
+	}
+	c.pairingApprovalMux.Lock()
+	c.pairingClosing = true
+	c.pairingTerminal = true
+	c.pairingApprovalMux.Unlock()
+	c.discardBufferedSpineMessages()
+	c.discardPendingSpineDispatches()
+	c.stopOutgoingAttemptCancellation()
+	c.stopHandshakeTimer()
+
+	// handshake is completed if approved or aborted
+	state := c.getState()
+	handshakeEnd := state == model.SmeStateComplete ||
+		state == model.SmeHelloStateAbortDone ||
+		state == model.SmeHelloStateRemoteAbortDone ||
+		state == model.SmeHelloStateRejected
+
+	// this may not be used for Connection Data Exchange is entered!
+	if safe && state == model.SmeStateComplete {
+		// SHIP 13.4.7: Connection Termination Announce
+		closeMessage := model.ConnectionClose{
+			ConnectionClose: model.ConnectionCloseType{
+				Phase:   model.ConnectionClosePhaseTypeAnnounce,
+				MaxTime: util.Ptr(uint(500)),
+				Reason:  util.Ptr(model.ConnectionCloseReasonType(reason)),
+			},
+		}
+
+		_ = c.sendShipModel(model.MsgTypeEnd, closeMessage)
+
+		go func() {
+			// wait a bit to let it send
+			<-time.After(500 * time.Millisecond)
+
+			//
+			c.dataWriter.CloseDataConnection(4001, "close")
+			c.reportConnectionClosed(handshakeEnd)
+		}()
+		return
+	}
+
+	closeCode := 4001
+	if code != 0 {
+		closeCode = code
+	}
+	c.dataWriter.CloseDataConnection(closeCode, reason)
+
+	c.reportConnectionClosed(handshakeEnd)
 }
 
 var _ api.ShipConnectionDataWriterInterface = (*ShipConnection)(nil)
@@ -363,18 +555,17 @@ func (c *ShipConnection) shipModelFromMessage(message []byte) (*model.ShipData, 
 	return &data, nil
 }
 
-// process any SPINE messages that came in before the handshake completed
-// this will be called once the handshake is completed and
-// spineDataProcessing is set
-func (c *ShipConnection) processBufferedSpineMessages() {
+func (c *ShipConnection) discardBufferedSpineMessages() {
 	c.bufferMux.Lock()
-	defer c.bufferMux.Unlock()
-
-	for _, item := range c.spineBuffer {
-		c.dataReader.HandleShipPayloadMessage(item)
-	}
-
 	c.spineBuffer = nil
+	c.spineBufferBytes = 0
+	c.bufferMux.Unlock()
+}
+
+func (c *ShipConnection) discardPendingSpineDispatches() {
+	c.spineDispatchMux.Lock()
+	c.spineDispatchQueue = nil
+	c.spineDispatchMux.Unlock()
 }
 
 // route the incoming message to either SHIP or SPINE message handlers
@@ -390,18 +581,89 @@ func (c *ShipConnection) HandleIncomingWebsocketMessage(message []byte) {
 		return
 	}
 
-	if c.dataReader == nil {
-		// buffer message for processing once the handshake is completed
-		c.bufferMux.Lock()
-		defer c.bufferMux.Unlock()
-
-		c.spineBuffer = append(c.spineBuffer, []byte(data.Data.Payload))
-
+	payload := []byte(data.Data.Payload)
+	c.spineDispatchMux.Lock()
+	reader, closeCode, closeReason := c.routeOrBufferSpinePayload(payload)
+	if closeCode != 0 {
+		c.spineDispatchMux.Unlock()
+		c.CloseConnection(false, closeCode, closeReason)
 		return
 	}
+	if reader == nil {
+		c.spineDispatchMux.Unlock()
+		return
+	}
+	payload = append([]byte(nil), payload...)
+	shouldDrain := c.enqueueSpineDispatchLocked(func() {
+		if !c.spineDispatchTerminated() {
+			reader.HandleShipPayloadMessage(payload)
+		}
+	})
+	c.spineDispatchMux.Unlock()
+	if shouldDrain {
+		c.drainSpineDispatchQueue()
+	}
+}
 
-	// pass the payload to the SPINE read handler
-	c.dataReader.HandleShipPayloadMessage([]byte(data.Data.Payload))
+// enqueueSpineDispatchLocked appends work in admission order. The first caller
+// owns synchronous draining; reentrant and concurrent arrivals only enqueue.
+func (c *ShipConnection) enqueueSpineDispatchLocked(tasks ...func()) bool {
+	c.spineDispatchQueue = append(c.spineDispatchQueue, tasks...)
+	if c.spineDispatching {
+		return false
+	}
+	c.spineDispatching = true
+	return true
+}
+
+func (c *ShipConnection) drainSpineDispatchQueue() {
+	for {
+		c.spineDispatchMux.Lock()
+		if len(c.spineDispatchQueue) == 0 {
+			c.spineDispatching = false
+			c.spineDispatchMux.Unlock()
+			return
+		}
+		task := c.spineDispatchQueue[0]
+		c.spineDispatchQueue[0] = nil
+		c.spineDispatchQueue = c.spineDispatchQueue[1:]
+		c.spineDispatchMux.Unlock()
+		task()
+	}
+}
+
+func (c *ShipConnection) routeOrBufferSpinePayload(
+	payload []byte,
+) (api.ShipConnectionDataReaderInterface, int, string) {
+	c.pairingApprovalMux.Lock()
+	defer c.pairingApprovalMux.Unlock()
+	c.bufferMux.Lock()
+	defer c.bufferMux.Unlock()
+
+	if c.pairingClosing || c.pairingTerminal {
+		return nil, 0, ""
+	}
+	if c.dataReader != nil {
+		return c.dataReader, 0, ""
+	}
+	if c.requirePairingApproval && !c.pairingApprovalReleased {
+		c.pairingTerminal = true
+		return nil, 4452, "SPINE data before pairing approval"
+	}
+	if len(c.spineBuffer) >= maxBufferedSpineMessages ||
+		len(payload) > maxBufferedSpineBytes-c.spineBufferBytes {
+		c.pairingTerminal = true
+		return nil, 4452, "SPINE setup buffer limit exceeded"
+	}
+	c.spineBuffer = append(c.spineBuffer, append([]byte(nil), payload...))
+	c.spineBufferBytes += len(payload)
+	return nil, 0, ""
+}
+
+func (c *ShipConnection) spineDispatchTerminated() bool {
+	c.pairingApprovalMux.Lock()
+	defer c.pairingApprovalMux.Unlock()
+	return c.pairingClosing || c.pairingTerminal
 }
 
 // checks wether the provided messages is a SHIP message
@@ -411,6 +673,9 @@ func (c *ShipConnection) hasSpineDatagram(message []byte) bool {
 
 // the websocket data connection was closed from remote
 func (c *ShipConnection) ReportConnectionError(err error) {
+	if !c.pairingEffectAllowed() {
+		return
+	}
 	// if the handshake is aborted, a closed connection is no error
 	currentState := c.getState()
 

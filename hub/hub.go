@@ -3,6 +3,8 @@ package hub
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
+	"net"
 	"net/http"
 	"sync"
 
@@ -28,6 +30,34 @@ type outboundAttemptRegistration struct {
 	context    context.Context
 	cancel     context.CancelFunc
 	connection api.ShipConnectionInterface
+}
+
+type pairingCandidateObservation struct {
+	ski       string
+	revision  uint64
+	path      string
+	port      int
+	addresses []net.IP
+}
+
+type activePairingCandidate struct {
+	service   *api.ServiceDetails
+	authority *outboundAttemptAuthority
+}
+
+type pairingCandidateRetirement struct {
+	ski       string
+	service   *api.ServiceDetails
+	authority *outboundAttemptAuthority
+}
+
+type hubTestHooks struct {
+	launchPairingCandidate           func(func())
+	beforePairingCandidateAdmission  func()
+	beforePairingCandidateGate       func()
+	beforePairingCandidateRetire     func()
+	beforeOutboundAttemptRelease     func()
+	afterRegisterRemoteServiceLookup func()
 }
 
 // defines the delay timeframes in seconds depening on the connection attempt counter
@@ -56,15 +86,24 @@ type Hub struct {
 
 	hubReader api.HubReaderInterface
 
-	dialer              outgoingAttemptDialer
-	outgoingAttemptGate api.OutgoingAttemptGate
-	outgoingGateEpoch   uint64
-	outboundEpoch       uint64
-	outboundAuthorities map[string]*outboundAttemptAuthority
-	outboundAttempts    map[string]map[*outboundAttemptRegistration]struct{}
-	outboundShutdown    bool
+	dialer               outgoingAttemptDialer
+	outgoingAttemptGate  api.OutgoingAttemptGate
+	outgoingGateEpoch    uint64
+	outboundEpoch        uint64
+	internalAttemptEpoch uint64
+	outboundAuthorities  map[string]*outboundAttemptAuthority
+	outboundAttempts     map[string]map[*outboundAttemptRegistration]struct{}
+	outboundShutdown     bool
 
 	autoaccept bool
+
+	// Outbound candidate capabilities are volatile, generation-bound mDNS
+	// observations and never persist an endpoint.
+	visiblePairingCandidates         map[string]pairingCandidateObservation
+	consumedPairingCandidates        map[string]struct{}
+	activePairingCandidates          map[string]*activePairingCandidate
+	latestPairingObservationRevision uint64
+	testHooks                        *hubTestHooks
 
 	// The list of known remote services
 	remoteServices map[string]*api.ServiceDetails
@@ -85,6 +124,15 @@ type Hub struct {
 	muxReg         sync.Mutex
 	muxStarted     sync.Mutex
 	muxAttemptGate sync.RWMutex
+
+	pairingNotificationMux      sync.Mutex
+	pairingNotificationQueue    []func()
+	pairingNotificationDraining bool
+
+	mdnsSnapshotMux      sync.Mutex
+	mdnsSnapshotQueue    []func()
+	mdnsSnapshotDraining bool
+	mdnsSnapshotRevision uint64
 }
 
 func NewHub(hubReader api.HubReaderInterface,
@@ -93,19 +141,22 @@ func NewHub(hubReader api.HubReaderInterface,
 	certificate tls.Certificate,
 	localService *api.ServiceDetails) *Hub {
 	hub := &Hub{
-		connections:              make(map[string]api.ShipConnectionInterface),
-		connectionAttemptCounter: make(map[string]int),
-		connectionAttemptRunning: make(map[string]bool),
-		connectionsInitiating:    make(map[string]bool),
-		remoteServices:           make(map[string]*api.ServiceDetails),
-		hubReader:                hubReader,
-		port:                     port,
-		certifciate:              certificate,
-		localService:             localService,
-		mdns:                     mdns,
-		dialer:                   newOutgoingAttemptDialer(certificate),
-		outboundAuthorities:      make(map[string]*outboundAttemptAuthority),
-		outboundAttempts:         make(map[string]map[*outboundAttemptRegistration]struct{}),
+		connections:               make(map[string]api.ShipConnectionInterface),
+		connectionAttemptCounter:  make(map[string]int),
+		connectionAttemptRunning:  make(map[string]bool),
+		connectionsInitiating:     make(map[string]bool),
+		remoteServices:            make(map[string]*api.ServiceDetails),
+		visiblePairingCandidates:  make(map[string]pairingCandidateObservation),
+		consumedPairingCandidates: make(map[string]struct{}),
+		activePairingCandidates:   make(map[string]*activePairingCandidate),
+		hubReader:                 hubReader,
+		port:                      port,
+		certifciate:               certificate,
+		localService:              localService,
+		mdns:                      mdns,
+		dialer:                    newOutgoingAttemptDialer(certificate),
+		outboundAuthorities:       make(map[string]*outboundAttemptAuthority),
+		outboundAttempts:          make(map[string]map[*outboundAttemptRegistration]struct{}),
 	}
 
 	return hub
@@ -114,6 +165,7 @@ func NewHub(hubReader api.HubReaderInterface,
 var _ api.HubInterface = (*Hub)(nil)
 var _ api.OutgoingAttemptGateSetter = (*Hub)(nil)
 var _ api.PairingRegistrationSetter = (*Hub)(nil)
+var _ api.PairingCandidateQueuer = (*Hub)(nil)
 
 // SetOutgoingAttemptGate installs or removes the optional outgoing dial gate.
 func (h *Hub) SetOutgoingAttemptGate(gate api.OutgoingAttemptGate) error {
@@ -127,29 +179,36 @@ func (h *Hub) SetOutgoingAttemptGate(gate api.OutgoingAttemptGate) error {
 		}
 	}
 
+	h.muxReg.Lock()
 	h.muxAttemptGate.Lock()
 	h.outgoingAttemptGate = gate
 	h.outgoingGateEpoch++
+	retirements := make([]pairingCandidateRetirement, 0, len(h.activePairingCandidates))
+	for ski := range h.activePairingCandidates {
+		if retired := h.retireActivePairingCandidateLocked(ski, nil, nil); retired != nil {
+			retirements = append(retirements, *retired)
+		}
+	}
 	cancellations := h.removeAllOutboundAttemptRegistrationsLocked()
 	h.muxAttemptGate.Unlock()
+	h.removeOutboundAttemptConnections(cancellations)
+	h.muxReg.Unlock()
 	cancelOutboundAttemptRegistrations(cancellations)
+	h.finishPairingCandidateRetirements(retirements)
 	return nil
 }
 
-func (h *Hub) configuredOutgoingAttemptGate() api.OutgoingAttemptGate {
-	h.muxAttemptGate.RLock()
-	defer h.muxAttemptGate.RUnlock()
-
-	return h.outgoingAttemptGate
-}
-
 func (h *Hub) revokeOutboundAttempts(ski string, service *api.ServiceDetails) {
+	h.muxReg.Lock()
 	h.muxAttemptGate.Lock()
 	h.rotateOutboundAuthorityLocked(ski)
 	cancellations := h.removeOutboundAttemptRegistrationsLocked(ski)
+	delete(h.activePairingCandidates, ski)
 	service.SetTrusted(false)
 	service.ConnectionStateDetail().SetState(api.ConnectionStateNone)
 	h.muxAttemptGate.Unlock()
+	h.removeOutboundAttemptConnections(cancellations)
+	h.muxReg.Unlock()
 
 	// Cancellation may close a SHIP connection and re-enter the Hub.
 	cancelOutboundAttemptRegistrations(cancellations)
@@ -157,6 +216,7 @@ func (h *Hub) revokeOutboundAttempts(ski string, service *api.ServiceDetails) {
 
 func (h *Hub) outgoingAttemptGateSnapshot(
 	remoteService *api.ServiceDetails,
+	requiredAuthority *outboundAttemptAuthority,
 ) (api.OutgoingAttemptGate, uint64, *outboundAttemptAuthority, bool) {
 	h.muxAttemptGate.Lock()
 	defer h.muxAttemptGate.Unlock()
@@ -166,10 +226,37 @@ func (h *Hub) outgoingAttemptGateSnapshot(
 
 	gate := h.outgoingAttemptGate
 	generation := h.outgoingGateEpoch
-	if gate == nil || isNilOutgoingAttemptValue(gate) {
-		return gate, generation, nil, true
+	authority := h.currentOutboundAuthorityLocked(remoteService.SKI())
+	if requiredAuthority != nil && authority != requiredAuthority {
+		return gate, generation, nil, false
 	}
-	return gate, generation, h.currentOutboundAuthorityLocked(remoteService.SKI()), true
+	if gate == nil || isNilOutgoingAttemptValue(gate) {
+		return gate, generation, authority, true
+	}
+	return gate, generation, authority, true
+}
+
+func (h *Hub) outboundReconnectAuthority(
+	remoteService *api.ServiceDetails,
+) (*outboundAttemptAuthority, bool) {
+	if remoteService == nil {
+		return nil, false
+	}
+	ski := util.NormalizeSKI(remoteService.SKI())
+	h.muxReg.Lock()
+	defer h.muxReg.Unlock()
+	service := h.remoteServices[ski]
+	if service == nil || service != remoteService ||
+		(!service.Trusted() && service.ConnectionStateDetail().State() != api.ConnectionStateQueued) {
+		return nil, false
+	}
+
+	h.muxAttemptGate.Lock()
+	defer h.muxAttemptGate.Unlock()
+	if h.outboundShutdown {
+		return nil, false
+	}
+	return h.currentOutboundAuthorityLocked(ski), true
 }
 
 // registerOutboundAttemptForLaunch performs the final authority check and
@@ -193,6 +280,7 @@ func (h *Hub) registerOutboundAttemptForLaunch(
 		return nil, false
 	}
 
+	// #nosec G118 -- cancellation ownership is transferred to the registration.
 	attemptContext, cancel := context.WithCancel(permitContext)
 	registration := &outboundAttemptRegistration{
 		authority: authority,
@@ -207,6 +295,64 @@ func (h *Hub) registerOutboundAttemptForLaunch(
 	}
 	registrations[registration] = struct{}{}
 	return registration, true
+}
+
+func (h *Hub) registerInternalOutboundAttemptForLaunch(
+	ski string,
+	authority *outboundAttemptAuthority,
+) (*outboundAttemptRegistration, api.OutgoingAttemptMetadata, bool) {
+	h.muxAttemptGate.Lock()
+	defer h.muxAttemptGate.Unlock()
+	if h.outboundShutdown ||
+		(h.outgoingAttemptGate != nil && !isNilOutgoingAttemptValue(h.outgoingAttemptGate)) ||
+		authority == nil ||
+		h.outboundAuthorities[ski] != authority {
+		return nil, api.OutgoingAttemptMetadata{}, false
+	}
+	h.internalAttemptEpoch++
+	if h.internalAttemptEpoch == 0 {
+		h.internalAttemptEpoch++
+	}
+	metadata := api.OutgoingAttemptMetadata{
+		AttemptID:    fmt.Sprintf("ship-internal-%d", h.internalAttemptEpoch),
+		Scope:        internalOutgoingAttemptScope,
+		ControlEpoch: authority.epoch,
+	}
+	// #nosec G118 -- cancellation ownership is transferred to the registration.
+	attemptContext, cancel := context.WithCancel(context.Background())
+	registration := &outboundAttemptRegistration{
+		authority: authority,
+		metadata:  metadata,
+		context:   attemptContext,
+		cancel:    cancel,
+	}
+	registrations := h.outboundAttempts[ski]
+	if registrations == nil {
+		registrations = make(map[*outboundAttemptRegistration]struct{})
+		h.outboundAttempts[ski] = registrations
+	}
+	registrations[registration] = struct{}{}
+	return registration, metadata, true
+}
+
+// internalOutboundAttemptActiveLocked requires muxReg and muxAttemptGate.
+func (h *Hub) internalOutboundAttemptActiveLocked(
+	ski string,
+	metadata api.OutgoingAttemptMetadata,
+) bool {
+	service := h.remoteServices[ski]
+	authority := h.outboundAuthorities[ski]
+	if service == nil || !service.Trusted() || authority == nil ||
+		metadata.Scope != internalOutgoingAttemptScope ||
+		metadata.ControlEpoch != authority.epoch {
+		return false
+	}
+	for registration := range h.outboundAttempts[ski] {
+		if registration.metadata == metadata && registration.context.Err() == nil {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Hub) currentOutboundAuthorityLocked(ski string) *outboundAttemptAuthority {
@@ -281,32 +427,41 @@ func (h *Hub) bindOutboundAttemptConnection(
 	return true
 }
 
-func (h *Hub) releaseOutboundAttemptForConnection(
+// releaseOutboundAttemptForConnectionLocked requires muxAttemptGate.
+func (h *Hub) releaseOutboundAttemptForConnectionLocked(
 	ski string,
 	connection api.ShipConnectionInterface,
 	metadata api.OutgoingAttemptMetadata,
-) {
+) ([]*outboundAttemptRegistration, *outboundAttemptAuthority) {
 	// Exact connection ownership prevents a stale close from releasing a newer
 	// registration if an external gate ever reuses metadata.
-	h.muxAttemptGate.Lock()
 	registrations := h.outboundAttempts[ski]
 	var removed []*outboundAttemptRegistration
+	var releasedAuthority *outboundAttemptAuthority
 	for registration := range registrations {
 		if registration.connection == connection && registration.metadata == metadata {
 			delete(registrations, registration)
 			removed = append(removed, registration)
+			releasedAuthority = registration.authority
 		}
 	}
 	if len(registrations) == 0 {
 		delete(h.outboundAttempts, ski)
 	}
-	h.muxAttemptGate.Unlock()
-	cancelOutboundAttemptRegistrations(removed)
+	return removed, releasedAuthority
 }
 
 func cancelOutboundAttemptRegistrations(registrations []*outboundAttemptRegistration) {
 	for _, registration := range registrations {
 		registration.cancel()
+	}
+}
+
+func (h *Hub) removeOutboundAttemptConnections(registrations []*outboundAttemptRegistration) {
+	for _, registration := range registrations {
+		if registration.connection != nil {
+			h.removeExactConnection(registration.connection)
+		}
 	}
 }
 
