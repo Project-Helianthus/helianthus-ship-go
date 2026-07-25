@@ -1023,10 +1023,14 @@ func (h *Hub) registerReservedInboundPairingConnection(
 	connection api.ShipConnectionInterface,
 	reservation *inboundPairingReservation,
 ) (api.ShipConnectionInterface, bool) {
+	if reservation == nil {
+		return nil, false
+	}
 	remoteSKI := connection.RemoteSKI()
+	h.blockOutboundAttemptCallbacks(reservation.replaced)
 	h.muxCon.Lock()
 	defer h.muxCon.Unlock()
-	if h.hasShutdown || reservation == nil || h.inboundPairingReservations[remoteSKI] != reservation {
+	if h.hasShutdown || h.inboundPairingReservations[remoteSKI] != reservation {
 		return nil, false
 	}
 	existing := h.connections[remoteSKI]
@@ -1042,6 +1046,24 @@ func (h *Hub) registerReservedInboundPairingConnection(
 	}
 	delete(h.inboundPairingReservations, remoteSKI)
 	return existing, true
+}
+
+func (h *Hub) blockOutboundAttemptCallbacks(connection api.ShipConnectionInterface) {
+	if connection == nil {
+		return
+	}
+	remoteSKI := connection.RemoteSKI()
+	h.muxAttemptGate.RLock()
+	registrations := make([]*outboundAttemptRegistration, 0, len(h.outboundAttempts[remoteSKI]))
+	for registration := range h.outboundAttempts[remoteSKI] {
+		if registration.connection == connection {
+			registrations = append(registrations, registration)
+		}
+	}
+	h.muxAttemptGate.RUnlock()
+	for _, registration := range registrations {
+		registration.blockCallbacksAndWait()
+	}
 }
 
 func (h *Hub) releaseInboundPairingReservation(ski string, reservation *inboundPairingReservation) {

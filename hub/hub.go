@@ -30,6 +30,52 @@ type outboundAttemptRegistration struct {
 	context    context.Context
 	cancel     context.CancelFunc
 	connection api.ShipConnectionInterface
+
+	callbackMux     sync.Mutex
+	callbackBlocked bool
+	callbackActive  int
+	callbackDrained chan struct{}
+}
+
+func (registration *outboundAttemptRegistration) beginCallback() bool {
+	if registration == nil {
+		return false
+	}
+	registration.callbackMux.Lock()
+	defer registration.callbackMux.Unlock()
+	if registration.callbackBlocked {
+		return false
+	}
+	registration.callbackActive++
+	return true
+}
+
+func (registration *outboundAttemptRegistration) endCallback() {
+	registration.callbackMux.Lock()
+	registration.callbackActive--
+	if registration.callbackActive == 0 && registration.callbackDrained != nil {
+		close(registration.callbackDrained)
+		registration.callbackDrained = nil
+	}
+	registration.callbackMux.Unlock()
+}
+
+func (registration *outboundAttemptRegistration) blockCallbacksAndWait() {
+	if registration == nil {
+		return
+	}
+	registration.callbackMux.Lock()
+	registration.callbackBlocked = true
+	if registration.callbackActive == 0 {
+		registration.callbackMux.Unlock()
+		return
+	}
+	if registration.callbackDrained == nil {
+		registration.callbackDrained = make(chan struct{})
+	}
+	drained := registration.callbackDrained
+	registration.callbackMux.Unlock()
+	<-drained
 }
 
 type pairingCandidateObservation struct {

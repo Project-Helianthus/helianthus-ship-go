@@ -26,6 +26,10 @@ func (provider *outgoingAttemptInfoProvider) HandleConnectionClosed(
 }
 
 func (provider *outgoingAttemptInfoProvider) ReportServiceShipID(ski, shipID string) {
+	if !provider.registration.beginCallback() {
+		return
+	}
+	defer provider.registration.endCallback()
 	if !provider.hub.outboundAttemptRegistrationOwnsCallbacks(provider.registration) {
 		return
 	}
@@ -33,6 +37,10 @@ func (provider *outgoingAttemptInfoProvider) ReportServiceShipID(ski, shipID str
 }
 
 func (provider *outgoingAttemptInfoProvider) AllowWaitingForTrust(ski string) bool {
+	if !provider.registration.beginCallback() {
+		return false
+	}
+	defer provider.registration.endCallback()
 	if !provider.hub.outboundAttemptRegistrationOwnsCallbacks(provider.registration) {
 		return false
 	}
@@ -50,6 +58,10 @@ func (provider *outgoingAttemptInfoProvider) SetupRemoteDevice(
 	ski string,
 	writer api.ShipConnectionDataWriterInterface,
 ) api.ShipConnectionDataReaderInterface {
+	if !provider.registration.beginCallback() {
+		return nil
+	}
+	defer provider.registration.endCallback()
 	if !provider.hub.outboundAttemptRegistrationOwnsCallbacks(provider.registration) {
 		return nil
 	}
@@ -69,6 +81,10 @@ func (provider *outgoingAttemptInfoProvider) HandleShipHandshakeStateUpdateWithA
 	state model.ShipState,
 	metadata api.OutgoingAttemptMetadata,
 ) {
+	if !provider.registration.beginCallback() {
+		return
+	}
+	defer provider.registration.endCallback()
 	if !provider.hub.outboundAttemptRegistrationOwnsCallbacks(provider.registration) {
 		return
 	}

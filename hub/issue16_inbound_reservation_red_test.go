@@ -30,6 +30,9 @@ type issue16PairingReader struct {
 	connected    int
 	disconnected int
 	setups       int
+
+	connectedEntered chan struct{}
+	connectedRelease chan struct{}
 }
 
 type issue16AttemptReader struct {
@@ -82,6 +85,14 @@ func (reader *issue16PairingReader) ServicePairingDetailUpdate(
 
 func (reader *issue16PairingReader) RemoteSKIConnected(string) {
 	reader.mu.Lock()
+	entered := reader.connectedEntered
+	release := reader.connectedRelease
+	reader.mu.Unlock()
+	if entered != nil {
+		close(entered)
+		<-release
+	}
+	reader.mu.Lock()
 	reader.connected++
 	reader.mu.Unlock()
 }
@@ -124,6 +135,13 @@ func (reader *issue16PairingReader) setupCount() int {
 	reader.mu.Lock()
 	defer reader.mu.Unlock()
 	return reader.setups
+}
+
+func (reader *issue16PairingReader) setConnectedBarrier(entered, release chan struct{}) {
+	reader.mu.Lock()
+	reader.connectedEntered = entered
+	reader.connectedRelease = release
+	reader.mu.Unlock()
 }
 
 func TestIssue16LosingInboundConnectionCannotPublishPairingRequest(t *testing.T) {
@@ -456,6 +474,92 @@ func TestIssue16ReusedMetadataOnLaterExactConnectionIsNotTombstoned(t *testing.T
 	}
 	if connected, _, shipIDs := reader.evidenceCounts(); connected != 1 || shipIDs != 1 || reader.setupCount() != 1 {
 		t.Fatalf("later exact connection evidence = connected:%d ship_ids:%d setups:%d, want 1/1/1", connected, shipIDs, reader.setupCount())
+	}
+}
+
+func TestIssue16InboundReplacementWaitsForAdmittedOutboundEvidenceCallback(t *testing.T) {
+	reader := &issue16AttemptReader{}
+	hub := NewHub(
+		reader,
+		&attemptTestMdns{},
+		0,
+		tls.Certificate{},
+		api.NewServiceDetails(strings.Repeat("0", 40)),
+	)
+	remoteSKI := strings.Repeat("a", 40)
+	metadata := api.OutgoingAttemptMetadata{
+		AttemptID:    "callback-lease",
+		Scope:        "candidate-scope",
+		ControlEpoch: 16,
+	}
+	authority := &outboundAttemptAuthority{epoch: 16}
+	attemptContext, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	outbound := &attemptCallbackConnection{ski: remoteSKI}
+	registration := &outboundAttemptRegistration{
+		authority:  authority,
+		metadata:   metadata,
+		context:    attemptContext,
+		cancel:     cancel,
+		connection: outbound,
+	}
+	hub.outboundAttempts[remoteSKI] = map[*outboundAttemptRegistration]struct{}{registration: {}}
+	hub.registerConnection(outbound)
+	provider := &outgoingAttemptInfoProvider{hub: hub, registration: registration}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	reader.setConnectedBarrier(entered, release)
+	evidenceDone := make(chan struct{})
+	go func() {
+		provider.ReportServiceShipID(remoteSKI, "outbound-ship-id")
+		close(evidenceDone)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("outbound evidence callback did not enter")
+	}
+
+	reservation := hub.reserveInboundPairingConnection(remoteSKI)
+	if reservation == nil {
+		t.Fatal("inbound replacement reservation was denied")
+	}
+	inbound := &attemptCallbackConnection{ski: remoteSKI}
+	replacementDone := make(chan struct{})
+	var replaced api.ShipConnectionInterface
+	var registered bool
+	go func() {
+		replaced, registered = hub.registerReservedInboundPairingConnection(inbound, reservation)
+		close(replacementDone)
+	}()
+	select {
+	case <-replacementDone:
+		t.Fatal("inbound replacement overtook an admitted outbound evidence callback")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case <-evidenceDone:
+	case <-time.After(time.Second):
+		t.Fatal("outbound evidence callback did not finish")
+	}
+	select {
+	case <-replacementDone:
+	case <-time.After(time.Second):
+		t.Fatal("inbound replacement did not resume after callback completion")
+	}
+	if !registered || replaced != outbound {
+		t.Fatalf("inbound replacement = %#v, %t; want exact outbound and true", replaced, registered)
+	}
+	if connected, _, shipIDs := reader.evidenceCounts(); connected != 1 || shipIDs != 1 {
+		t.Fatalf("ordered outbound evidence = connected:%d ship_ids:%d, want 1/1", connected, shipIDs)
+	}
+
+	provider.ReportServiceShipID(remoteSKI, "late-outbound-ship-id")
+	if connected, _, shipIDs := reader.evidenceCounts(); connected != 1 || shipIDs != 1 {
+		t.Fatalf("post-replacement loser evidence = connected:%d ship_ids:%d, want unchanged 1/1", connected, shipIDs)
 	}
 }
 
