@@ -97,6 +97,9 @@ func (h *Hub) claimClosedOutboundAttempt(
 	if !superseded && releasedAuthority != nil {
 		retirement = h.retireActivePairingCandidateLocked(remoteSKI, nil, releasedAuthority)
 	}
+	if superseded {
+		h.supersededAttemptCallbacks[metadata] = struct{}{}
+	}
 	h.muxAttemptGate.Unlock()
 	h.muxReg.Unlock()
 
@@ -107,11 +110,8 @@ func (h *Hub) claimClosedOutboundAttempt(
 func (h *Hub) claimSupersededConnection(connection api.ShipConnectionInterface) bool {
 	h.muxCon.Lock()
 	defer h.muxCon.Unlock()
-	if _, superseded := h.supersededConnections[connection]; !superseded {
-		return false
-	}
-	delete(h.supersededConnections, connection)
-	return true
+	_, superseded := h.supersededConnections[connection]
+	return superseded
 }
 
 func (h *Hub) removeExactConnection(connection api.ShipConnectionInterface) bool {
@@ -183,6 +183,9 @@ func (h *Hub) HandleShipHandshakeStateUpdateWithAttempt(
 	state model.ShipState,
 	metadata api.OutgoingAttemptMetadata,
 ) {
+	if h.outgoingAttemptCallbackSuperseded(ski, metadata) {
+		return
+	}
 	if metadata.Scope == internalOutgoingAttemptScope {
 		h.handleInternalShipHandshakeStateUpdate(ski, state, metadata)
 		return
@@ -192,6 +195,32 @@ func (h *Hub) HandleShipHandshakeStateUpdateWithAttempt(
 		return
 	}
 	h.HandleShipHandshakeStateUpdate(ski, state)
+}
+
+func (h *Hub) outgoingAttemptCallbackSuperseded(
+	ski string,
+	metadata api.OutgoingAttemptMetadata,
+) bool {
+	h.muxAttemptGate.RLock()
+	if _, superseded := h.supersededAttemptCallbacks[metadata]; superseded {
+		h.muxAttemptGate.RUnlock()
+		return true
+	}
+	var connection api.ShipConnectionInterface
+	for registration := range h.outboundAttempts[ski] {
+		if registration.metadata == metadata {
+			connection = registration.connection
+			break
+		}
+	}
+	h.muxAttemptGate.RUnlock()
+	if connection == nil {
+		return false
+	}
+	h.muxCon.Lock()
+	_, superseded := h.supersededConnections[connection]
+	h.muxCon.Unlock()
+	return superseded
 }
 
 func (h *Hub) handleInternalShipHandshakeStateUpdate(

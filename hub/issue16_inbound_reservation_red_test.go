@@ -33,8 +33,9 @@ type issue16PairingReader struct {
 
 type issue16AttemptReader struct {
 	issue16PairingReader
-	muAttempt sync.Mutex
-	terminals []api.OutgoingAttemptMetadata
+	muAttempt  sync.Mutex
+	terminals  []api.OutgoingAttemptMetadata
+	handshakes []api.OutgoingAttemptMetadata
 }
 
 func (reader *issue16AttemptReader) OutgoingAttemptConnectionClosed(
@@ -47,17 +48,26 @@ func (reader *issue16AttemptReader) OutgoingAttemptConnectionClosed(
 	reader.muAttempt.Unlock()
 }
 
-func (*issue16AttemptReader) OutgoingAttemptHandshakeStateUpdate(
-	string,
-	model.ShipState,
-	api.OutgoingAttemptMetadata,
+func (reader *issue16AttemptReader) OutgoingAttemptHandshakeStateUpdate(
+	_ string,
+	_ model.ShipState,
+	metadata api.OutgoingAttemptMetadata,
 ) {
+	reader.muAttempt.Lock()
+	reader.handshakes = append(reader.handshakes, metadata)
+	reader.muAttempt.Unlock()
 }
 
 func (reader *issue16AttemptReader) terminalCount() int {
 	reader.muAttempt.Lock()
 	defer reader.muAttempt.Unlock()
 	return len(reader.terminals)
+}
+
+func (reader *issue16AttemptReader) handshakeCount() int {
+	reader.muAttempt.Lock()
+	defer reader.muAttempt.Unlock()
+	return len(reader.handshakes)
 }
 
 func (reader *issue16PairingReader) ServicePairingDetailUpdate(
@@ -298,6 +308,21 @@ func TestIssue16ReplacedAttemptTaggedConnectionOnlyReleasesPrivateReservation(t 
 			hub.outboundAttempts[remoteSKI] = map[*outboundAttemptRegistration]struct{}{
 				registration: {},
 			}
+			service := hub.ServiceForSKI(remoteSKI)
+			service.SetTrusted(true)
+			hub.outboundAuthorities[remoteSKI] = authority
+
+			hub.HandleShipHandshakeStateUpdateWithAttempt(
+				remoteSKI,
+				model.ShipState{State: model.SmeStateComplete},
+				metadata,
+			)
+			if reader.handshakeCount() != 0 {
+				t.Fatalf("superseded attempt published %d pre-terminal handshake callbacks, want zero", reader.handshakeCount())
+			}
+			if state := service.ConnectionStateDetail().State(); state == api.ConnectionStateCompleted {
+				t.Fatal("superseded internal attempt changed pairing state before terminal")
+			}
 
 			hub.HandleConnectionClosedWithAttempt(loser, false, metadata)
 
@@ -317,6 +342,18 @@ func TestIssue16ReplacedAttemptTaggedConnectionOnlyReleasesPrivateReservation(t 
 			}
 			if _, disconnected, _ := reader.evidenceCounts(); disconnected != 0 {
 				t.Fatalf("losing attempt published %d disconnect callbacks, want zero", disconnected)
+			}
+
+			hub.HandleShipHandshakeStateUpdateWithAttempt(
+				remoteSKI,
+				model.ShipState{State: model.SmeStateComplete},
+				metadata,
+			)
+			if reader.handshakeCount() != 0 {
+				t.Fatalf("superseded attempt published %d post-terminal handshake callbacks, want zero", reader.handshakeCount())
+			}
+			if state := service.ConnectionStateDetail().State(); state == api.ConnectionStateCompleted {
+				t.Fatal("superseded internal attempt changed pairing state after terminal")
 			}
 		})
 	}

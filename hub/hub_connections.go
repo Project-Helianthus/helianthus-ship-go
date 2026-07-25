@@ -1033,6 +1033,9 @@ func (h *Hub) registerReservedInboundPairingConnection(
 	if existing != reservation.replaced {
 		return nil, false
 	}
+	if existing != nil && len(h.supersededConnections) >= maximumSupersededConnections {
+		return nil, false
+	}
 	h.connections[remoteSKI] = connection
 	if existing != nil {
 		h.supersededConnections[existing] = struct{}{}

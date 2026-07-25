@@ -55,6 +55,8 @@ type inboundPairingReservation struct {
 	replaced api.ShipConnectionInterface
 }
 
+const maximumSupersededConnections = 128
+
 type hubTestHooks struct {
 	launchPairingCandidate           func(func())
 	beforePairingCandidateAdmission  func()
@@ -85,6 +87,7 @@ type Hub struct {
 	// Exact inbound first-trust winners reserved before a pairing callback.
 	inboundPairingReservations map[string]*inboundPairingReservation
 	supersededConnections      map[api.ShipConnectionInterface]struct{}
+	supersededAttemptCallbacks map[api.OutgoingAttemptMetadata]struct{}
 
 	port        int
 	certifciate tls.Certificate
@@ -154,6 +157,7 @@ func NewHub(hubReader api.HubReaderInterface,
 		connectionsInitiating:      make(map[string]bool),
 		inboundPairingReservations: make(map[string]*inboundPairingReservation),
 		supersededConnections:      make(map[api.ShipConnectionInterface]struct{}),
+		supersededAttemptCallbacks: make(map[api.OutgoingAttemptMetadata]struct{}),
 		remoteServices:             make(map[string]*api.ServiceDetails),
 		visiblePairingCandidates:   make(map[string]pairingCandidateObservation),
 		consumedPairingCandidates:  make(map[string]struct{}),
