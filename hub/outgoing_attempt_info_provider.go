@@ -10,6 +10,23 @@ type outgoingAttemptInfoProvider struct {
 	registration *outboundAttemptRegistration
 }
 
+type outgoingAttemptDataReader struct {
+	provider *outgoingAttemptInfoProvider
+	reader   api.ShipConnectionDataReaderInterface
+}
+
+func (reader *outgoingAttemptDataReader) HandleShipPayloadMessage(message []byte) {
+	if reader == nil || reader.provider == nil || reader.reader == nil ||
+		!reader.provider.registration.beginCallback() {
+		return
+	}
+	defer reader.provider.registration.endCallback()
+	if !reader.provider.hub.outboundAttemptRegistrationOwnsCallbacks(reader.provider.registration) {
+		return
+	}
+	reader.reader.HandleShipPayloadMessage(message)
+}
+
 func (provider *outgoingAttemptInfoProvider) IsRemoteServiceForSKIPaired(ski string) bool {
 	return provider.hub.IsRemoteServiceForSKIPaired(ski)
 }
@@ -65,7 +82,11 @@ func (provider *outgoingAttemptInfoProvider) SetupRemoteDevice(
 	if !provider.hub.outboundAttemptRegistrationOwnsCallbacks(provider.registration) {
 		return nil
 	}
-	return provider.hub.SetupRemoteDevice(ski, writer)
+	reader := provider.hub.SetupRemoteDevice(ski, writer)
+	if reader == nil {
+		return nil
+	}
+	return &outgoingAttemptDataReader{provider: provider, reader: reader}
 }
 
 func (provider *outgoingAttemptInfoProvider) HandleConnectionClosedWithAttempt(

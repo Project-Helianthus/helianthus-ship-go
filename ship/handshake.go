@@ -235,6 +235,10 @@ func (c *ShipConnection) approveHandshake() {
 			reader = c.infoProvider.SetupRemoteDevice(c.remoteSKI, c)
 		}
 	}, true)
+	if reader == nil {
+		c.CloseConnection(false, 4452, "SPINE reader unavailable")
+		return
+	}
 	c.stopHandshakeTimer()
 
 	c.spineDispatchMux.Lock()

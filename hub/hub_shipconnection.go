@@ -26,6 +26,7 @@ func (h *Hub) HandleConnectionClosed(connection api.ShipConnectionInterface, han
 	if h.claimSupersededConnection(connection) {
 		return
 	}
+	h.releaseInboundPairingWinner(connection)
 	// only remove this connection if it is the registered one for the ski!
 	// as we can have double connections but only one can be registered
 	if !h.removeExactConnection(connection) {
@@ -108,6 +109,9 @@ func (h *Hub) claimSupersededConnection(connection api.ShipConnectionInterface) 
 	h.muxCon.Lock()
 	defer h.muxCon.Unlock()
 	_, superseded := h.supersededConnections[connection]
+	if superseded {
+		delete(h.supersededConnections, connection)
+	}
 	return superseded
 }
 

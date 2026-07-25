@@ -110,9 +110,10 @@ type pairingCandidateRetirement struct {
 
 type inboundPairingReservation struct {
 	replaced api.ShipConnectionInterface
+	winner   api.ShipConnectionInterface
 }
 
-const maximumSupersededConnections = 128
+const maximumSupersededConnectionsPerSKI = 128
 
 type hubTestHooks struct {
 	launchPairingCandidate           func(func())

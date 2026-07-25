@@ -605,12 +605,12 @@ func TestIssue16RejectedReplacementDoesNotDisableLiveOutboundCallbacks(t *testin
 		tls.Certificate{},
 		api.NewServiceDetails(strings.Repeat("0", 40)),
 	)
-	for index := 0; index < maximumSupersededConnections; index++ {
-		connection := &attemptCallbackConnection{ski: fmt.Sprintf("%040x", index+1)}
+	remoteSKI := strings.Repeat("a", 40)
+	for index := 0; index < maximumSupersededConnectionsPerSKI; index++ {
+		connection := &attemptCallbackConnection{ski: remoteSKI}
 		hub.supersededConnections[connection] = struct{}{}
 	}
 
-	remoteSKI := strings.Repeat("a", 40)
 	metadata := api.OutgoingAttemptMetadata{
 		AttemptID:    "saturated-replacement",
 		Scope:        "candidate-scope",
@@ -760,7 +760,7 @@ func TestIssue16SupersededConnectionsAreReclaimedAndCapacityIsPerSKI(t *testing.
 		tls.Certificate{},
 		api.NewServiceDetails(strings.Repeat("0", 40)),
 	)
-	for index := 0; index < maximumSupersededConnections; index++ {
+	for index := 0; index < maximumSupersededConnectionsPerSKI; index++ {
 		connection := &attemptCallbackConnection{ski: fmt.Sprintf("%040x", index+1)}
 		hub.supersededConnections[connection] = struct{}{}
 	}
