@@ -25,11 +25,12 @@ func (h *Hub) HandleConnectionClosed(connection api.ShipConnectionInterface, han
 
 	// only remove this connection if it is the registered one for the ski!
 	// as we can have double connections but only one can be registered
-	if h.removeConnectionWithDataHandler(connection) {
-		// connection close was after a completed handshake, so we can reset the attetmpt counter
-		if handshakeCompleted {
-			h.removeConnectionAttemptCounter(remoteSki)
-		}
+	if !h.removeExactConnection(connection) {
+		return
+	}
+	// connection close was after a completed handshake, so we can reset the attetmpt counter
+	if handshakeCompleted {
+		h.removeConnectionAttemptCounter(remoteSki)
 	}
 
 	h.hubReader.RemoteSKIDisconnected(remoteSki)
@@ -96,33 +97,17 @@ func (h *Hub) claimClosedOutboundAttempt(
 	return retirement
 }
 
-func (h *Hub) removeExactConnection(connection api.ShipConnectionInterface) {
+func (h *Hub) removeExactConnection(connection api.ShipConnectionInterface) bool {
 	remoteSKI := connection.RemoteSKI()
 
 	h.muxCon.Lock()
 	existing := h.connections[remoteSKI]
 	if existing != connection {
 		h.muxCon.Unlock()
-		return
+		return false
 	}
 	delete(h.connections, remoteSKI)
 	h.muxCon.Unlock()
-}
-
-func (h *Hub) removeConnectionWithDataHandler(connection api.ShipConnectionInterface) bool {
-	remoteSKI := connection.RemoteSKI()
-	dataHandler := connection.DataHandler()
-
-	h.muxCon.Lock()
-	defer h.muxCon.Unlock()
-
-	existing := h.connections[remoteSKI]
-	if existing == nil {
-		return false
-	}
-	if existing.DataHandler() == dataHandler {
-		delete(h.connections, remoteSKI)
-	}
 	return true
 }
 

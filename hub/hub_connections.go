@@ -249,9 +249,13 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		dataHandler := ws.NewWebsocketConnection(conn, remoteService.SKI())
 		shipConnection := ship.NewConnectionHandler(h, dataHandler, ship.ShipRoleServer,
 			h.localService.ShipID(), remoteService.SKI(), remoteService.ShipID())
-		if !h.registerReservedInboundPairingConnection(shipConnection, reservation) {
+		replaced, registered := h.registerReservedInboundPairingConnection(shipConnection, reservation)
+		if !registered {
 			_ = conn.Close()
 			return
+		}
+		if replaced != nil {
+			replaced.CloseConnection(false, 0, "replaced by SHIP SKI ordering")
 		}
 
 		connectionStateDetail.SetState(api.ConnectionStateReceivedPairingRequest)
@@ -1003,11 +1007,14 @@ func (h *Hub) registerConnection(connection api.ShipConnectionInterface) {
 func (h *Hub) reserveInboundPairingConnection(ski string) *inboundPairingReservation {
 	h.muxCon.Lock()
 	defer h.muxCon.Unlock()
-	if h.hasShutdown || h.connections[ski] != nil || h.connectionsInitiating[ski] ||
-		h.inboundPairingReservations[ski] != nil {
+	if h.hasShutdown || h.connectionsInitiating[ski] || h.inboundPairingReservations[ski] != nil {
 		return nil
 	}
-	reservation := &inboundPairingReservation{}
+	existing := h.connections[ski]
+	if existing != nil && ski <= h.localService.SKI() {
+		return nil
+	}
+	reservation := &inboundPairingReservation{replaced: existing}
 	h.inboundPairingReservations[ski] = reservation
 	return reservation
 }
@@ -1015,17 +1022,20 @@ func (h *Hub) reserveInboundPairingConnection(ski string) *inboundPairingReserva
 func (h *Hub) registerReservedInboundPairingConnection(
 	connection api.ShipConnectionInterface,
 	reservation *inboundPairingReservation,
-) bool {
+) (api.ShipConnectionInterface, bool) {
 	remoteSKI := connection.RemoteSKI()
 	h.muxCon.Lock()
 	defer h.muxCon.Unlock()
-	if h.hasShutdown || reservation == nil || h.inboundPairingReservations[remoteSKI] != reservation ||
-		h.connections[remoteSKI] != nil {
-		return false
+	if h.hasShutdown || reservation == nil || h.inboundPairingReservations[remoteSKI] != reservation {
+		return nil, false
+	}
+	existing := h.connections[remoteSKI]
+	if existing != reservation.replaced {
+		return nil, false
 	}
 	h.connections[remoteSKI] = connection
 	delete(h.inboundPairingReservations, remoteSKI)
-	return true
+	return existing, true
 }
 
 func (h *Hub) releaseInboundPairingReservation(ski string, reservation *inboundPairingReservation) {

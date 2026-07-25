@@ -142,6 +142,82 @@ func TestIssue16LosingInboundConnectionCannotPublishPairingRequest(t *testing.T)
 	}
 }
 
+func TestIssue16HigherRemoteSKIAtomicallyReplacesQueuedConnectionBeforePairingRequest(t *testing.T) {
+	serverCertificate, err := cert.CreateCertificate("unit", "org", "DE", "server")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientCertificate, err := cert.CreateCertificate("unit", "org", "DE", "client")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientLeaf, err := x509.ParseCertificate(clientCertificate.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	remoteSKI, err := cert.SkiFromCertificate(clientLeaf)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader := &issue16PairingReader{}
+	hub := NewHub(reader, &attemptTestMdns{}, 0, serverCertificate, api.NewServiceDetails(strings.Repeat("0", 40)))
+	hub.ServiceForSKI(remoteSKI).ConnectionStateDetail().SetState(api.ConnectionStateQueued)
+	existing := &attemptCallbackConnection{ski: remoteSKI}
+	hub.registerConnection(existing)
+	server := newIssue16TLSServer(t, hub, serverCertificate)
+
+	connection, response, err := issue16Dial(server.URL, clientCertificate)
+	if response != nil && response.Body != nil {
+		_ = response.Body.Close()
+	}
+	if err != nil {
+		t.Fatalf("websocket dial: %v", err)
+	}
+	defer connection.Close()
+
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if len(reader.pairingStates()) != 0 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	states := reader.pairingStates()
+	if len(states) != 1 || states[0] != api.ConnectionStateReceivedPairingRequest {
+		t.Fatalf("winning inbound pairing states = %v, want [ReceivedPairingRequest]", states)
+	}
+	if registered := hub.connectionForSKI(remoteSKI); registered == nil || registered == existing {
+		t.Fatalf("registered winning connection = %#v, want replacement", registered)
+	}
+	if connected, disconnected, shipIDs := reader.evidenceCounts(); connected != 0 || disconnected != 0 || shipIDs != 0 {
+		t.Fatalf("pre-SHIP evidence counts = connected:%d disconnected:%d ship_ids:%d, want zero", connected, disconnected, shipIDs)
+	}
+}
+
+func TestIssue16LosingConnectionCloseCannotPublishDisconnectEvidence(t *testing.T) {
+	reader := &issue16PairingReader{}
+	hub := NewHub(
+		reader,
+		&attemptTestMdns{},
+		0,
+		tls.Certificate{},
+		api.NewServiceDetails(strings.Repeat("0", 40)),
+	)
+	current := &attemptCallbackConnection{ski: strings.Repeat("a", 40)}
+	loser := &attemptCallbackConnection{ski: current.ski}
+	hub.registerConnection(current)
+
+	hub.HandleConnectionClosed(loser, false)
+
+	if registered := hub.connectionForSKI(current.ski); registered != current {
+		t.Fatalf("loser close changed registered connection to %#v, want %#v", registered, current)
+	}
+	if _, disconnected, _ := reader.evidenceCounts(); disconnected != 0 {
+		t.Fatalf("loser close published %d disconnect callbacks, want zero", disconnected)
+	}
+}
+
 func TestIssue16ConcurrentInboundConnectionsPublishOnePairingWinner(t *testing.T) {
 	serverCertificate, err := cert.CreateCertificate("unit", "org", "DE", "server")
 	if err != nil {

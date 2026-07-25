@@ -51,7 +51,9 @@ type pairingCandidateRetirement struct {
 	authority *outboundAttemptAuthority
 }
 
-type inboundPairingReservation struct{}
+type inboundPairingReservation struct {
+	replaced api.ShipConnectionInterface
+}
 
 type hubTestHooks struct {
 	launchPairingCandidate           func(func())
