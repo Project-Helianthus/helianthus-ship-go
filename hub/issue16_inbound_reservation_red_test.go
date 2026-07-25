@@ -43,6 +43,38 @@ type issue16AttemptReader struct {
 	handshakes []api.OutgoingAttemptMetadata
 }
 
+type issue16SpineReader struct {
+	mu       sync.Mutex
+	payloads [][]byte
+}
+
+func (reader *issue16SpineReader) HandleShipPayloadMessage(message []byte) {
+	reader.mu.Lock()
+	reader.payloads = append(reader.payloads, append([]byte(nil), message...))
+	reader.mu.Unlock()
+}
+
+func (reader *issue16SpineReader) payloadCount() int {
+	reader.mu.Lock()
+	defer reader.mu.Unlock()
+	return len(reader.payloads)
+}
+
+type issue16SpineAttemptReader struct {
+	issue16AttemptReader
+	spine *issue16SpineReader
+}
+
+func (reader *issue16SpineAttemptReader) SetupRemoteDevice(
+	string,
+	api.ShipConnectionDataWriterInterface,
+) api.ShipConnectionDataReaderInterface {
+	reader.mu.Lock()
+	reader.setups++
+	reader.mu.Unlock()
+	return reader.spine
+}
+
 func (reader *issue16AttemptReader) OutgoingAttemptConnectionClosed(
 	_ string,
 	_ bool,
@@ -610,6 +642,145 @@ func TestIssue16RejectedReplacementDoesNotDisableLiveOutboundCallbacks(t *testin
 	provider.ReportServiceShipID(remoteSKI, "still-live")
 	if connected, _, shipIDs := reader.evidenceCounts(); connected != 1 || shipIDs != 1 {
 		t.Fatalf("live outbound evidence after rejected replacement = connected:%d ship_ids:%d, want 1/1", connected, shipIDs)
+	}
+}
+
+func TestIssue16SupersededOutboundReaderDropsSpinePayloads(t *testing.T) {
+	spineReader := &issue16SpineReader{}
+	reader := &issue16SpineAttemptReader{spine: spineReader}
+	hub := NewHub(
+		reader,
+		&attemptTestMdns{},
+		0,
+		tls.Certificate{},
+		api.NewServiceDetails(strings.Repeat("0", 40)),
+	)
+	remoteSKI := strings.Repeat("a", 40)
+	metadata := api.OutgoingAttemptMetadata{
+		AttemptID:    "spine-reader-fence",
+		Scope:        "candidate-scope",
+		ControlEpoch: 16,
+	}
+	attemptContext, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	outbound := &attemptCallbackConnection{ski: remoteSKI}
+	registration := &outboundAttemptRegistration{
+		authority:  &outboundAttemptAuthority{epoch: 16},
+		metadata:   metadata,
+		context:    attemptContext,
+		cancel:     cancel,
+		connection: outbound,
+	}
+	hub.outboundAttempts[remoteSKI] = map[*outboundAttemptRegistration]struct{}{registration: {}}
+	hub.registerConnection(outbound)
+	provider := &outgoingAttemptInfoProvider{hub: hub, registration: registration}
+
+	dataReader := provider.SetupRemoteDevice(remoteSKI, nil)
+	if dataReader == nil {
+		t.Fatal("live outbound setup returned no SPINE reader")
+	}
+	dataReader.HandleShipPayloadMessage([]byte("before-replacement"))
+	if got := spineReader.payloadCount(); got != 1 {
+		t.Fatalf("live outbound SPINE payloads = %d, want 1", got)
+	}
+
+	reservation := hub.reserveInboundPairingConnection(remoteSKI)
+	if reservation == nil {
+		t.Fatal("inbound replacement reservation was denied")
+	}
+	inbound := &attemptCallbackConnection{ski: remoteSKI}
+	if replaced, registered := hub.registerReservedInboundPairingConnection(inbound, reservation); !registered || replaced != outbound {
+		t.Fatalf("inbound replacement = %#v, %t; want exact outbound and true", replaced, registered)
+	}
+
+	dataReader.HandleShipPayloadMessage([]byte("after-replacement"))
+	if got := spineReader.payloadCount(); got != 1 {
+		t.Fatalf("superseded outbound delivered %d SPINE payloads, want unchanged 1", got)
+	}
+}
+
+func TestIssue16RemoteHigherInboundWinsWhileOutboundIsInitiating(t *testing.T) {
+	localSKI := strings.Repeat("0", 40)
+	remoteSKI := strings.Repeat("a", 40)
+	hub := NewHub(
+		&issue16AttemptReader{},
+		&attemptTestMdns{},
+		0,
+		tls.Certificate{},
+		api.NewServiceDetails(localSKI),
+	)
+	hub.connectionsInitiating[remoteSKI] = true
+
+	reservation := hub.reserveInboundPairingConnection(remoteSKI)
+	if reservation == nil {
+		t.Fatal("SHIP-defined remote-higher inbound winner was rejected by an outbound dial in flight")
+	}
+	outbound := &attemptCallbackConnection{ski: remoteSKI}
+	if hub.registerOutgoingConnection(outbound, context.Background()) {
+		t.Fatal("outbound loser registered over the reserved remote-higher inbound winner")
+	}
+	inbound := &attemptCallbackConnection{ski: remoteSKI}
+	if replaced, registered := hub.registerReservedInboundPairingConnection(inbound, reservation); !registered || replaced != nil {
+		t.Fatalf("remote-higher inbound winner = %#v, %t; want nil and true", replaced, registered)
+	}
+}
+
+func TestIssue16InboundReservationSurvivesWinnerRegistrationUntilClose(t *testing.T) {
+	remoteSKI := strings.Repeat("a", 40)
+	hub := NewHub(
+		&issue16AttemptReader{},
+		&attemptTestMdns{},
+		0,
+		tls.Certificate{},
+		api.NewServiceDetails(strings.Repeat("0", 40)),
+	)
+	reservation := hub.reserveInboundPairingConnection(remoteSKI)
+	if reservation == nil {
+		t.Fatal("inbound reservation was denied")
+	}
+	winner := &attemptCallbackConnection{ski: remoteSKI}
+	if _, registered := hub.registerReservedInboundPairingConnection(winner, reservation); !registered {
+		t.Fatal("inbound winner was not registered")
+	}
+	if second := hub.reserveInboundPairingConnection(remoteSKI); second != nil {
+		t.Fatal("second inbound reserved before the exact winner terminated")
+	}
+
+	hub.HandleConnectionClosed(winner, false)
+	if next := hub.reserveInboundPairingConnection(remoteSKI); next == nil {
+		t.Fatal("winner terminal close did not release the inbound reservation")
+	}
+}
+
+func TestIssue16SupersededConnectionsAreReclaimedAndCapacityIsPerSKI(t *testing.T) {
+	hub := NewHub(
+		&issue16AttemptReader{},
+		&attemptTestMdns{},
+		0,
+		tls.Certificate{},
+		api.NewServiceDetails(strings.Repeat("0", 40)),
+	)
+	for index := 0; index < maximumSupersededConnections; index++ {
+		connection := &attemptCallbackConnection{ski: fmt.Sprintf("%040x", index+1)}
+		hub.supersededConnections[connection] = struct{}{}
+	}
+
+	remoteSKI := strings.Repeat("a", 40)
+	outbound := &attemptCallbackConnection{ski: remoteSKI}
+	hub.registerConnection(outbound)
+	reservation := hub.reserveInboundPairingConnection(remoteSKI)
+	if reservation == nil {
+		t.Fatal("inbound reservation was denied by unrelated superseded connections")
+	}
+	inbound := &attemptCallbackConnection{ski: remoteSKI}
+	if replaced, registered := hub.registerReservedInboundPairingConnection(inbound, reservation); !registered || replaced != outbound {
+		t.Fatalf("per-SKI replacement = %#v, %t; want exact outbound and true", replaced, registered)
+	}
+	if !hub.claimSupersededConnection(outbound) {
+		t.Fatal("superseded outbound was not claimed")
+	}
+	if hub.claimSupersededConnection(outbound) {
+		t.Fatal("superseded outbound tombstone was not reclaimed after its terminal claim")
 	}
 }
 
