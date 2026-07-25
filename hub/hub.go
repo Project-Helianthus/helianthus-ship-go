@@ -84,6 +84,7 @@ type Hub struct {
 	connectionsInitiating map[string]bool
 	// Exact inbound first-trust winners reserved before a pairing callback.
 	inboundPairingReservations map[string]*inboundPairingReservation
+	supersededConnections      map[api.ShipConnectionInterface]struct{}
 
 	port        int
 	certifciate tls.Certificate
@@ -152,6 +153,7 @@ func NewHub(hubReader api.HubReaderInterface,
 		connectionAttemptRunning:   make(map[string]bool),
 		connectionsInitiating:      make(map[string]bool),
 		inboundPairingReservations: make(map[string]*inboundPairingReservation),
+		supersededConnections:      make(map[api.ShipConnectionInterface]struct{}),
 		remoteServices:             make(map[string]*api.ServiceDetails),
 		visiblePairingCandidates:   make(map[string]pairingCandidateObservation),
 		consumedPairingCandidates:  make(map[string]struct{}),

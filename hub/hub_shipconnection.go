@@ -23,6 +23,9 @@ func (h *Hub) IsRemoteServiceForSKIPaired(ski string) bool {
 func (h *Hub) HandleConnectionClosed(connection api.ShipConnectionInterface, handshakeCompleted bool) {
 	remoteSki := connection.RemoteSKI()
 
+	if h.claimSupersededConnection(connection) {
+		return
+	}
 	// only remove this connection if it is the registered one for the ski!
 	// as we can have double connections but only one can be registered
 	if !h.removeExactConnection(connection) {
@@ -50,7 +53,10 @@ func (h *Hub) HandleConnectionClosedWithAttempt(
 	metadata api.OutgoingAttemptMetadata,
 ) {
 	remoteSKI := connection.RemoteSKI()
-	retirement := h.claimClosedOutboundAttempt(remoteSKI, connection, metadata)
+	retirement, superseded := h.claimClosedOutboundAttempt(remoteSKI, connection, metadata)
+	if superseded {
+		return
+	}
 	if retirement != nil {
 		h.finishPairingCandidateRetirements([]pairingCandidateRetirement{*retirement})
 	}
@@ -78,23 +84,34 @@ func (h *Hub) claimClosedOutboundAttempt(
 	remoteSKI string,
 	connection api.ShipConnectionInterface,
 	metadata api.OutgoingAttemptMetadata,
-) *pairingCandidateRetirement {
+) (*pairingCandidateRetirement, bool) {
 	h.muxReg.Lock()
 	h.muxAttemptGate.Lock()
+	superseded := h.claimSupersededConnection(connection)
 	h.removeExactConnection(connection)
 	if h.testHooks != nil && h.testHooks.beforeOutboundAttemptRelease != nil {
 		h.testHooks.beforeOutboundAttemptRelease()
 	}
 	removed, releasedAuthority := h.releaseOutboundAttemptForConnectionLocked(remoteSKI, connection, metadata)
 	var retirement *pairingCandidateRetirement
-	if releasedAuthority != nil {
+	if !superseded && releasedAuthority != nil {
 		retirement = h.retireActivePairingCandidateLocked(remoteSKI, nil, releasedAuthority)
 	}
 	h.muxAttemptGate.Unlock()
 	h.muxReg.Unlock()
 
 	cancelOutboundAttemptRegistrations(removed)
-	return retirement
+	return retirement, superseded
+}
+
+func (h *Hub) claimSupersededConnection(connection api.ShipConnectionInterface) bool {
+	h.muxCon.Lock()
+	defer h.muxCon.Unlock()
+	if _, superseded := h.supersededConnections[connection]; !superseded {
+		return false
+	}
+	delete(h.supersededConnections, connection)
+	return true
 }
 
 func (h *Hub) removeExactConnection(connection api.ShipConnectionInterface) bool {

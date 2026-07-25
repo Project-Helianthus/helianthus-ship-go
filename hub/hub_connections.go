@@ -1034,6 +1034,9 @@ func (h *Hub) registerReservedInboundPairingConnection(
 		return nil, false
 	}
 	h.connections[remoteSKI] = connection
+	if existing != nil {
+		h.supersededConnections[existing] = struct{}{}
+	}
 	delete(h.inboundPairingReservations, remoteSKI)
 	return existing, true
 }

@@ -2,6 +2,7 @@ package hub
 
 import (
 	"bytes"
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
 	"github.com/Project-Helianthus/helianthus-ship-go/cert"
+	"github.com/Project-Helianthus/helianthus-ship-go/model"
 	"github.com/gorilla/websocket"
 )
 
@@ -27,6 +29,35 @@ type issue16PairingReader struct {
 	shipIDs      int
 	connected    int
 	disconnected int
+}
+
+type issue16AttemptReader struct {
+	issue16PairingReader
+	muAttempt sync.Mutex
+	terminals []api.OutgoingAttemptMetadata
+}
+
+func (reader *issue16AttemptReader) OutgoingAttemptConnectionClosed(
+	_ string,
+	_ bool,
+	metadata api.OutgoingAttemptMetadata,
+) {
+	reader.muAttempt.Lock()
+	reader.terminals = append(reader.terminals, metadata)
+	reader.muAttempt.Unlock()
+}
+
+func (*issue16AttemptReader) OutgoingAttemptHandshakeStateUpdate(
+	string,
+	model.ShipState,
+	api.OutgoingAttemptMetadata,
+) {
+}
+
+func (reader *issue16AttemptReader) terminalCount() int {
+	reader.muAttempt.Lock()
+	defer reader.muAttempt.Unlock()
+	return len(reader.terminals)
 }
 
 func (reader *issue16PairingReader) ServicePairingDetailUpdate(
@@ -215,6 +246,79 @@ func TestIssue16LosingConnectionCloseCannotPublishDisconnectEvidence(t *testing.
 	}
 	if _, disconnected, _ := reader.evidenceCounts(); disconnected != 0 {
 		t.Fatalf("loser close published %d disconnect callbacks, want zero", disconnected)
+	}
+}
+
+func TestIssue16ReplacedAttemptTaggedConnectionOnlyReleasesPrivateReservation(t *testing.T) {
+	tests := []struct {
+		name  string
+		scope string
+	}{
+		{name: "internal", scope: internalOutgoingAttemptScope},
+		{name: "gated", scope: "candidate-scope"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			reader := &issue16AttemptReader{}
+			hub := NewHub(
+				reader,
+				&attemptTestMdns{},
+				0,
+				tls.Certificate{},
+				api.NewServiceDetails(strings.Repeat("0", 40)),
+			)
+			remoteSKI := strings.Repeat("a", 40)
+			loser := &attemptCallbackConnection{ski: remoteSKI}
+			hub.registerConnection(loser)
+			reservation := hub.reserveInboundPairingConnection(remoteSKI)
+			if reservation == nil {
+				t.Fatal("inbound replacement reservation was denied")
+			}
+			current := &attemptCallbackConnection{ski: remoteSKI}
+			replaced, registered := hub.registerReservedInboundPairingConnection(current, reservation)
+			if !registered || replaced != loser {
+				t.Fatalf("replacement registration = %#v, %t; want exact loser and true", replaced, registered)
+			}
+
+			attemptContext, cancel := context.WithCancel(context.Background())
+			t.Cleanup(cancel)
+			metadata := api.OutgoingAttemptMetadata{
+				AttemptID:    "replaced-" + test.name,
+				Scope:        test.scope,
+				ControlEpoch: 16,
+			}
+			authority := &outboundAttemptAuthority{epoch: 16}
+			registration := &outboundAttemptRegistration{
+				authority:  authority,
+				metadata:   metadata,
+				context:    attemptContext,
+				cancel:     cancel,
+				connection: loser,
+			}
+			hub.outboundAttempts[remoteSKI] = map[*outboundAttemptRegistration]struct{}{
+				registration: {},
+			}
+
+			hub.HandleConnectionClosedWithAttempt(loser, false, metadata)
+
+			if registered := hub.connectionForSKI(remoteSKI); registered != current {
+				t.Fatalf("loser terminal changed registered connection to %#v, want %#v", registered, current)
+			}
+			select {
+			case <-attemptContext.Done():
+			default:
+				t.Fatal("losing private attempt reservation was not released")
+			}
+			if registrations := hub.outboundAttempts[remoteSKI]; len(registrations) != 0 {
+				t.Fatalf("losing private attempt registrations = %d, want zero", len(registrations))
+			}
+			if reader.terminalCount() != 0 {
+				t.Fatalf("losing attempt published %d terminal callbacks, want zero", reader.terminalCount())
+			}
+			if _, disconnected, _ := reader.evidenceCounts(); disconnected != 0 {
+				t.Fatalf("losing attempt published %d disconnect callbacks, want zero", disconnected)
+			}
+		})
 	}
 }
 
