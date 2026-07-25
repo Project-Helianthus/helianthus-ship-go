@@ -29,6 +29,7 @@ type issue16PairingReader struct {
 	shipIDs      int
 	connected    int
 	disconnected int
+	setups       int
 }
 
 type issue16AttemptReader struct {
@@ -97,6 +98,16 @@ func (reader *issue16PairingReader) ServiceShipIDUpdate(string, string) {
 	reader.mu.Unlock()
 }
 
+func (reader *issue16PairingReader) SetupRemoteDevice(
+	string,
+	api.ShipConnectionDataWriterInterface,
+) api.ShipConnectionDataReaderInterface {
+	reader.mu.Lock()
+	reader.setups++
+	reader.mu.Unlock()
+	return nil
+}
+
 func (reader *issue16PairingReader) pairingStates() []api.ConnectionState {
 	reader.mu.Lock()
 	defer reader.mu.Unlock()
@@ -107,6 +118,12 @@ func (reader *issue16PairingReader) evidenceCounts() (int, int, int) {
 	reader.mu.Lock()
 	defer reader.mu.Unlock()
 	return reader.connected, reader.disconnected, reader.shipIDs
+}
+
+func (reader *issue16PairingReader) setupCount() int {
+	reader.mu.Lock()
+	defer reader.mu.Unlock()
+	return reader.setups
 }
 
 func TestIssue16LosingInboundConnectionCannotPublishPairingRequest(t *testing.T) {
@@ -318,11 +335,16 @@ func TestIssue16ReplacedAttemptTaggedConnectionOnlyReleasesPrivateReservation(t 
 				model.ShipState{State: model.SmeStateComplete},
 				metadata,
 			)
+			provider.ReportServiceShipID(remoteSKI, "loser-ship-id")
+			_ = provider.SetupRemoteDevice(remoteSKI, nil)
 			if reader.handshakeCount() != 0 {
 				t.Fatalf("superseded attempt published %d pre-terminal handshake callbacks, want zero", reader.handshakeCount())
 			}
 			if state := service.ConnectionStateDetail().State(); state == api.ConnectionStateCompleted {
 				t.Fatal("superseded internal attempt changed pairing state before terminal")
+			}
+			if connected, _, shipIDs := reader.evidenceCounts(); connected != 0 || shipIDs != 0 || reader.setupCount() != 0 {
+				t.Fatalf("superseded pre-terminal evidence = connected:%d ship_ids:%d setups:%d, want zero", connected, shipIDs, reader.setupCount())
 			}
 
 			provider.HandleConnectionClosedWithAttempt(loser, false, metadata)
@@ -350,11 +372,16 @@ func TestIssue16ReplacedAttemptTaggedConnectionOnlyReleasesPrivateReservation(t 
 				model.ShipState{State: model.SmeStateComplete},
 				metadata,
 			)
+			provider.ReportServiceShipID(remoteSKI, "late-loser-ship-id")
+			_ = provider.SetupRemoteDevice(remoteSKI, nil)
 			if reader.handshakeCount() != 0 {
 				t.Fatalf("superseded attempt published %d post-terminal handshake callbacks, want zero", reader.handshakeCount())
 			}
 			if state := service.ConnectionStateDetail().State(); state == api.ConnectionStateCompleted {
 				t.Fatal("superseded internal attempt changed pairing state after terminal")
+			}
+			if connected, _, shipIDs := reader.evidenceCounts(); connected != 0 || shipIDs != 0 || reader.setupCount() != 0 {
+				t.Fatalf("superseded post-terminal evidence = connected:%d ship_ids:%d setups:%d, want zero", connected, shipIDs, reader.setupCount())
 			}
 		})
 	}
@@ -421,9 +448,14 @@ func TestIssue16ReusedMetadataOnLaterExactConnectionIsNotTombstoned(t *testing.T
 		model.ShipState{State: model.SmeStateComplete},
 		metadata,
 	)
+	newProvider.ReportServiceShipID(remoteSKI, "new-ship-id")
+	_ = newProvider.SetupRemoteDevice(remoteSKI, nil)
 
 	if reader.handshakeCount() != 1 {
 		t.Fatalf("later exact connection handshake callbacks = %d, want 1", reader.handshakeCount())
+	}
+	if connected, _, shipIDs := reader.evidenceCounts(); connected != 1 || shipIDs != 1 || reader.setupCount() != 1 {
+		t.Fatalf("later exact connection evidence = connected:%d ship_ids:%d setups:%d, want 1/1/1", connected, shipIDs, reader.setupCount())
 	}
 }
 

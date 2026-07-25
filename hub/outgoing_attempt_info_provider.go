@@ -26,10 +26,16 @@ func (provider *outgoingAttemptInfoProvider) HandleConnectionClosed(
 }
 
 func (provider *outgoingAttemptInfoProvider) ReportServiceShipID(ski, shipID string) {
+	if !provider.hub.outboundAttemptRegistrationOwnsCallbacks(provider.registration) {
+		return
+	}
 	provider.hub.ReportServiceShipID(ski, shipID)
 }
 
 func (provider *outgoingAttemptInfoProvider) AllowWaitingForTrust(ski string) bool {
+	if !provider.hub.outboundAttemptRegistrationOwnsCallbacks(provider.registration) {
+		return false
+	}
 	return provider.hub.AllowWaitingForTrust(ski)
 }
 
@@ -44,6 +50,9 @@ func (provider *outgoingAttemptInfoProvider) SetupRemoteDevice(
 	ski string,
 	writer api.ShipConnectionDataWriterInterface,
 ) api.ShipConnectionDataReaderInterface {
+	if !provider.hub.outboundAttemptRegistrationOwnsCallbacks(provider.registration) {
+		return nil
+	}
 	return provider.hub.SetupRemoteDevice(ski, writer)
 }
 
