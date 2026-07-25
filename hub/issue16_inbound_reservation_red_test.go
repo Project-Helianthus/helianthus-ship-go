@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"math/big"
 	"net/http"
 	"net/http/httptest"
@@ -560,6 +561,55 @@ func TestIssue16InboundReplacementWaitsForAdmittedOutboundEvidenceCallback(t *te
 	provider.ReportServiceShipID(remoteSKI, "late-outbound-ship-id")
 	if connected, _, shipIDs := reader.evidenceCounts(); connected != 1 || shipIDs != 1 {
 		t.Fatalf("post-replacement loser evidence = connected:%d ship_ids:%d, want unchanged 1/1", connected, shipIDs)
+	}
+}
+
+func TestIssue16RejectedReplacementDoesNotDisableLiveOutboundCallbacks(t *testing.T) {
+	reader := &issue16AttemptReader{}
+	hub := NewHub(
+		reader,
+		&attemptTestMdns{},
+		0,
+		tls.Certificate{},
+		api.NewServiceDetails(strings.Repeat("0", 40)),
+	)
+	for index := 0; index < maximumSupersededConnections; index++ {
+		connection := &attemptCallbackConnection{ski: fmt.Sprintf("%040x", index+1)}
+		hub.supersededConnections[connection] = struct{}{}
+	}
+
+	remoteSKI := strings.Repeat("a", 40)
+	metadata := api.OutgoingAttemptMetadata{
+		AttemptID:    "saturated-replacement",
+		Scope:        "candidate-scope",
+		ControlEpoch: 16,
+	}
+	authority := &outboundAttemptAuthority{epoch: 16}
+	attemptContext, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	outbound := &attemptCallbackConnection{ski: remoteSKI}
+	registration := &outboundAttemptRegistration{
+		authority:  authority,
+		metadata:   metadata,
+		context:    attemptContext,
+		cancel:     cancel,
+		connection: outbound,
+	}
+	hub.outboundAttempts[remoteSKI] = map[*outboundAttemptRegistration]struct{}{registration: {}}
+	hub.registerConnection(outbound)
+	reservation := hub.reserveInboundPairingConnection(remoteSKI)
+	if reservation == nil {
+		t.Fatal("inbound replacement reservation was denied before bounded registration")
+	}
+	inbound := &attemptCallbackConnection{ski: remoteSKI}
+	if replaced, registered := hub.registerReservedInboundPairingConnection(inbound, reservation); registered || replaced != nil {
+		t.Fatalf("saturated replacement = %#v, %t; want nil and false", replaced, registered)
+	}
+
+	provider := &outgoingAttemptInfoProvider{hub: hub, registration: registration}
+	provider.ReportServiceShipID(remoteSKI, "still-live")
+	if connected, _, shipIDs := reader.evidenceCounts(); connected != 1 || shipIDs != 1 {
+		t.Fatalf("live outbound evidence after rejected replacement = connected:%d ship_ids:%d, want 1/1", connected, shipIDs)
 	}
 }
 

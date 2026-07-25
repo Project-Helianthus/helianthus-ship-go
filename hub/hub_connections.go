@@ -1027,17 +1027,30 @@ func (h *Hub) registerReservedInboundPairingConnection(
 		return nil, false
 	}
 	remoteSKI := connection.RemoteSKI()
-	h.blockOutboundAttemptCallbacks(reservation.replaced)
 	h.muxCon.Lock()
-	defer h.muxCon.Unlock()
-	if h.hasShutdown || h.inboundPairingReservations[remoteSKI] != reservation {
+	if h.hasShutdown || h.inboundPairingReservations[remoteSKI] != reservation ||
+		h.connections[remoteSKI] != reservation.replaced ||
+		(reservation.replaced != nil && len(h.supersededConnections) >= maximumSupersededConnections) {
+		h.muxCon.Unlock()
 		return nil, false
 	}
+	h.muxCon.Unlock()
+
+	blocked := h.blockOutboundAttemptCallbacks(reservation.replaced)
+	h.muxCon.Lock()
 	existing := h.connections[remoteSKI]
-	if existing != reservation.replaced {
-		return nil, false
-	}
-	if existing != nil && len(h.supersededConnections) >= maximumSupersededConnections {
+	if h.hasShutdown || h.inboundPairingReservations[remoteSKI] != reservation ||
+		existing != reservation.replaced ||
+		(existing != nil && len(h.supersededConnections) >= maximumSupersededConnections) {
+		restore := !h.hasShutdown && existing == reservation.replaced
+		if restore {
+			_, restore = h.supersededConnections[existing]
+			restore = !restore
+		}
+		h.muxCon.Unlock()
+		if restore {
+			unblockOutboundAttemptCallbacks(blocked)
+		}
 		return nil, false
 	}
 	h.connections[remoteSKI] = connection
@@ -1045,12 +1058,15 @@ func (h *Hub) registerReservedInboundPairingConnection(
 		h.supersededConnections[existing] = struct{}{}
 	}
 	delete(h.inboundPairingReservations, remoteSKI)
+	h.muxCon.Unlock()
 	return existing, true
 }
 
-func (h *Hub) blockOutboundAttemptCallbacks(connection api.ShipConnectionInterface) {
+func (h *Hub) blockOutboundAttemptCallbacks(
+	connection api.ShipConnectionInterface,
+) []*outboundAttemptRegistration {
 	if connection == nil {
-		return
+		return nil
 	}
 	remoteSKI := connection.RemoteSKI()
 	h.muxAttemptGate.RLock()
@@ -1063,6 +1079,13 @@ func (h *Hub) blockOutboundAttemptCallbacks(connection api.ShipConnectionInterfa
 	h.muxAttemptGate.RUnlock()
 	for _, registration := range registrations {
 		registration.blockCallbacksAndWait()
+	}
+	return registrations
+}
+
+func unblockOutboundAttemptCallbacks(registrations []*outboundAttemptRegistration) {
+	for _, registration := range registrations {
+		registration.unblockCallbacks()
 	}
 }
 
