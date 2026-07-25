@@ -23,7 +23,7 @@ func (h *Hub) IsRemoteServiceForSKIPaired(ski string) bool {
 func (h *Hub) HandleConnectionClosed(connection api.ShipConnectionInterface, handshakeCompleted bool) {
 	remoteSki := connection.RemoteSKI()
 
-	removed, superseded, inboundPairingWinner := h.claimClosedConnectionState(connection)
+	removed, superseded, inboundPairingReservation := h.claimClosedConnectionState(connection)
 	if superseded || !removed {
 		return
 	}
@@ -36,10 +36,18 @@ func (h *Hub) HandleConnectionClosed(connection api.ShipConnectionInterface, han
 
 	// Do not automatically reconnect if handshake failed and not already paired
 	remoteService := h.ServiceForSKI(remoteSki)
-	if !handshakeCompleted && !remoteService.Trusted() {
-		if inboundPairingWinner {
-			h.retirePairingCandidate(remoteSki, nil, nil)
+	if inboundPairingReservation != nil && !remoteService.Trusted() {
+		if inboundPairingReservation.candidate != nil &&
+			inboundPairingReservation.authority != nil {
+			h.retirePairingCandidate(
+				remoteSki,
+				inboundPairingReservation.candidate,
+				inboundPairingReservation.authority,
+			)
 		}
+		return
+	}
+	if !handshakeCompleted && !remoteService.Trusted() {
 		return
 	}
 
@@ -111,9 +119,9 @@ func (h *Hub) claimClosedConnection(
 
 func (h *Hub) claimClosedConnectionState(
 	connection api.ShipConnectionInterface,
-) (removed bool, superseded bool, inboundPairingWinner bool) {
+) (removed bool, superseded bool, inboundPairingReservation *inboundPairingReservation) {
 	if connection == nil {
-		return false, false, false
+		return false, false, nil
 	}
 	remoteSKI := connection.RemoteSKI()
 	h.muxCon.Lock()
@@ -121,18 +129,18 @@ func (h *Hub) claimClosedConnectionState(
 	_, superseded = h.supersededConnections[connection]
 	if superseded {
 		delete(h.supersededConnections, connection)
-		return false, true, false
+		return false, true, nil
 	}
 	if h.connections[remoteSKI] != connection {
-		return false, false, false
+		return false, false, nil
 	}
 	reservation := h.inboundPairingReservations[remoteSKI]
 	if reservation != nil && reservation.winner == connection {
-		inboundPairingWinner = true
+		inboundPairingReservation = reservation
 		delete(h.inboundPairingReservations, remoteSKI)
 	}
 	delete(h.connections, remoteSKI)
-	return true, false, inboundPairingWinner
+	return true, false, inboundPairingReservation
 }
 
 func (h *Hub) removeExactConnection(connection api.ShipConnectionInterface) bool {

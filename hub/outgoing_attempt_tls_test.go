@@ -594,9 +594,13 @@ func TestAttemptCancellationBeforeAndAfterRegistrationCannotRemainRegistered(t *
 			if test.cancelBefore {
 				cancel()
 			}
-			registered := hub.registerOutgoingConnection(connection, attemptContext)
-			if registered == test.cancelBefore {
-				t.Fatalf("registered = %t with cancelBefore=%t", registered, test.cancelBefore)
+			result := hub.registerOutgoingConnection(connection, attemptContext, nil)
+			want := outgoingConnectionRegistrationAccepted
+			if test.cancelBefore {
+				want = outgoingConnectionRegistrationRejected
+			}
+			if result != want {
+				t.Fatalf("registration result = %v, want %v", result, want)
 			}
 			connection.Run()
 			if !test.cancelBefore {
@@ -631,8 +635,12 @@ func TestCanceledAttemptCannotDisconnectNewerConnection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create old outgoing connection: %v", err)
 	}
-	if !hub.registerOutgoingConnection(oldConnection, attemptContext) {
-		t.Fatal("old connection was not registered")
+	if result := hub.registerOutgoingConnection(
+		oldConnection,
+		attemptContext,
+		nil,
+	); result != outgoingConnectionRegistrationAccepted {
+		t.Fatalf("old connection registration result = %v, want accepted", result)
 	}
 	oldConnection.Run()
 

@@ -98,8 +98,10 @@ type pairingCandidateRetirement struct {
 }
 
 type inboundPairingReservation struct {
-	replaced api.ShipConnectionInterface
-	winner   api.ShipConnectionInterface
+	replaced  api.ShipConnectionInterface
+	winner    api.ShipConnectionInterface
+	candidate *activePairingCandidate
+	authority *outboundAttemptAuthority
 }
 
 const maximumSupersededConnectionsPerSKI = 128
