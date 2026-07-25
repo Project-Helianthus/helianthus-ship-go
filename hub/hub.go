@@ -78,17 +78,6 @@ func (registration *outboundAttemptRegistration) blockCallbacksAndWait() {
 	<-drained
 }
 
-func (registration *outboundAttemptRegistration) unblockCallbacks() {
-	if registration == nil {
-		return
-	}
-	registration.callbackMux.Lock()
-	if registration.callbackActive == 0 {
-		registration.callbackBlocked = false
-	}
-	registration.callbackMux.Unlock()
-}
-
 type pairingCandidateObservation struct {
 	ski       string
 	revision  uint64

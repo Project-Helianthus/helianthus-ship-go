@@ -776,10 +776,10 @@ func TestIssue16SupersededConnectionsAreReclaimedAndCapacityIsPerSKI(t *testing.
 	if replaced, registered := hub.registerReservedInboundPairingConnection(inbound, reservation); !registered || replaced != outbound {
 		t.Fatalf("per-SKI replacement = %#v, %t; want exact outbound and true", replaced, registered)
 	}
-	if !hub.claimSupersededConnection(outbound) {
+	if _, superseded := hub.claimClosedConnection(outbound); !superseded {
 		t.Fatal("superseded outbound was not claimed")
 	}
-	if hub.claimSupersededConnection(outbound) {
+	if _, superseded := hub.claimClosedConnection(outbound); superseded {
 		t.Fatal("superseded outbound tombstone was not reclaimed after its terminal claim")
 	}
 }
