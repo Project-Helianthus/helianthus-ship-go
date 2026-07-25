@@ -311,8 +311,9 @@ func TestIssue16ReplacedAttemptTaggedConnectionOnlyReleasesPrivateReservation(t 
 			service := hub.ServiceForSKI(remoteSKI)
 			service.SetTrusted(true)
 			hub.outboundAuthorities[remoteSKI] = authority
+			provider := &outgoingAttemptInfoProvider{hub: hub, registration: registration}
 
-			hub.HandleShipHandshakeStateUpdateWithAttempt(
+			provider.HandleShipHandshakeStateUpdateWithAttempt(
 				remoteSKI,
 				model.ShipState{State: model.SmeStateComplete},
 				metadata,
@@ -324,7 +325,7 @@ func TestIssue16ReplacedAttemptTaggedConnectionOnlyReleasesPrivateReservation(t 
 				t.Fatal("superseded internal attempt changed pairing state before terminal")
 			}
 
-			hub.HandleConnectionClosedWithAttempt(loser, false, metadata)
+			provider.HandleConnectionClosedWithAttempt(loser, false, metadata)
 
 			if registered := hub.connectionForSKI(remoteSKI); registered != current {
 				t.Fatalf("loser terminal changed registered connection to %#v, want %#v", registered, current)
@@ -344,7 +345,7 @@ func TestIssue16ReplacedAttemptTaggedConnectionOnlyReleasesPrivateReservation(t 
 				t.Fatalf("losing attempt published %d disconnect callbacks, want zero", disconnected)
 			}
 
-			hub.HandleShipHandshakeStateUpdateWithAttempt(
+			provider.HandleShipHandshakeStateUpdateWithAttempt(
 				remoteSKI,
 				model.ShipState{State: model.SmeStateComplete},
 				metadata,
@@ -356,6 +357,73 @@ func TestIssue16ReplacedAttemptTaggedConnectionOnlyReleasesPrivateReservation(t 
 				t.Fatal("superseded internal attempt changed pairing state after terminal")
 			}
 		})
+	}
+}
+
+func TestIssue16ReusedMetadataOnLaterExactConnectionIsNotTombstoned(t *testing.T) {
+	reader := &issue16AttemptReader{}
+	hub := NewHub(
+		reader,
+		&attemptTestMdns{},
+		0,
+		tls.Certificate{},
+		api.NewServiceDetails(strings.Repeat("0", 40)),
+	)
+	remoteSKI := strings.Repeat("a", 40)
+	metadata := api.OutgoingAttemptMetadata{
+		AttemptID:    "reused-by-external-gate",
+		Scope:        "candidate-scope",
+		ControlEpoch: 16,
+	}
+	authority := &outboundAttemptAuthority{epoch: 16}
+
+	oldContext, oldCancel := context.WithCancel(context.Background())
+	oldConnection := &attemptCallbackConnection{ski: remoteSKI}
+	oldRegistration := &outboundAttemptRegistration{
+		authority:  authority,
+		metadata:   metadata,
+		context:    oldContext,
+		cancel:     oldCancel,
+		connection: oldConnection,
+	}
+	hub.outboundAttempts[remoteSKI] = map[*outboundAttemptRegistration]struct{}{oldRegistration: {}}
+	hub.registerConnection(oldConnection)
+	reservation := hub.reserveInboundPairingConnection(remoteSKI)
+	if reservation == nil {
+		t.Fatal("inbound replacement reservation was denied")
+	}
+	inboundWinner := &attemptCallbackConnection{ski: remoteSKI}
+	if replaced, registered := hub.registerReservedInboundPairingConnection(inboundWinner, reservation); !registered || replaced != oldConnection {
+		t.Fatalf("inbound replacement = %#v, %t; want exact old connection and true", replaced, registered)
+	}
+	oldProvider := &outgoingAttemptInfoProvider{hub: hub, registration: oldRegistration}
+	oldProvider.HandleConnectionClosedWithAttempt(oldConnection, false, metadata)
+
+	if !hub.removeExactConnection(inboundWinner) {
+		t.Fatal("remove inbound winner before later reconnect")
+	}
+	newContext, newCancel := context.WithCancel(context.Background())
+	t.Cleanup(newCancel)
+	newConnection := &attemptCallbackConnection{ski: remoteSKI}
+	newRegistration := &outboundAttemptRegistration{
+		authority:  authority,
+		metadata:   metadata,
+		context:    newContext,
+		cancel:     newCancel,
+		connection: newConnection,
+	}
+	hub.outboundAttempts[remoteSKI] = map[*outboundAttemptRegistration]struct{}{newRegistration: {}}
+	hub.registerConnection(newConnection)
+	newProvider := &outgoingAttemptInfoProvider{hub: hub, registration: newRegistration}
+
+	newProvider.HandleShipHandshakeStateUpdateWithAttempt(
+		remoteSKI,
+		model.ShipState{State: model.SmeStateComplete},
+		metadata,
+	)
+
+	if reader.handshakeCount() != 1 {
+		t.Fatalf("later exact connection handshake callbacks = %d, want 1", reader.handshakeCount())
 	}
 }
 

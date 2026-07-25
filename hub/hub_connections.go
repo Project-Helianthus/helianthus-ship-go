@@ -449,7 +449,7 @@ func (h *Hub) connectFoundServiceWithOptions(
 		return failBeforeConnection(outgoingAttemptDeniedError{})
 	}
 	shipConnection, configurationErr := ship.NewOutgoingConnectionHandler(
-		h,
+		&outgoingAttemptInfoProvider{hub: h, registration: attempt.registration},
 		dataHandler,
 		ship.ShipRoleClient,
 		h.localService.ShipID(),
