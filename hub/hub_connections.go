@@ -236,12 +236,37 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Check if the remote service is paired
 	service := h.ServiceForSKI(remoteService.SKI())
 	connectionStateDetail := service.ConnectionStateDetail()
+	remoteService = service
+
 	if connectionStateDetail.State() == api.ConnectionStateQueued {
+		reservation := h.reserveInboundPairingConnection(remoteService.SKI())
+		if reservation == nil {
+			_ = conn.Close()
+			return
+		}
+
+		dataHandler := ws.NewWebsocketConnection(conn, remoteService.SKI())
+		shipConnection := ship.NewConnectionHandler(h, dataHandler, ship.ShipRoleServer,
+			h.localService.ShipID(), remoteService.SKI(), remoteService.ShipID())
+		replaced, registered := h.registerReservedInboundPairingConnection(shipConnection, reservation)
+		if !registered {
+			h.abandonInboundPairingReservation(remoteService.SKI(), reservation)
+			_ = conn.Close()
+			return
+		}
+		if replaced != nil {
+			replaced.CloseConnection(false, 0, "replaced by SHIP SKI ordering")
+		}
+
 		connectionStateDetail.SetState(api.ConnectionStateReceivedPairingRequest)
 		h.publishPairingDetail(ski, connectionStateDetail)
+		shipConnection.Run()
+		return
 	}
-
-	remoteService = service
+	if h.hasInboundPairingReservation(remoteService.SKI()) {
+		_ = conn.Close()
+		return
+	}
 
 	// don't allow a second connection
 	if !h.keepThisConnection(conn, true, remoteService) {
@@ -319,7 +344,8 @@ func (h *Hub) connectFoundServiceWithOptions(
 			h.muxCon.Unlock()
 			return outgoingAttemptDeniedError{}
 		}
-		if _, connected := h.connections[ski]; connected || h.connectionsInitiating[ski] {
+		if _, connected := h.connections[ski]; connected || h.connectionsInitiating[ski] ||
+			h.inboundPairingReservations[ski] != nil {
 			h.muxCon.Unlock()
 			if expectedSKI != "" {
 				return outgoingAttemptDeniedError{}
@@ -427,7 +453,7 @@ func (h *Hub) connectFoundServiceWithOptions(
 		return failBeforeConnection(outgoingAttemptDeniedError{})
 	}
 	shipConnection, configurationErr := ship.NewOutgoingConnectionHandler(
-		h,
+		&outgoingAttemptInfoProvider{hub: h, registration: attempt.registration},
 		dataHandler,
 		ship.ShipRoleClient,
 		h.localService.ShipID(),
@@ -446,12 +472,12 @@ func (h *Hub) connectFoundServiceWithOptions(
 		return failBeforeConnection(outgoingAttemptDeniedError{})
 	}
 
-	registered := h.registerOutgoingConnection(shipConnection, attempt.context)
+	if !h.registerOutgoingConnection(shipConnection, attempt.context) {
+		shipConnection.CloseConnection(false, 0, "connection registration rejected")
+		return outgoingAttemptDeniedError{}
+	}
 	shipConnection.Run()
-	if !registered || attempt.context.Err() != nil {
-		if !registered {
-			shipConnection.CloseConnection(false, 0, "connection registration rejected")
-		}
+	if attempt.context.Err() != nil {
 		return outgoingAttemptDeniedError{}
 	}
 
@@ -982,13 +1008,103 @@ func (h *Hub) registerConnection(connection api.ShipConnectionInterface) {
 	h.muxCon.Unlock()
 }
 
+func (h *Hub) reserveInboundPairingConnection(ski string) *inboundPairingReservation {
+	h.muxCon.Lock()
+	defer h.muxCon.Unlock()
+	if h.hasShutdown || h.inboundPairingReservations[ski] != nil {
+		return nil
+	}
+	if h.connectionsInitiating[ski] && ski <= h.localService.SKI() {
+		return nil
+	}
+	existing := h.connections[ski]
+	if existing != nil && ski <= h.localService.SKI() {
+		return nil
+	}
+	reservation := &inboundPairingReservation{replaced: existing}
+	h.inboundPairingReservations[ski] = reservation
+	return reservation
+}
+
+func (h *Hub) registerReservedInboundPairingConnection(
+	connection api.ShipConnectionInterface,
+	reservation *inboundPairingReservation,
+) (api.ShipConnectionInterface, bool) {
+	if reservation == nil {
+		return nil, false
+	}
+	remoteSKI := connection.RemoteSKI()
+	h.muxCon.Lock()
+	if h.hasShutdown || h.inboundPairingReservations[remoteSKI] != reservation ||
+		reservation.winner != nil ||
+		h.connections[remoteSKI] != reservation.replaced ||
+		(reservation.replaced != nil &&
+			h.supersededConnectionCountForSKILocked(remoteSKI) >= maximumSupersededConnectionsPerSKI) {
+		h.muxCon.Unlock()
+		return nil, false
+	}
+	existing := h.connections[remoteSKI]
+	h.connections[remoteSKI] = connection
+	reservation.winner = connection
+	if existing != nil {
+		h.supersededConnections[existing] = struct{}{}
+	}
+	h.muxCon.Unlock()
+	h.blockOutboundAttemptCallbacks(existing)
+	return existing, true
+}
+
+func (h *Hub) supersededConnectionCountForSKILocked(ski string) int {
+	count := 0
+	for connection := range h.supersededConnections {
+		if connection.RemoteSKI() == ski {
+			count++
+		}
+	}
+	return count
+}
+
+func (h *Hub) blockOutboundAttemptCallbacks(
+	connection api.ShipConnectionInterface,
+) {
+	if connection == nil {
+		return
+	}
+	remoteSKI := connection.RemoteSKI()
+	h.muxAttemptGate.RLock()
+	registrations := make([]*outboundAttemptRegistration, 0, len(h.outboundAttempts[remoteSKI]))
+	for registration := range h.outboundAttempts[remoteSKI] {
+		if registration.connection == connection {
+			registrations = append(registrations, registration)
+		}
+	}
+	h.muxAttemptGate.RUnlock()
+	for _, registration := range registrations {
+		registration.blockCallbacksAndWait()
+	}
+}
+
+func (h *Hub) hasInboundPairingReservation(ski string) bool {
+	h.muxCon.Lock()
+	defer h.muxCon.Unlock()
+	return h.inboundPairingReservations[ski] != nil
+}
+
+func (h *Hub) abandonInboundPairingReservation(ski string, reservation *inboundPairingReservation) {
+	h.muxCon.Lock()
+	if h.inboundPairingReservations[ski] == reservation && reservation.winner == nil {
+		delete(h.inboundPairingReservations, ski)
+	}
+	h.muxCon.Unlock()
+}
+
 func (h *Hub) registerOutgoingConnection(connection api.ShipConnectionInterface, attemptContext context.Context) bool {
 	remoteSKI := connection.RemoteSKI()
 
 	h.muxCon.Lock()
 	defer h.muxCon.Unlock()
 
-	if h.hasShutdown || attemptContext.Err() != nil {
+	if h.hasShutdown || attemptContext.Err() != nil || h.inboundPairingReservations[remoteSKI] != nil {
 		return false
 	}
 	h.connections[remoteSKI] = connection

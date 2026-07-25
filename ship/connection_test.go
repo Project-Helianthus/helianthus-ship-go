@@ -646,6 +646,18 @@ func (s *ConnectionSuite) TestReaderInstallationIsOneShotForOrdinaryConnection()
 	assert.Same(s.T(), reader, s.sut.dataReader)
 }
 
+func (s *ConnectionSuite) TestNilSpineReaderClosesFailClosedWithoutDraining() {
+	payload := []byte(`{"datagram":{"sequence":1}}`)
+	s.sut.HandleIncomingWebsocketMessage(spineWebsocketMessage(s.T(), payload))
+	s.infoProvider.EXPECT().SetupRemoteDevice("RemoveDevice", s.sut).Return(nil).Once()
+
+	assert.NotPanics(s.T(), func() {
+		s.sut.approveHandshake()
+	})
+	assert.True(s.T(), s.sut.pairingTerminal)
+	assert.Nil(s.T(), s.sut.dataReader)
+}
+
 func (s *ConnectionSuite) TestSpineSetupBufferCountLimitClosesFailClosed() {
 	message := spineWebsocketMessage(s.T(), []byte(`{"datagram":{}}`))
 	for range maxBufferedSpineMessages {

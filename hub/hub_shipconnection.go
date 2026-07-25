@@ -23,13 +23,13 @@ func (h *Hub) IsRemoteServiceForSKIPaired(ski string) bool {
 func (h *Hub) HandleConnectionClosed(connection api.ShipConnectionInterface, handshakeCompleted bool) {
 	remoteSki := connection.RemoteSKI()
 
-	// only remove this connection if it is the registered one for the ski!
-	// as we can have double connections but only one can be registered
-	if h.removeConnectionWithDataHandler(connection) {
-		// connection close was after a completed handshake, so we can reset the attetmpt counter
-		if handshakeCompleted {
-			h.removeConnectionAttemptCounter(remoteSki)
-		}
+	removed, superseded := h.claimClosedConnection(connection)
+	if superseded || !removed {
+		return
+	}
+	// connection close was after a completed handshake, so we can reset the attetmpt counter
+	if handshakeCompleted {
+		h.removeConnectionAttemptCounter(remoteSki)
 	}
 
 	h.hubReader.RemoteSKIDisconnected(remoteSki)
@@ -49,7 +49,10 @@ func (h *Hub) HandleConnectionClosedWithAttempt(
 	metadata api.OutgoingAttemptMetadata,
 ) {
 	remoteSKI := connection.RemoteSKI()
-	retirement := h.claimClosedOutboundAttempt(remoteSKI, connection, metadata)
+	retirement, superseded := h.claimClosedOutboundAttempt(remoteSKI, connection, metadata)
+	if superseded {
+		return
+	}
 	if retirement != nil {
 		h.finishPairingCandidateRetirements([]pairingCandidateRetirement{*retirement})
 	}
@@ -77,52 +80,61 @@ func (h *Hub) claimClosedOutboundAttempt(
 	remoteSKI string,
 	connection api.ShipConnectionInterface,
 	metadata api.OutgoingAttemptMetadata,
-) *pairingCandidateRetirement {
+) (*pairingCandidateRetirement, bool) {
 	h.muxReg.Lock()
 	h.muxAttemptGate.Lock()
-	h.removeExactConnection(connection)
+	_, superseded := h.claimClosedConnection(connection)
 	if h.testHooks != nil && h.testHooks.beforeOutboundAttemptRelease != nil {
 		h.testHooks.beforeOutboundAttemptRelease()
 	}
 	removed, releasedAuthority := h.releaseOutboundAttemptForConnectionLocked(remoteSKI, connection, metadata)
 	var retirement *pairingCandidateRetirement
-	if releasedAuthority != nil {
+	if !superseded && releasedAuthority != nil {
 		retirement = h.retireActivePairingCandidateLocked(remoteSKI, nil, releasedAuthority)
 	}
 	h.muxAttemptGate.Unlock()
 	h.muxReg.Unlock()
 
 	cancelOutboundAttemptRegistrations(removed)
-	return retirement
+	return retirement, superseded
 }
 
-func (h *Hub) removeExactConnection(connection api.ShipConnectionInterface) {
+func (h *Hub) claimClosedConnection(
+	connection api.ShipConnectionInterface,
+) (removed bool, superseded bool) {
+	if connection == nil {
+		return false, false
+	}
+	remoteSKI := connection.RemoteSKI()
+	h.muxCon.Lock()
+	defer h.muxCon.Unlock()
+	_, superseded = h.supersededConnections[connection]
+	if superseded {
+		delete(h.supersededConnections, connection)
+		return false, true
+	}
+	if h.connections[remoteSKI] != connection {
+		return false, false
+	}
+	reservation := h.inboundPairingReservations[remoteSKI]
+	if reservation != nil && reservation.winner == connection {
+		delete(h.inboundPairingReservations, remoteSKI)
+	}
+	delete(h.connections, remoteSKI)
+	return true, false
+}
+
+func (h *Hub) removeExactConnection(connection api.ShipConnectionInterface) bool {
 	remoteSKI := connection.RemoteSKI()
 
 	h.muxCon.Lock()
 	existing := h.connections[remoteSKI]
 	if existing != connection {
 		h.muxCon.Unlock()
-		return
+		return false
 	}
 	delete(h.connections, remoteSKI)
 	h.muxCon.Unlock()
-}
-
-func (h *Hub) removeConnectionWithDataHandler(connection api.ShipConnectionInterface) bool {
-	remoteSKI := connection.RemoteSKI()
-	dataHandler := connection.DataHandler()
-
-	h.muxCon.Lock()
-	defer h.muxCon.Unlock()
-
-	existing := h.connections[remoteSKI]
-	if existing == nil {
-		return false
-	}
-	if existing.DataHandler() == dataHandler {
-		delete(h.connections, remoteSKI)
-	}
 	return true
 }
 

@@ -6,6 +6,7 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/sha1"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
@@ -84,10 +85,28 @@ func CreateCertificate(organizationalUnit, organization, country, commonName str
 }
 
 func SkiFromCertificate(cert *x509.Certificate) (string, error) {
+	if cert == nil {
+		return "", errors.New("client certificate is missing")
+	}
 	// check if the clients certificate provides a SKI
 	subjectKeyId := cert.SubjectKeyId
 	if len(subjectKeyId) != 20 {
 		return "", errors.New("Client certificate does not provide a SKI")
+	}
+
+	publicKey, ok := cert.PublicKey.(*ecdsa.PublicKey)
+	if !ok || publicKey == nil || publicKey.Curve != elliptic.P256() {
+		return "", errors.New("client certificate does not provide a P-256 public key")
+	}
+	ecdhKey, err := publicKey.ECDH()
+	if err != nil {
+		return "", errors.New("client certificate provides an invalid public key")
+	}
+	// SHIP 12.2 binds the service SKI to the uncompressed P-256 public key.
+	// #nosec G401
+	derivedSKI := sha1.Sum(ecdhKey.Bytes())
+	if subtle.ConstantTimeCompare(subjectKeyId, derivedSKI[:]) != 1 {
+		return "", errors.New("client certificate SKI does not match its public key")
 	}
 
 	return fmt.Sprintf("%0x", subjectKeyId), nil
