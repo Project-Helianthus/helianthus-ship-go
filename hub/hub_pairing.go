@@ -174,11 +174,23 @@ func (h *Hub) QueuePairingCandidate(candidateRef, expectedSKI string) error {
 		if !active {
 			return
 		}
-		if err := h.connectFoundPairingCandidate(service, host, port, path, validatedSKI, candidateAuthority); err != nil {
+		if err := h.connectFoundPairingCandidate(
+			service,
+			host,
+			port,
+			path,
+			validatedSKI,
+			candidateAuthority,
+		); err != nil && !isInboundPairingDirectionHandoff(err) {
 			h.retirePairingCandidate(validatedSKI, activeCandidate, nil)
 		}
 	})
 	return nil
+}
+
+func isInboundPairingDirectionHandoff(err error) bool {
+	var handoff inboundPairingDirectionHandoffError
+	return errors.As(err, &handoff)
 }
 
 func validPairingCandidateSKI(ski string) (string, error) {

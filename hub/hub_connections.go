@@ -84,6 +84,20 @@ type outgoingAttemptDeniedError struct{}
 func (outgoingAttemptDeniedError) Error() string       { return "outgoing attempt denied" }
 func (outgoingAttemptDeniedError) AttemptDenied() bool { return true }
 
+type inboundPairingDirectionHandoffError struct{}
+
+func (inboundPairingDirectionHandoffError) Error() string {
+	return "outgoing pairing direction handed off to authenticated inbound winner"
+}
+
+type outgoingConnectionRegistrationResult uint8
+
+const (
+	outgoingConnectionRegistrationRejected outgoingConnectionRegistrationResult = iota
+	outgoingConnectionRegistrationAccepted
+	outgoingConnectionRegistrationInboundHandoff
+)
+
 var errOutgoingAttemptFailed = errors.New("outgoing attempt failed")
 
 const internalOutgoingAttemptScope = "ship.internal.reconnect"
@@ -344,9 +358,18 @@ func (h *Hub) connectFoundServiceWithOptions(
 			h.muxCon.Unlock()
 			return outgoingAttemptDeniedError{}
 		}
-		if _, connected := h.connections[ski]; connected || h.connectionsInitiating[ski] ||
-			h.inboundPairingReservations[ski] != nil {
+		connection, connected := h.connections[ski]
+		reservation := h.inboundPairingReservations[ski]
+		if connected || h.connectionsInitiating[ski] || reservation != nil {
+			inboundPairingHandoff := expectedSKI == ski &&
+				reservation != nil &&
+				requiredAuthority != nil &&
+				reservation.authority == requiredAuthority &&
+				(reservation.winner == nil || connection == reservation.winner)
 			h.muxCon.Unlock()
+			if inboundPairingHandoff {
+				return inboundPairingDirectionHandoffError{}
+			}
 			if expectedSKI != "" {
 				return outgoingAttemptDeniedError{}
 			}
@@ -472,8 +495,16 @@ func (h *Hub) connectFoundServiceWithOptions(
 		return failBeforeConnection(outgoingAttemptDeniedError{})
 	}
 
-	if !h.registerOutgoingConnection(shipConnection, attempt.context) {
+	registrationResult := h.registerOutgoingConnection(
+		shipConnection,
+		attempt.context,
+		requiredAuthority,
+	)
+	if registrationResult != outgoingConnectionRegistrationAccepted {
 		shipConnection.CloseConnection(false, 0, "connection registration rejected")
+		if registrationResult == outgoingConnectionRegistrationInboundHandoff {
+			return inboundPairingDirectionHandoffError{}
+		}
 		return outgoingAttemptDeniedError{}
 	}
 	shipConnection.Run()
@@ -1009,20 +1040,35 @@ func (h *Hub) registerConnection(connection api.ShipConnectionInterface) {
 }
 
 func (h *Hub) reserveInboundPairingConnection(ski string) *inboundPairingReservation {
+	h.muxReg.Lock()
 	h.muxCon.Lock()
-	defer h.muxCon.Unlock()
 	if h.hasShutdown || h.inboundPairingReservations[ski] != nil {
+		h.muxCon.Unlock()
+		h.muxReg.Unlock()
 		return nil
 	}
 	if h.connectionsInitiating[ski] && ski <= h.localService.SKI() {
+		h.muxCon.Unlock()
+		h.muxReg.Unlock()
 		return nil
 	}
 	existing := h.connections[ski]
 	if existing != nil && ski <= h.localService.SKI() {
+		h.muxCon.Unlock()
+		h.muxReg.Unlock()
 		return nil
 	}
-	reservation := &inboundPairingReservation{replaced: existing}
+	activeCandidate := h.activePairingCandidates[ski]
+	reservation := &inboundPairingReservation{
+		replaced:  existing,
+		candidate: activeCandidate,
+	}
+	if activeCandidate != nil {
+		reservation.authority = activeCandidate.authority
+	}
 	h.inboundPairingReservations[ski] = reservation
+	h.muxCon.Unlock()
+	h.muxReg.Unlock()
 	return reservation
 }
 
@@ -1091,24 +1137,46 @@ func (h *Hub) hasInboundPairingReservation(ski string) bool {
 }
 
 func (h *Hub) abandonInboundPairingReservation(ski string, reservation *inboundPairingReservation) {
+	var retiredCandidate *activePairingCandidate
+	var retiredAuthority *outboundAttemptAuthority
 	h.muxCon.Lock()
 	if h.inboundPairingReservations[ski] == reservation && reservation.winner == nil {
 		delete(h.inboundPairingReservations, ski)
+		replacedStillCurrent := reservation.replaced != nil &&
+			h.connections[ski] == reservation.replaced
+		if !replacedStillCurrent {
+			retiredCandidate = reservation.candidate
+			retiredAuthority = reservation.authority
+		}
 	}
 	h.muxCon.Unlock()
+	if retiredCandidate != nil && retiredAuthority != nil {
+		h.retirePairingCandidate(ski, retiredCandidate, retiredAuthority)
+	}
 }
 
-func (h *Hub) registerOutgoingConnection(connection api.ShipConnectionInterface, attemptContext context.Context) bool {
+func (h *Hub) registerOutgoingConnection(
+	connection api.ShipConnectionInterface,
+	attemptContext context.Context,
+	requiredAuthority *outboundAttemptAuthority,
+) outgoingConnectionRegistrationResult {
 	remoteSKI := connection.RemoteSKI()
 
 	h.muxCon.Lock()
 	defer h.muxCon.Unlock()
 
-	if h.hasShutdown || attemptContext.Err() != nil || h.inboundPairingReservations[remoteSKI] != nil {
-		return false
+	if h.hasShutdown || attemptContext.Err() != nil {
+		return outgoingConnectionRegistrationRejected
+	}
+	if reservation := h.inboundPairingReservations[remoteSKI]; reservation != nil {
+		if requiredAuthority != nil && reservation.authority == requiredAuthority {
+			h.supersededConnections[connection] = struct{}{}
+			return outgoingConnectionRegistrationInboundHandoff
+		}
+		return outgoingConnectionRegistrationRejected
 	}
 	h.connections[remoteSKI] = connection
-	return true
+	return outgoingConnectionRegistrationAccepted
 }
 
 // return the connection for a specific SKI

@@ -716,8 +716,12 @@ func TestIssue16RemoteHigherInboundWinsWhileOutboundIsInitiating(t *testing.T) {
 		t.Fatal("SHIP-defined remote-higher inbound winner was rejected by an outbound dial in flight")
 	}
 	outbound := &attemptCallbackConnection{ski: remoteSKI}
-	if hub.registerOutgoingConnection(outbound, context.Background()) {
-		t.Fatal("outbound loser registered over the reserved remote-higher inbound winner")
+	if result := hub.registerOutgoingConnection(
+		outbound,
+		context.Background(),
+		nil,
+	); result != outgoingConnectionRegistrationRejected {
+		t.Fatalf("outbound loser registration result = %v, want rejected", result)
 	}
 	inbound := &attemptCallbackConnection{ski: remoteSKI}
 	if replaced, registered := hub.registerReservedInboundPairingConnection(inbound, reservation); !registered || replaced != nil {
