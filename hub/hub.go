@@ -51,6 +51,8 @@ type pairingCandidateRetirement struct {
 	authority *outboundAttemptAuthority
 }
 
+type inboundPairingReservation struct{}
+
 type hubTestHooks struct {
 	launchPairingCandidate           func(func())
 	beforePairingCandidateAdmission  func()
@@ -78,6 +80,8 @@ type Hub struct {
 	connectionAttemptRunning map[string]bool
 	// SKIs with an outgoing dial in flight but not yet registered.
 	connectionsInitiating map[string]bool
+	// Exact inbound first-trust winners reserved before a pairing callback.
+	inboundPairingReservations map[string]*inboundPairingReservation
 
 	port        int
 	certifciate tls.Certificate
@@ -141,22 +145,23 @@ func NewHub(hubReader api.HubReaderInterface,
 	certificate tls.Certificate,
 	localService *api.ServiceDetails) *Hub {
 	hub := &Hub{
-		connections:               make(map[string]api.ShipConnectionInterface),
-		connectionAttemptCounter:  make(map[string]int),
-		connectionAttemptRunning:  make(map[string]bool),
-		connectionsInitiating:     make(map[string]bool),
-		remoteServices:            make(map[string]*api.ServiceDetails),
-		visiblePairingCandidates:  make(map[string]pairingCandidateObservation),
-		consumedPairingCandidates: make(map[string]struct{}),
-		activePairingCandidates:   make(map[string]*activePairingCandidate),
-		hubReader:                 hubReader,
-		port:                      port,
-		certifciate:               certificate,
-		localService:              localService,
-		mdns:                      mdns,
-		dialer:                    newOutgoingAttemptDialer(certificate),
-		outboundAuthorities:       make(map[string]*outboundAttemptAuthority),
-		outboundAttempts:          make(map[string]map[*outboundAttemptRegistration]struct{}),
+		connections:                make(map[string]api.ShipConnectionInterface),
+		connectionAttemptCounter:   make(map[string]int),
+		connectionAttemptRunning:   make(map[string]bool),
+		connectionsInitiating:      make(map[string]bool),
+		inboundPairingReservations: make(map[string]*inboundPairingReservation),
+		remoteServices:             make(map[string]*api.ServiceDetails),
+		visiblePairingCandidates:   make(map[string]pairingCandidateObservation),
+		consumedPairingCandidates:  make(map[string]struct{}),
+		activePairingCandidates:    make(map[string]*activePairingCandidate),
+		hubReader:                  hubReader,
+		port:                       port,
+		certifciate:                certificate,
+		localService:               localService,
+		mdns:                       mdns,
+		dialer:                     newOutgoingAttemptDialer(certificate),
+		outboundAuthorities:        make(map[string]*outboundAttemptAuthority),
+		outboundAttempts:           make(map[string]map[*outboundAttemptRegistration]struct{}),
 	}
 
 	return hub
