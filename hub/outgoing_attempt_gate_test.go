@@ -461,12 +461,12 @@ func TestAuthorizedAttemptsGateEveryPathAndEndpointFallback(t *testing.T) {
 		path string
 		url  string
 	}{
-		{host: "peer.local", path: "/ship/", url: "wss://peer.local:4712/ship/"},
-		{host: "peer.local", path: "", url: "wss://peer.local:4712"},
 		{host: "192.0.2.10", path: "/ship/", url: "wss://192.0.2.10:4712/ship/"},
 		{host: "192.0.2.10", path: "", url: "wss://192.0.2.10:4712"},
 		{host: "2001:db8::10", path: "/ship/", url: "wss://[2001:db8::10]:4712/ship/"},
 		{host: "2001:db8::10", path: "", url: "wss://[2001:db8::10]:4712"},
+		{host: "peer.local", path: "/ship/", url: "wss://peer.local:4712/ship/"},
+		{host: "peer.local", path: "", url: "wss://peer.local:4712"},
 	}
 	if len(requests) != len(want) || len(authorized) != len(want) || len(permits) != len(want) || len(calls) != len(want) {
 		t.Fatalf("prepare/authorize/permit/dial = %d/%d/%d/%d, want %d each", len(requests), len(authorized), len(permits), len(calls), len(want))
@@ -508,9 +508,9 @@ func TestNoGatePreservesUpstreamRetryFallbackAndReannounce(t *testing.T) {
 	calls, peerEffects := dialer.snapshot()
 	announce, requested := mdns.counts()
 	wantURLs := []string{
-		"wss://peer.local:4712/ship/", "wss://peer.local:4712",
 		"wss://192.0.2.10:4712/ship/", "wss://192.0.2.10:4712",
 		"wss://[2001:db8::10]:4712/ship/", "wss://[2001:db8::10]:4712",
+		"wss://peer.local:4712/ship/", "wss://peer.local:4712",
 	}
 	if len(calls) != len(wantURLs) {
 		t.Fatalf("ungated dial count = %d, want %d", len(calls), len(wantURLs))

@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"reflect"
-	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -889,38 +888,8 @@ func (h *Hub) initateConnectionWithError(remoteService *api.ServiceDetails, entr
 		return false, nil
 	}
 
-	// try connetion via hostname
-	if len(entry.Host) > 0 {
-		logging.Log().Debug("trying to connect to", remoteService.SKI(), "at", entry.Host)
-		if err = h.connectFoundService(
-			remoteService,
-			entry.Host,
-			strconv.Itoa(entry.Port),
-			entry.Path,
-			requiredAuthority,
-		); err != nil {
-			if isOutgoingAttemptDenied(err) {
-				return false, err
-			}
-			logging.Log().Debugf("connection to %s failed: %s", remoteService.SKI(), err)
-		} else {
-			return true, nil
-		}
-	}
-
-	// try IPv4 addresses before IPv6 addresses
-	slices.SortFunc(entry.Addresses, func(a, b net.IP) int {
-		if a.To4() != nil && b.To4() == nil {
-			return -1
-		}
-		if a.To4() == nil && b.To4() != nil {
-			return 1
-		}
-		return 0
-	})
-
-	// try connecting via the provided IP addresses
-	for _, address := range entry.Addresses {
+	addresses := orderedConnectionAddresses(entry.Addresses)
+	for _, address := range addresses {
 		logging.Log().Debug("trying to connect to", remoteService.SKI(), "at", address)
 		addressValue := address.String()
 		if address.To4() == nil {
@@ -942,9 +911,53 @@ func (h *Hub) initateConnectionWithError(remoteService *api.ServiceDetails, entr
 		}
 	}
 
-	// no connection could be estabished via any of the provided addresses
-	// because no service was reachable at any of the addresses
+	if entry.Host != "" && !hostMatchesConnectionAddress(entry.Host, addresses) {
+		logging.Log().Debug("trying to connect to", remoteService.SKI(), "at", entry.Host)
+		if err = h.connectFoundService(
+			remoteService,
+			entry.Host,
+			strconv.Itoa(entry.Port),
+			entry.Path,
+			requiredAuthority,
+		); err != nil {
+			if isOutgoingAttemptDenied(err) {
+				return false, err
+			}
+			logging.Log().Debugf("connection to %s failed: %s", remoteService.SKI(), err)
+		} else {
+			return true, nil
+		}
+	}
+
 	return false, err
+}
+
+func orderedConnectionAddresses(addresses []net.IP) []net.IP {
+	ordered := make([]net.IP, 0, len(addresses))
+	for _, address := range addresses {
+		if address.To4() != nil {
+			ordered = append(ordered, append(net.IP(nil), address...))
+		}
+	}
+	for _, address := range addresses {
+		if address.To4() == nil {
+			ordered = append(ordered, append(net.IP(nil), address...))
+		}
+	}
+	return ordered
+}
+
+func hostMatchesConnectionAddress(host string, addresses []net.IP) bool {
+	hostAddress := net.ParseIP(normalizeOutgoingAttemptHost(host))
+	if hostAddress == nil {
+		return false
+	}
+	for _, address := range addresses {
+		if address.Equal(hostAddress) {
+			return true
+		}
+	}
+	return false
 }
 
 // increase the connection attempt counter for the given ski

@@ -37,6 +37,62 @@ func TestIssue20ReconnectEndpointsPreferConcreteAddresses(t *testing.T) {
 	}
 	originalAddresses := cloneIssue20Addresses(entry.Addresses)
 
+	assertIssue20EndpointSweep(t, entry, []string{ipv4A, ipv4B, ipv6A, ipv6B, host})
+
+	if !reflect.DeepEqual(entry.Addresses, originalAddresses) {
+		t.Fatalf("endpoint sweep mutated mDNS addresses: got %v, want %v", entry.Addresses, originalAddresses)
+	}
+}
+
+func TestIssue20ReconnectEndpointFallbacks(t *testing.T) {
+	const remoteSKI = "1111111111111111111111111111111111111111"
+	tests := []struct {
+		name          string
+		entry         *api.MdnsEntry
+		expectedHosts []string
+	}{
+		{
+			name: "addresses without host",
+			entry: &api.MdnsEntry{
+				Ski:       remoteSKI,
+				Port:      12480,
+				Path:      "/ship/",
+				Addresses: []net.IP{net.ParseIP("2001:db8::20"), net.ParseIP("192.0.2.20")},
+			},
+			expectedHosts: []string{"192.0.2.20", "2001:db8::20"},
+		},
+		{
+			name: "host without addresses",
+			entry: &api.MdnsEntry{
+				Ski:  remoteSKI,
+				Host: "peer.local",
+				Port: 12480,
+				Path: "/ship/",
+			},
+			expectedHosts: []string{"peer.local"},
+		},
+		{
+			name: "concrete host duplicates address",
+			entry: &api.MdnsEntry{
+				Ski:       remoteSKI,
+				Host:      "192.0.2.30",
+				Port:      12480,
+				Path:      "/ship/",
+				Addresses: []net.IP{net.ParseIP("2001:db8::30"), net.ParseIP("192.0.2.30")},
+			},
+			expectedHosts: []string{"192.0.2.30", "2001:db8::30"},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			assertIssue20EndpointSweep(t, test.entry, test.expectedHosts)
+		})
+	}
+}
+
+func assertIssue20EndpointSweep(t *testing.T, entry *api.MdnsEntry, expectedHosts []string) {
+	t.Helper()
 	reader := &attemptAwareHubReader{}
 	hub := NewHub(
 		reader,
@@ -50,7 +106,7 @@ func TestIssue20ReconnectEndpointsPreferConcreteAddresses(t *testing.T) {
 	if err := hub.SetOutgoingAttemptGate(gate); err != nil {
 		t.Fatalf("install outgoing attempt gate: %v", err)
 	}
-	remote := hub.ServiceForSKI(remoteSKI)
+	remote := hub.ServiceForSKI(entry.Ski)
 	remote.SetTrusted(true)
 	dialer := &fakePeerDialer{err: errAttemptTestDial}
 	hub.dialer = dialer
@@ -62,7 +118,6 @@ func TestIssue20ReconnectEndpointsPreferConcreteAddresses(t *testing.T) {
 
 	calls, _ := dialer.snapshot()
 	requests, authorized, permits, _ := gate.snapshot()
-	expectedHosts := []string{ipv4A, ipv4B, ipv6A, ipv6B, host}
 	expectedCount := len(expectedHosts) * 2
 	if len(calls) != expectedCount || len(requests) != expectedCount ||
 		len(authorized) != expectedCount || len(permits) != expectedCount {
@@ -77,25 +132,21 @@ func TestIssue20ReconnectEndpointsPreferConcreteAddresses(t *testing.T) {
 	}
 
 	for endpointIndex, expectedHost := range expectedHosts {
-		for fallbackIndex, expectedPath := range []string{path, ""} {
+		for fallbackIndex, expectedPath := range []string{entry.Path, ""} {
 			index := endpointIndex*2 + fallbackIndex
-			expectedURL := "wss://" + net.JoinHostPort(expectedHost, fmt.Sprint(port)) + expectedPath
+			expectedURL := "wss://" + net.JoinHostPort(expectedHost, fmt.Sprint(entry.Port)) + expectedPath
 			if calls[index].url != expectedURL {
 				t.Fatalf("dial[%d] = %q, want %q", index, calls[index].url, expectedURL)
 			}
 			request := requests[index]
-			if request.RemoteSKI != remoteSKI ||
+			if request.RemoteSKI != entry.Ski ||
 				request.Endpoint.Host != expectedHost ||
-				request.Endpoint.Port != port ||
+				request.Endpoint.Port != uint16(entry.Port) ||
 				request.Path != expectedPath {
 				t.Fatalf("gate[%d] = %#v, want SKI=%s endpoint=%s:%d path=%q",
-					index, request, remoteSKI, expectedHost, port, expectedPath)
+					index, request, entry.Ski, expectedHost, entry.Port, expectedPath)
 			}
 		}
-	}
-
-	if !reflect.DeepEqual(entry.Addresses, originalAddresses) {
-		t.Fatalf("endpoint sweep mutated mDNS addresses: got %v, want %v", entry.Addresses, originalAddresses)
 	}
 }
 
