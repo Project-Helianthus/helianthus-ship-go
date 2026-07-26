@@ -7,6 +7,7 @@ import (
 	"net"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
 )
@@ -41,6 +42,73 @@ func TestIssue20ReconnectEndpointsPreferConcreteAddresses(t *testing.T) {
 
 	if !reflect.DeepEqual(entry.Addresses, originalAddresses) {
 		t.Fatalf("endpoint sweep mutated mDNS addresses: got %v, want %v", entry.Addresses, originalAddresses)
+	}
+}
+
+func TestIssue20ReconnectUsesObservedMdnsEndpoints(t *testing.T) {
+	const (
+		remoteSKI = "1111111111111111111111111111111111111111"
+		staleIPv4 = "198.51.100.99"
+	)
+	entry := &api.MdnsEntry{
+		Ski:       remoteSKI,
+		Host:      "peer.local",
+		Port:      12480,
+		Path:      "/ship/",
+		Addresses: []net.IP{net.ParseIP("2001:db8::50"), net.ParseIP("192.0.2.50")},
+	}
+	originalAddresses := cloneIssue20Addresses(entry.Addresses)
+
+	reader := &attemptAwareHubReader{}
+	mdns := &attemptTestMdns{}
+	hub := NewHub(
+		reader,
+		mdns,
+		0,
+		tls.Certificate{},
+		api.NewServiceDetails("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"),
+	)
+	t.Cleanup(hub.Shutdown)
+	gate := newScriptedAttemptGate(gatePermit)
+	if err := hub.SetOutgoingAttemptGate(gate); err != nil {
+		t.Fatalf("install outgoing attempt gate: %v", err)
+	}
+	service := hub.ServiceForSKI(remoteSKI)
+	service.SetTrusted(true)
+	service.SetIPv4(staleIPv4)
+	service.ConnectionStateDetail().SetState(api.ConnectionStateQueued)
+	dialer := &fakePeerDialer{err: errAttemptTestDial}
+	hub.dialer = dialer
+
+	hub.ReportMdnsEntries(map[string]*api.MdnsEntry{remoteSKI: entry}, true)
+	waitIssue20MdnsEffects(t, reader, gate, dialer, mdns, 6)
+
+	calls, _ := dialer.snapshot()
+	requests, _, _, _ := gate.snapshot()
+	expectedHosts := []string{
+		"192.0.2.50", "192.0.2.50",
+		"2001:db8::50", "2001:db8::50",
+		"peer.local", "peer.local",
+	}
+	for index, expectedHost := range expectedHosts {
+		expectedPath := "/ship/"
+		if index%2 != 0 {
+			expectedPath = ""
+		}
+		expectedURL := "wss://" + net.JoinHostPort(expectedHost, "12480") + expectedPath
+		if requests[index].Endpoint.Host != expectedHost || requests[index].Path != expectedPath {
+			t.Fatalf("gate[%d] = %#v, want host=%q path=%q",
+				index, requests[index], expectedHost, expectedPath)
+		}
+		if calls[index].url != expectedURL {
+			t.Fatalf("dial[%d] = %q, want %q", index, calls[index].url, expectedURL)
+		}
+	}
+	if !reflect.DeepEqual(entry.Addresses, originalAddresses) {
+		t.Fatalf("mDNS reconnect mutated observed addresses: got %v, want %v", entry.Addresses, originalAddresses)
+	}
+	if service.IPv4() != staleIPv4 {
+		t.Fatalf("reconnect changed configured IPv4 to %q, want %q", service.IPv4(), staleIPv4)
 	}
 }
 
@@ -123,6 +191,37 @@ func TestIssue20ReconnectEndpointFallbacks(t *testing.T) {
 			}
 		})
 	}
+}
+
+func waitIssue20MdnsEffects(
+	t *testing.T,
+	reader *attemptAwareHubReader,
+	gate *scriptedAttemptGate,
+	dialer *fakePeerDialer,
+	mdns *attemptTestMdns,
+	expected int,
+) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		calls, _ := dialer.snapshot()
+		requests, authorized, permits, _ := gate.snapshot()
+		terminals, _ := reader.snapshot()
+		announced, requested := mdns.counts()
+		if len(calls) == expected && len(requests) == expected &&
+			len(authorized) == expected && len(permits) == expected &&
+			len(terminals) == expected && announced == 1 && requested == 1 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	calls, _ := dialer.snapshot()
+	requests, authorized, permits, _ := gate.snapshot()
+	terminals, _ := reader.snapshot()
+	announced, requested := mdns.counts()
+	t.Fatalf("dial/gate/authorize/permit/terminal/announce/request = %d/%d/%d/%d/%d/%d/%d, want %d each and 1/1",
+		len(calls), len(requests), len(authorized), len(permits), len(terminals),
+		announced, requested, expected)
 }
 
 func assertIssue20EndpointSweep(t *testing.T, entry *api.MdnsEntry, expectedHosts []string) {

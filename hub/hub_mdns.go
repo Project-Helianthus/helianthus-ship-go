@@ -152,11 +152,6 @@ func (h *Hub) reportMdnsSnapshot(
 		}
 
 		service.SetAutoAccept(entry.Register)
-		if service.IPv4() != "" {
-			if ip := net.ParseIP(service.IPv4()); ip != nil {
-				entry.Addresses = []net.IP{ip}
-			}
-		}
 		h.coordinateConnectionInitations(entry.Ski, entry)
 	}
 
