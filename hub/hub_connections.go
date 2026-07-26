@@ -933,18 +933,32 @@ func (h *Hub) initateConnectionWithError(remoteService *api.ServiceDetails, entr
 }
 
 func orderedConnectionAddresses(addresses []net.IP) []net.IP {
-	ordered := make([]net.IP, 0, len(addresses))
+	ipv4 := make([]net.IP, 0, len(addresses))
+	ipv6 := make([]net.IP, 0, len(addresses))
+	seen := make(map[string]struct{}, len(addresses))
 	for _, address := range addresses {
-		if address.To4() != nil {
-			ordered = append(ordered, append(net.IP(nil), address...))
+		canonical := address.To4()
+		family := byte(4)
+		if canonical == nil {
+			canonical = address.To16()
+			family = 6
+		}
+		if canonical == nil {
+			continue
+		}
+		key := string(append([]byte{family}, canonical...))
+		if _, exists := seen[key]; exists {
+			continue
+		}
+		seen[key] = struct{}{}
+		cloned := append(net.IP(nil), address...)
+		if family == 4 {
+			ipv4 = append(ipv4, cloned)
+		} else {
+			ipv6 = append(ipv6, cloned)
 		}
 	}
-	for _, address := range addresses {
-		if address.To4() == nil {
-			ordered = append(ordered, append(net.IP(nil), address...))
-		}
-	}
-	return ordered
+	return append(ipv4, ipv6...)
 }
 
 func hostMatchesConnectionAddress(host string, addresses []net.IP) bool {

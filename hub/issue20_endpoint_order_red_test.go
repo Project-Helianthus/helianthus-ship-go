@@ -82,11 +82,45 @@ func TestIssue20ReconnectEndpointFallbacks(t *testing.T) {
 			},
 			expectedHosts: []string{"192.0.2.30", "2001:db8::30"},
 		},
+		{
+			name: "invalid addresses have no effects",
+			entry: &api.MdnsEntry{
+				Ski:       remoteSKI,
+				Port:      12480,
+				Path:      "/ship/",
+				Addresses: []net.IP{nil, {}, {0x01, 0x02, 0x03}},
+			},
+		},
+		{
+			name: "canonical duplicates keep first family occurrence",
+			entry: &api.MdnsEntry{
+				Ski:  remoteSKI,
+				Host: "[2001:db8::40]",
+				Port: 12480,
+				Path: "/ship/",
+				Addresses: []net.IP{
+					net.ParseIP("2001:db8::40"),
+					net.IPv4(192, 0, 2, 40),
+					net.IP{192, 0, 2, 40},
+					net.ParseIP("2001:db8::40"),
+					net.IP{192, 0, 2, 41},
+					net.IPv4(192, 0, 2, 41),
+					net.ParseIP("2001:db8::41"),
+					net.ParseIP("2001:db8::41"),
+				},
+			},
+			expectedHosts: []string{"192.0.2.40", "192.0.2.41", "2001:db8::40", "2001:db8::41"},
+		},
 	}
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			originalAddresses := cloneIssue20Addresses(test.entry.Addresses)
 			assertIssue20EndpointSweep(t, test.entry, test.expectedHosts)
+			if !reflect.DeepEqual(test.entry.Addresses, originalAddresses) {
+				t.Fatalf("endpoint sweep mutated mDNS addresses: got %v, want %v",
+					test.entry.Addresses, originalAddresses)
+			}
 		})
 	}
 }
@@ -112,21 +146,28 @@ func assertIssue20EndpointSweep(t *testing.T, entry *api.MdnsEntry, expectedHost
 	hub.dialer = dialer
 
 	success, err := hub.initateConnectionWithError(remote, entry)
-	if success || !errors.Is(err, errAttemptTestDial) {
+	if len(expectedHosts) == 0 {
+		if success || err != nil {
+			t.Fatalf("empty endpoint sweep = success:%t err:%v, want false/nil", success, err)
+		}
+	} else if success || !errors.Is(err, errAttemptTestDial) {
 		t.Fatalf("failed endpoint sweep = success:%t err:%v, want false/%v", success, err, errAttemptTestDial)
 	}
 
 	calls, _ := dialer.snapshot()
 	requests, authorized, permits, _ := gate.snapshot()
+	terminals, _ := reader.snapshot()
 	expectedCount := len(expectedHosts) * 2
 	if len(calls) != expectedCount || len(requests) != expectedCount ||
-		len(authorized) != expectedCount || len(permits) != expectedCount {
+		len(authorized) != expectedCount || len(permits) != expectedCount ||
+		len(terminals) != expectedCount {
 		t.Fatalf(
-			"dial/gate/authorize/permit counts = %d/%d/%d/%d, want %d each",
+			"dial/gate/authorize/permit/terminal counts = %d/%d/%d/%d/%d, want %d each",
 			len(calls),
 			len(requests),
 			len(authorized),
 			len(permits),
+			len(terminals),
 			expectedCount,
 		)
 	}
@@ -151,9 +192,16 @@ func assertIssue20EndpointSweep(t *testing.T, entry *api.MdnsEntry, expectedHost
 }
 
 func cloneIssue20Addresses(addresses []net.IP) []net.IP {
+	if addresses == nil {
+		return nil
+	}
 	cloned := make([]net.IP, len(addresses))
 	for index, address := range addresses {
-		cloned[index] = append(net.IP(nil), address...)
+		if address == nil {
+			continue
+		}
+		cloned[index] = make(net.IP, len(address))
+		copy(cloned[index], address)
 	}
 	return cloned
 }
