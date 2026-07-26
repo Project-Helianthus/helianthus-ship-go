@@ -312,9 +312,9 @@ func TestAuthorizedFailuresTerminalizeBeforeEndpointFallback(t *testing.T) {
 	}
 	requests, terminals, counts, active := lifecycle.snapshotLifecycle()
 	wantHosts := []string{
-		"peer.local", "peer.local",
 		"192.0.2.10", "192.0.2.10",
 		"2001:db8::10", "2001:db8::10",
+		"peer.local", "peer.local",
 	}
 	wantPaths := []string{"/ship/", "", "/ship/", "", "/ship/", ""}
 	if len(requests) != len(wantHosts) || len(terminals) != len(wantHosts) || dialer.count() != len(wantHosts) || active != 0 {
