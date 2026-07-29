@@ -130,7 +130,10 @@ func NewConnectionHandler(
 	localShipID,
 	remoteSki,
 	remoteShipId string) *ShipConnection {
-	return newConnectionHandler(dataProvider, dataHandler, role, localShipID, remoteSki, remoteShipId, true)
+	// The Hub must register inbound ownership before read-pump callbacks can close it.
+	connection := newConnectionHandler(dataProvider, dataHandler, role, localShipID, remoteSki, remoteShipId, false)
+	connection.initializeDataHandlerOnRun = true
+	return connection
 }
 
 // NewOutgoingConnectionHandler creates a connection carrying one exact authorized attempt.
@@ -272,8 +275,11 @@ func (c *ShipConnection) reportShipHandshakeStateUpdate(state model.ShipState) {
 // start SHIP communication
 func (c *ShipConnection) Run() {
 	if c.initializeDataHandlerOnRun {
+		if !c.pairingEffectAllowed() {
+			return
+		}
 		c.initializeDataProcessing()
-		if c.outgoingAttemptContext.Err() != nil {
+		if c.hasOutgoingAttempt && c.outgoingAttemptContext.Err() != nil {
 			c.CloseConnection(false, 0, "outgoing attempt canceled")
 			return
 		}
