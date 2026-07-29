@@ -290,9 +290,8 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	dataHandler := ws.NewWebsocketConnection(conn, remoteService.SKI())
 	shipConnection := ship.NewConnectionHandler(h, dataHandler, ship.ShipRoleServer,
 		h.localService.ShipID(), remoteService.SKI(), remoteService.ShipID())
-	shipConnection.Run()
-
 	h.registerConnection(shipConnection)
+	shipConnection.Run()
 }
 
 // return if there is a connection for a SKI
@@ -783,8 +782,8 @@ func (h *Hub) keepThisConnection(conn *websocket.Conn, incomingRequest bool, rem
 	// different approach: The connection initiated by the higher SKI will be kept
 
 	remoteSKI := remoteService.SKI()
-	existingC := h.connectionForSKI(remoteSKI)
-	if existingC == nil {
+	existingC, outgoingInitiating := h.connectionStateForSKI(remoteSKI)
+	if existingC == nil && (!incomingRequest || !outgoingInitiating) {
 		return true
 	}
 
@@ -796,6 +795,9 @@ func (h *Hub) keepThisConnection(conn *websocket.Conn, incomingRequest bool, rem
 	}
 
 	if keep {
+		if existingC == nil {
+			return true
+		}
 		// we have an existing connection
 		// so keep the new (most recent) and close the old one
 		logging.Log().Debug("closing existing double connection")
@@ -1208,12 +1210,13 @@ func (h *Hub) registerOutgoingConnection(
 
 // return the connection for a specific SKI
 func (h *Hub) connectionForSKI(ski string) api.ShipConnectionInterface {
+	connection, _ := h.connectionStateForSKI(ski)
+	return connection
+}
+
+func (h *Hub) connectionStateForSKI(ski string) (api.ShipConnectionInterface, bool) {
 	h.muxCon.Lock()
 	defer h.muxCon.Unlock()
 
-	con, ok := h.connections[ski]
-	if !ok {
-		return nil
-	}
-	return con
+	return h.connections[ski], h.connectionsInitiating[ski]
 }
