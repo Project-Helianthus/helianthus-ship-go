@@ -275,6 +275,9 @@ func (c *ShipConnection) reportShipHandshakeStateUpdate(state model.ShipState) {
 // start SHIP communication
 func (c *ShipConnection) Run() {
 	if c.initializeDataHandlerOnRun {
+		if !c.pairingEffectAllowed() {
+			return
+		}
 		c.initializeDataProcessing()
 		if c.hasOutgoingAttempt && c.outgoingAttemptContext.Err() != nil {
 			c.CloseConnection(false, 0, "outgoing attempt canceled")

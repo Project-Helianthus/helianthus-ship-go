@@ -40,6 +40,8 @@ type WebsocketConnection struct {
 	muxConnClosed sync.Mutex
 	muxShipWrite  sync.Mutex
 	muxConWrite   sync.Mutex
+	muxLifecycle  sync.Mutex
+	runOnce       sync.Once
 	shutdownOnce  sync.Once
 }
 
@@ -49,6 +51,8 @@ func NewWebsocketConnection(conn *websocket.Conn, remoteSki string) *WebsocketCo
 		conn:                  conn,
 		remoteSki:             remoteSki,
 		connectionClosedError: nil,
+		shipWriteChannel:      make(chan []byte, 1),
+		closeChannel:          make(chan struct{}, 1),
 	}
 }
 
@@ -80,11 +84,15 @@ func (w *WebsocketConnection) isConnClosed() bool {
 }
 
 func (w *WebsocketConnection) run() {
-	w.shipWriteChannel = make(chan []byte, 1) // Send outgoing ship messages
-	w.closeChannel = make(chan struct{}, 1)   // Listen to close events
-
-	go w.readShipPump()
-	go w.writeShipPump()
+	w.runOnce.Do(func() {
+		w.muxLifecycle.Lock()
+		defer w.muxLifecycle.Unlock()
+		if w.isConnClosed() {
+			return
+		}
+		go w.readShipPump()
+		go w.writeShipPump()
+	})
 }
 
 // writePump pumps messages from the SPINE and SHIP writeChannels to the websocket connection
@@ -227,6 +235,8 @@ func (w *WebsocketConnection) checkWebsocketMessage(msgType int, data []byte) er
 // close the current websocket connection
 func (w *WebsocketConnection) close() {
 	w.shutdownOnce.Do(func() {
+		w.muxLifecycle.Lock()
+		defer w.muxLifecycle.Unlock()
 		if w.isConnClosed() {
 			return
 		}

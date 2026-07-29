@@ -290,7 +290,9 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	dataHandler := ws.NewWebsocketConnection(conn, remoteService.SKI())
 	shipConnection := ship.NewConnectionHandler(h, dataHandler, ship.ShipRoleServer,
 		h.localService.ShipID(), remoteService.SKI(), remoteService.ShipID())
-	h.registerConnection(shipConnection)
+	if !h.registerConnection(shipConnection) {
+		return
+	}
 	shipConnection.Run()
 }
 
@@ -1055,17 +1057,18 @@ func (h *Hub) isConnectionAttemptRunning(ski string) bool {
 }
 
 // register a new ship Connection
-func (h *Hub) registerConnection(connection api.ShipConnectionInterface) {
+func (h *Hub) registerConnection(connection api.ShipConnectionInterface) bool {
 	remoteSKI := connection.RemoteSKI()
 
 	h.muxCon.Lock()
 	if h.hasShutdown {
 		h.muxCon.Unlock()
 		connection.CloseConnection(false, 0, "hub shutdown")
-		return
+		return false
 	}
 	h.connections[remoteSKI] = connection
 	h.muxCon.Unlock()
+	return true
 }
 
 func (h *Hub) reserveInboundPairingConnection(ski string) *inboundPairingReservation {

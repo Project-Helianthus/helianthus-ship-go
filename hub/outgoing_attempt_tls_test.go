@@ -563,6 +563,12 @@ func (w *registrationTestWriter) IsDataConnectionClosed() (bool, error) {
 	return true, errors.New("closed")
 }
 
+func (w *registrationTestWriter) snapshot() (api.WebsocketDataReaderInterface, int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.reader, w.closed
+}
+
 func TestAttemptCancellationBeforeAndAfterRegistrationCannotRemainRegistered(t *testing.T) {
 	tests := []struct {
 		name         string
