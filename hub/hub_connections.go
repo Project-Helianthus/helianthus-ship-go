@@ -281,16 +281,11 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// don't allow a second connection
-	if !h.keepThisConnection(conn, true, remoteService) {
-		_ = conn.Close()
-		return
-	}
-
 	dataHandler := ws.NewWebsocketConnection(conn, remoteService.SKI())
 	shipConnection := ship.NewConnectionHandler(h, dataHandler, ship.ShipRoleServer,
 		h.localService.ShipID(), remoteService.SKI(), remoteService.ShipID())
-	if !h.registerConnection(shipConnection) {
+	if !h.registerInboundConnection(shipConnection) {
+		_ = conn.Close()
 		return
 	}
 	shipConnection.Run()
@@ -1071,6 +1066,38 @@ func (h *Hub) registerConnection(connection api.ShipConnectionInterface) bool {
 	return true
 }
 
+func (h *Hub) registerInboundConnection(connection api.ShipConnectionInterface) bool {
+	remoteSKI := connection.RemoteSKI()
+
+	h.muxCon.Lock()
+	if h.hasShutdown {
+		h.muxCon.Unlock()
+		return false
+	}
+	existing := h.connections[remoteSKI]
+	if (existing != nil || h.connectionsInitiating[remoteSKI]) &&
+		remoteSKI <= h.localService.SKI() {
+		h.muxCon.Unlock()
+		return false
+	}
+	if existing != nil &&
+		h.supersededConnectionCountForSKILocked(remoteSKI) >= maximumSupersededConnectionsPerSKI {
+		h.muxCon.Unlock()
+		return false
+	}
+	h.connections[remoteSKI] = connection
+	if existing != nil {
+		h.supersededConnections[existing] = struct{}{}
+	}
+	h.muxCon.Unlock()
+
+	if existing != nil {
+		h.blockOutboundAttemptCallbacks(existing)
+		existing.CloseConnection(false, 0, "replaced by SHIP SKI ordering")
+	}
+	return true
+}
+
 func (h *Hub) reserveInboundPairingConnection(ski string) *inboundPairingReservation {
 	h.muxReg.Lock()
 	h.muxCon.Lock()
@@ -1195,19 +1222,38 @@ func (h *Hub) registerOutgoingConnection(
 	remoteSKI := connection.RemoteSKI()
 
 	h.muxCon.Lock()
-	defer h.muxCon.Unlock()
-
 	if h.hasShutdown || attemptContext.Err() != nil {
+		h.muxCon.Unlock()
 		return outgoingConnectionRegistrationRejected
 	}
 	if reservation := h.inboundPairingReservations[remoteSKI]; reservation != nil {
 		if requiredAuthority != nil && reservation.authority == requiredAuthority {
 			h.supersededConnections[connection] = struct{}{}
+			h.muxCon.Unlock()
 			return outgoingConnectionRegistrationInboundHandoff
 		}
+		h.muxCon.Unlock()
 		return outgoingConnectionRegistrationRejected
 	}
+	existing := h.connections[remoteSKI]
+	if existing != nil {
+		if h.localService.SKI() <= remoteSKI {
+			h.supersededConnections[connection] = struct{}{}
+			h.muxCon.Unlock()
+			return outgoingConnectionRegistrationInboundHandoff
+		}
+		if h.supersededConnectionCountForSKILocked(remoteSKI) >= maximumSupersededConnectionsPerSKI {
+			h.muxCon.Unlock()
+			return outgoingConnectionRegistrationRejected
+		}
+		h.supersededConnections[existing] = struct{}{}
+	}
 	h.connections[remoteSKI] = connection
+	h.muxCon.Unlock()
+	if existing != nil {
+		h.blockOutboundAttemptCallbacks(existing)
+		existing.CloseConnection(false, 0, "replaced by SHIP SKI ordering")
+	}
 	return outgoingConnectionRegistrationAccepted
 }
 
