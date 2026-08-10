@@ -88,6 +88,7 @@ func TestOutboundPairingAPIIsAbsentFromProductionTree(t *testing.T) {
 }
 
 func TestDiscoveredMdnsEntriesAreTheOnlyConnectionInitiationSource(t *testing.T) {
+	// Unknown production endpoint feeds cannot be ruled out behaviorally.
 	root, fset, files := loadProductionFiles(t)
 	typedPackages := loadTypedProductionPackages(t, root, fset, files)
 	discovery := analyzeTypedDiscoveryPackages(typedPackages)
@@ -291,6 +292,7 @@ func TestCanonicalModuleIdentityAndSelfImports(t *testing.T) {
 }
 
 func TestProductionDialInventoryAndAttemptPropagation(t *testing.T) {
+	// Unknown production dial paths cannot be ruled out behaviorally.
 	_, fset, files := loadProductionFiles(t)
 
 	var directDial []string
