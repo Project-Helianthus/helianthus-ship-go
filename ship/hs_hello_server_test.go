@@ -85,7 +85,7 @@ func (s *HelloSuite) BeforeTest(suiteName, testName string) {
 }
 
 func (s *HelloSuite) AfterTest(suiteName, testName string) {
-	s.sut.stopHandshakeTimer()
+	s.sut.stopHandshakeTimerAndWait()
 	assert.Equal(s.T(), false, s.sut.getHandshakeTimerRunning())
 }
 

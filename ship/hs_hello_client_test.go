@@ -84,7 +84,7 @@ func (s *HelloClientSuite) BeforeTest(suiteName, testName string) {
 }
 
 func (s *HelloClientSuite) AfterTest(suiteName, testName string) {
-	s.sut.stopHandshakeTimer()
+	s.sut.stopHandshakeTimerAndWait()
 }
 
 func (s *HelloClientSuite) Test_InitialState() {

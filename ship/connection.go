@@ -69,11 +69,16 @@ type ShipConnection struct {
 	handshakeTimerRunning  bool
 	handshakeTimerType     timeoutTimerType
 	handshakeTimerStopChan chan struct{}
+	handshakeTimerDoneChan chan struct{}
 	handshakeTimerMux      sync.Mutex
+	handshakeTimerIdle     *sync.Cond
+	handshakeTimerActive   int
 
 	lastReceivedWaitingValue time.Duration // required for Prolong-Request-Reply-Timer
 
 	shutdownOnce sync.Once
+	shutdownChan chan struct{}
+	shipWriteMux sync.Mutex
 
 	dataHandlerInitOnce        sync.Once
 	outgoingAttemptTerminal    sync.Once
@@ -189,9 +194,9 @@ func newConnectionHandler(
 		remoteShipID: remoteShipId,
 		smeState:     model.CmiStateInitStart,
 		smeError:     nil,
+		shutdownChan: make(chan struct{}),
 	}
-
-	ship.handshakeTimerStopChan = make(chan struct{})
+	ship.handshakeTimerIdle = sync.NewCond(&ship.handshakeTimerMux)
 
 	if initializeDataHandler {
 		ship.initializeDataProcessing()
@@ -463,9 +468,12 @@ func (c *ShipConnection) publishPairingApproved() bool {
 // close this ship connection
 func (c *ShipConnection) CloseConnection(safe bool, code int, reason string) {
 	closeClaimed := false
+	c.shipWriteMux.Lock()
 	c.shutdownOnce.Do(func() {
 		closeClaimed = true
+		close(c.shutdownChan)
 	})
+	c.shipWriteMux.Unlock()
 	if !closeClaimed {
 		return
 	}
@@ -497,6 +505,26 @@ func (c *ShipConnection) closeConnection(safe bool, code int, reason string) {
 		state == model.SmeHelloStateRemoteAbortDone ||
 		state == model.SmeHelloStateRejected
 
+	finish := func() {
+		c.finishCloseConnection(safe, code, reason, handshakeEnd, state)
+	}
+	if c.handshakeTimerCallbacksActive() {
+		go func() {
+			c.stopHandshakeTimerAndWait()
+			c.runPairingEffect(finish, false)
+		}()
+		return
+	}
+	finish()
+}
+
+func (c *ShipConnection) finishCloseConnection(
+	safe bool,
+	code int,
+	reason string,
+	handshakeEnd bool,
+	state model.ShipMessageExchangeState,
+) {
 	// this may not be used for Connection Data Exchange is entered!
 	if safe && state == model.SmeStateComplete {
 		// SHIP 13.4.7: Connection Termination Announce
@@ -508,7 +536,7 @@ func (c *ShipConnection) closeConnection(safe bool, code int, reason string) {
 			},
 		}
 
-		_ = c.sendShipModel(model.MsgTypeEnd, closeMessage)
+		_ = c.sendShipModelDuringClose(model.MsgTypeEnd, closeMessage)
 
 		go func() {
 			// wait a bit to let it send
@@ -528,6 +556,15 @@ func (c *ShipConnection) closeConnection(safe bool, code int, reason string) {
 	c.dataWriter.CloseDataConnection(closeCode, reason)
 
 	c.reportConnectionClosed(handshakeEnd)
+}
+
+func (c *ShipConnection) shutdownRequested() bool {
+	select {
+	case <-c.shutdownChan:
+		return true
+	default:
+		return false
+	}
 }
 
 var _ api.ShipConnectionDataWriterInterface = (*ShipConnection)(nil)
@@ -771,7 +808,7 @@ func (c *ShipConnection) sendSpineData(data []byte) error {
 	shipMsg := []byte{model.MsgTypeData}
 	shipMsg = append(shipMsg, eebusMsg...)
 
-	err = c.dataWriter.WriteMessageToWebsocketConnection(shipMsg)
+	err = c.writeShipMessage(shipMsg, false)
 	if err != nil {
 		logging.Log().Debug("error sending message: ", err)
 		return err
@@ -782,17 +819,36 @@ func (c *ShipConnection) sendSpineData(data []byte) error {
 
 // send a json message for a provided model to the websocket connection
 func (c *ShipConnection) sendShipModel(typ byte, model interface{}) error {
+	return c.sendShipModelWithClosing(typ, model, false)
+}
+
+func (c *ShipConnection) sendShipModelDuringClose(typ byte, model interface{}) error {
+	return c.sendShipModelWithClosing(typ, model, true)
+}
+
+func (c *ShipConnection) sendShipModelWithClosing(typ byte, model interface{}, allowClosing bool) error {
 	shipMsg, err := c.shipMessage(typ, model)
 	if err != nil {
 		return err
 	}
 
-	err = c.dataWriter.WriteMessageToWebsocketConnection(shipMsg)
+	err = c.writeShipMessage(shipMsg, allowClosing)
 	if err != nil {
 		return err
 	}
 
 	return nil
+}
+
+var errConnectionClosing = errors.New("connection is closing")
+
+func (c *ShipConnection) writeShipMessage(message []byte, allowClosing bool) error {
+	c.shipWriteMux.Lock()
+	defer c.shipWriteMux.Unlock()
+	if !allowClosing && c.shutdownRequested() {
+		return errConnectionClosing
+	}
+	return c.dataWriter.WriteMessageToWebsocketConnection(message)
 }
 
 // Process a SHIP Json message

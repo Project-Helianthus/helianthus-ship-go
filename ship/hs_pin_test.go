@@ -83,7 +83,7 @@ func (s *PinSuite) BeforeTest(suiteName, testName string) {
 }
 
 func (s *PinSuite) AfterTest(suiteName, testName string) {
-	s.sut.stopHandshakeTimer()
+	s.sut.stopHandshakeTimerAndWait()
 }
 
 func (s *PinSuite) Test_Init() {
