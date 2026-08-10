@@ -98,10 +98,7 @@ func (w *WebsocketConnection) run() {
 // writePump pumps messages from the SPINE and SHIP writeChannels to the websocket connection
 func (w *WebsocketConnection) writeShipPump() {
 	ticker := time.NewTicker(pingPeriod)
-	defer func() {
-		ticker.Stop()
-		close(w.shipWriteChannel)
-	}()
+	defer ticker.Stop()
 
 	for {
 		select {
@@ -150,6 +147,7 @@ func (w *WebsocketConnection) handlePing() {
 
 func (w *WebsocketConnection) closeWithError(err error, reason string) {
 	logging.Log().Debug(w.remoteSki, reason, err)
+	w.close()
 	w.setConnClosedError(err)
 	w.dataProcessing.ReportConnectionError(err)
 }
@@ -268,8 +266,23 @@ func (w *WebsocketConnection) WriteMessageToWebsocketConnection(message []byte) 
 		return errors.New(connIsClosedError)
 	}
 
-	w.shipWriteChannel <- message
-	return nil
+	select {
+	case <-w.closeChannel:
+		return errors.New(connIsClosedError)
+	case w.shipWriteChannel <- message:
+	}
+
+	// A concurrent close may win immediately after the queue admission. In that
+	// case the pump discards the message and the caller must not observe success.
+	if w.isConnClosed() {
+		return errors.New(connIsClosedError)
+	}
+	select {
+	case <-w.closeChannel:
+		return errors.New(connIsClosedError)
+	default:
+		return nil
+	}
 }
 
 // make sure websocket Write is only called once at a time

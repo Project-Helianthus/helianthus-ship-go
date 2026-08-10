@@ -18,14 +18,14 @@ import (
 )
 
 type teardownBlockingReader struct {
-	writeDone <-chan error
+	writerReleased <-chan struct{}
 }
 
 func (*teardownBlockingReader) HandleIncomingWebsocketMessage([]byte) {}
 
 func (r *teardownBlockingReader) ReportConnectionError(error) {
 	select {
-	case <-r.writeDone:
+	case <-r.writerReleased:
 	case <-time.After(time.Second):
 	}
 }
@@ -35,8 +35,10 @@ func TestTerminalWriteFailureUnblocksFullQueueBeforeCallback(t *testing.T) {
 	connection.shipWriteChannel <- []byte("queued")
 
 	writeDone := make(chan error, 1)
+	writerReleased := make(chan struct{})
 	go func() {
 		writeDone <- connection.WriteMessageToWebsocketConnection([]byte("blocked"))
+		close(writerReleased)
 	}()
 
 	deadline := time.Now().Add(time.Second)
@@ -48,7 +50,7 @@ func TestTerminalWriteFailureUnblocksFullQueueBeforeCallback(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 
-	connection.dataProcessing = &teardownBlockingReader{writeDone: writeDone}
+	connection.dataProcessing = &teardownBlockingReader{writerReleased: writerReleased}
 	terminalErr := errors.New("terminal websocket write failure")
 	closeDone := make(chan struct{})
 	go func() {
