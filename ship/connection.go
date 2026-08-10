@@ -55,7 +55,8 @@ type ShipConnection struct {
 	shutdownOnce sync.Once
 
 	// buffer for SPINE messages that came in before the handshake was completed
-	spineBuffer [][]byte
+	spineBuffer   [][]byte
+	spineDraining bool
 
 	mux       sync.Mutex
 	bufferMux sync.Mutex

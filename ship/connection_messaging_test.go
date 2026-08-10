@@ -6,6 +6,7 @@ import (
 
 	"github.com/enbility/ship-go/model"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/suite"
 )
 
@@ -60,9 +61,8 @@ func (s *ConnectionMessagingSuite) TestHandleIncomingShipMessage() {
 
 	s.sut.HandleIncomingWebsocketMessage(msg)
 
-	s.sut.dataReader = s.shipConnectionReader
-
-	s.sut.processBufferedSpineMessages()
+	s.infoProvider.EXPECT().SetupRemoteService(mock.Anything, s.sut).Return(s.shipConnectionReader).Once()
+	s.sut.approveHandshake()
 
 	s.sut.HandleIncomingWebsocketMessage(msg)
 }

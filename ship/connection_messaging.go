@@ -42,17 +42,57 @@ func (c *ShipConnection) shipModelFromMessage(message []byte) (*model.ShipData, 
 	return &data, nil
 }
 
-// processBufferedSpineMessages processes any SPINE messages that came in before the handshake completed
-// this will be called once the handshake is completed and spineDataProcessing is set
-func (c *ShipConnection) processBufferedSpineMessages() {
+// installSpineDataReader makes the completed handshake reader visible and starts
+// the same serialized drain path used by post-handshake arrivals.
+func (c *ShipConnection) installSpineDataReader(reader api.ShipConnectionDataReaderInterface) {
 	c.bufferMux.Lock()
-	defer c.bufferMux.Unlock()
-
-	for _, item := range c.spineBuffer {
-		c.dataReader.HandleShipPayloadMessage(item)
+	c.dataReader = reader
+	shouldDrain := reader != nil && !c.spineDraining && len(c.spineBuffer) > 0
+	if shouldDrain {
+		c.spineDraining = true
 	}
+	c.bufferMux.Unlock()
 
-	c.spineBuffer = nil
+	if shouldDrain {
+		c.drainSpineMessages()
+	}
+}
+
+// queueSpinePayload serializes all SPINE callbacks. The goroutine that changes
+// spineDraining from false to true owns the drain until the queue is empty.
+func (c *ShipConnection) queueSpinePayload(payload []byte) {
+	c.bufferMux.Lock()
+	c.spineBuffer = append(c.spineBuffer, payload)
+	shouldDrain := c.dataReader != nil && !c.spineDraining
+	if shouldDrain {
+		c.spineDraining = true
+	}
+	c.bufferMux.Unlock()
+
+	if shouldDrain {
+		c.drainSpineMessages()
+	}
+}
+
+func (c *ShipConnection) drainSpineMessages() {
+	for {
+		c.bufferMux.Lock()
+		if c.dataReader == nil || len(c.spineBuffer) == 0 {
+			if len(c.spineBuffer) == 0 {
+				c.spineBuffer = nil
+			}
+			c.spineDraining = false
+			c.bufferMux.Unlock()
+			return
+		}
+		reader := c.dataReader
+		payload := c.spineBuffer[0]
+		c.spineBuffer[0] = nil
+		c.spineBuffer = c.spineBuffer[1:]
+		c.bufferMux.Unlock()
+
+		reader.HandleShipPayloadMessage(payload)
+	}
 }
 
 // HandleIncomingWebsocketMessage routes the incoming message to either SHIP or SPINE message handlers
@@ -68,18 +108,7 @@ func (c *ShipConnection) HandleIncomingWebsocketMessage(message []byte) {
 		return
 	}
 
-	if c.dataReader == nil {
-		// buffer message for processing once the handshake is completed
-		c.bufferMux.Lock()
-		defer c.bufferMux.Unlock()
-
-		c.spineBuffer = append(c.spineBuffer, []byte(data.Data.Payload))
-
-		return
-	}
-
-	// pass the payload to the SPINE read handler
-	c.dataReader.HandleShipPayloadMessage([]byte(data.Data.Payload))
+	c.queueSpinePayload([]byte(data.Data.Payload))
 }
 
 // hasSpineDatagram checks whether the provided message is a SHIP message

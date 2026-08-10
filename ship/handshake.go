@@ -216,10 +216,10 @@ func (c *ShipConnection) setAndHandleState(state model.ShipMessageExchangeState)
 // SHIP handshake is approved, now set the new state and the SPINE read handler
 func (c *ShipConnection) approveHandshake() {
 	// Report to SPINE local device about this remote device connection
-	c.dataReader = c.infoProvider.SetupRemoteService(c.remoteSKI, c)
+	reader := c.infoProvider.SetupRemoteService(c.remoteSKI, c)
 	c.stopTimerSafe()
 	c.setState(model.SmeStateComplete, nil)
-	c.processBufferedSpineMessages()
+	c.installSpineDataReader(reader)
 }
 
 // end the handshake process because of an error
