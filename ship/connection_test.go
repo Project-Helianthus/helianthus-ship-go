@@ -29,8 +29,14 @@ func (s *ConnectionSuite) AfterTest(_, _ string) {
 func (s *ConnectionSuite) TestStopHandshakeTimerAndWaitJoinsAdmittedTimeout() {
 	callbackEntered := make(chan struct{})
 	releaseCallback := make(chan struct{})
+	connectionClosed := make(chan struct{})
 	s.sut.infoProvider = &concurrentConnectionInfoProvider{
 		closed: func(api.ShipConnectionInterface, bool) {
+			close(connectionClosed)
+		},
+	}
+	s.sut.testHooks = &shipConnectionTestHooks{
+		beforeHandshakeErrorState: func() {
 			close(callbackEntered)
 			<-releaseCallback
 		},
@@ -52,6 +58,7 @@ func (s *ConnectionSuite) TestStopHandshakeTimerAndWaitJoinsAdmittedTimeout() {
 	}
 	close(releaseCallback)
 	waitForConnectionSignal(s.T(), waitComplete, "timer teardown barrier")
+	waitForConnectionSignal(s.T(), connectionClosed, "connection finalization")
 }
 
 func (s *ConnectionSuite) TestStopHandshakeTimerAndWaitCancelsTimerSpawnedByCallback() {
@@ -75,6 +82,40 @@ func (s *ConnectionSuite) TestStopHandshakeTimerAndWaitCancelsTimerSpawnedByCall
 	}()
 	close(releaseCallback)
 	waitForConnectionSignal(s.T(), waitComplete, "replacement timer teardown")
+}
+
+func (s *ConnectionSuite) TestCloseWaitsToReleaseDependenciesUntilAdmittedTimeoutReturns() {
+	callbackEntered := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	connectionClosed := make(chan struct{})
+	s.sut.infoProvider = &concurrentConnectionInfoProvider{
+		allow: func(string) bool {
+			close(callbackEntered)
+			<-releaseCallback
+			return true
+		},
+		closed: func(api.ShipConnectionInterface, bool) {
+			close(connectionClosed)
+		},
+	}
+	s.sut.setState(model.SmeHelloStatePendingListen, nil)
+	s.sut.setHandshakeTimer(timeoutTimerTypeWaitForReady, time.Millisecond)
+
+	waitForConnectionSignal(s.T(), callbackEntered, "admitted trust callback")
+	s.sut.CloseConnection(false, 4001, "terminal during trust callback")
+	assert.True(s.T(), s.sut.pairingTerminal)
+	select {
+	case <-connectionClosed:
+		s.T().Fatal("connection dependencies released before admitted callback completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(releaseCallback)
+	waitForConnectionSignal(s.T(), connectionClosed, "connection dependency teardown")
+	assert.False(s.T(), s.sut.getHandshakeTimerRunning())
+	s.mux.Lock()
+	defer s.mux.Unlock()
+	assert.Empty(s.T(), s.sentMessage)
 }
 
 type ConnectionSuite struct {

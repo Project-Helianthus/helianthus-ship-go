@@ -48,7 +48,11 @@ func (c *ShipConnection) handshakeHello_ReadyListen(timeout bool, message []byte
 
 		// if we got a prolongation request, accept it
 		if *hello.ProlongationRequest {
-			if c.infoProvider.AllowWaitingForTrust(c.remoteShipID) {
+			allowed := c.infoProvider.AllowWaitingForTrust(c.remoteShipID)
+			if c.shutdownRequested() {
+				return
+			}
+			if allowed {
 				// re-init timer
 				c.setHandshakeTimer(timeoutTimerTypeWaitForReady, tHelloInit)
 			}
@@ -103,7 +107,11 @@ func (c *ShipConnection) handshakeHello_PendingInit() {
 
 	c.setState(model.SmeHelloStatePendingListen, nil)
 
-	if !c.infoProvider.AllowWaitingForTrust(c.remoteSKI) {
+	allowed := c.infoProvider.AllowWaitingForTrust(c.remoteSKI)
+	if c.shutdownRequested() {
+		return
+	}
+	if !allowed {
 		c.setAndHandleState(model.SmeHelloStateAbort)
 	}
 }
@@ -113,7 +121,11 @@ func (c *ShipConnection) handshakeHello_PendingListen(timeout bool, message []by
 	if timeout {
 		// The device needs to be in a state for the user to allow trusting the device
 		// e.g. either the web UI or by other means
-		if !c.infoProvider.AllowWaitingForTrust(c.remoteShipID) {
+		allowed := c.infoProvider.AllowWaitingForTrust(c.remoteShipID)
+		if c.shutdownRequested() {
+			return
+		}
+		if !allowed {
 			c.handshakeHello_PendingTimeout()
 		} else {
 			c.handshakeHello_PendingProlongationRequest()

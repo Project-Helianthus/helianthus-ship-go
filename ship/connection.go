@@ -77,6 +77,7 @@ type ShipConnection struct {
 	lastReceivedWaitingValue time.Duration // required for Prolong-Request-Reply-Timer
 
 	shutdownOnce sync.Once
+	shutdownChan chan struct{}
 
 	dataHandlerInitOnce        sync.Once
 	outgoingAttemptTerminal    sync.Once
@@ -192,6 +193,7 @@ func newConnectionHandler(
 		remoteShipID: remoteShipId,
 		smeState:     model.CmiStateInitStart,
 		smeError:     nil,
+		shutdownChan: make(chan struct{}),
 	}
 	ship.handshakeTimerIdle = sync.NewCond(&ship.handshakeTimerMux)
 
@@ -467,6 +469,7 @@ func (c *ShipConnection) CloseConnection(safe bool, code int, reason string) {
 	closeClaimed := false
 	c.shutdownOnce.Do(func() {
 		closeClaimed = true
+		close(c.shutdownChan)
 	})
 	if !closeClaimed {
 		return
@@ -499,6 +502,26 @@ func (c *ShipConnection) closeConnection(safe bool, code int, reason string) {
 		state == model.SmeHelloStateRemoteAbortDone ||
 		state == model.SmeHelloStateRejected
 
+	finish := func() {
+		c.finishCloseConnection(safe, code, reason, handshakeEnd, state)
+	}
+	if c.handshakeTimerCallbacksActive() {
+		go func() {
+			c.stopHandshakeTimerAndWait()
+			c.runPairingEffect(finish, false)
+		}()
+		return
+	}
+	finish()
+}
+
+func (c *ShipConnection) finishCloseConnection(
+	safe bool,
+	code int,
+	reason string,
+	handshakeEnd bool,
+	state model.ShipMessageExchangeState,
+) {
 	// this may not be used for Connection Data Exchange is entered!
 	if safe && state == model.SmeStateComplete {
 		// SHIP 13.4.7: Connection Termination Announce
@@ -530,6 +553,15 @@ func (c *ShipConnection) closeConnection(safe bool, code int, reason string) {
 	c.dataWriter.CloseDataConnection(closeCode, reason)
 
 	c.reportConnectionClosed(handshakeEnd)
+}
+
+func (c *ShipConnection) shutdownRequested() bool {
+	select {
+	case <-c.shutdownChan:
+		return true
+	default:
+		return false
+	}
 }
 
 var _ api.ShipConnectionDataWriterInterface = (*ShipConnection)(nil)

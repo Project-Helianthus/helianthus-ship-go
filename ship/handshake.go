@@ -309,6 +309,10 @@ func (c *ShipConnection) setHandshakeTimer(timerType timeoutTimerType, duration 
 	stopChan := make(chan struct{})
 	doneChan := make(chan struct{})
 	c.handshakeTimerMux.Lock()
+	if c.shutdownRequested() {
+		c.handshakeTimerMux.Unlock()
+		return
+	}
 	c.handshakeTimerRunning = true
 	c.handshakeTimerType = timerType
 	c.handshakeTimerStopChan = stopChan
@@ -379,6 +383,12 @@ func (c *ShipConnection) finishHandshakeTimer() {
 	c.handshakeTimerActive--
 	c.handshakeTimerIdle.Broadcast()
 	c.handshakeTimerMux.Unlock()
+}
+
+func (c *ShipConnection) handshakeTimerCallbacksActive() bool {
+	c.handshakeTimerMux.Lock()
+	defer c.handshakeTimerMux.Unlock()
+	return c.handshakeTimerActive > 0
 }
 
 func (c *ShipConnection) setHandshakeTimerRunning(value bool) {
