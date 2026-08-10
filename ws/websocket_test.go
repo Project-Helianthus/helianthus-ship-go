@@ -17,6 +17,67 @@ import (
 	"github.com/stretchr/testify/suite"
 )
 
+type teardownBlockingReader struct {
+	writerReleased <-chan struct{}
+}
+
+func (*teardownBlockingReader) HandleIncomingWebsocketMessage([]byte) {}
+
+func (r *teardownBlockingReader) ReportConnectionError(error) {
+	select {
+	case <-r.writerReleased:
+	case <-time.After(time.Second):
+	}
+}
+
+func TestTerminalWriteFailureUnblocksFullQueueBeforeCallback(t *testing.T) {
+	connection := NewWebsocketConnection(nil, "remoteSki")
+	connection.shipWriteChannel <- []byte("queued")
+
+	writeDone := make(chan error, 1)
+	writerReleased := make(chan struct{})
+	go func() {
+		writeDone <- connection.WriteMessageToWebsocketConnection([]byte("blocked"))
+		close(writerReleased)
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for connection.muxShipWrite.TryLock() {
+		connection.muxShipWrite.Unlock()
+		if time.Now().After(deadline) {
+			t.Fatal("writer did not block on the full queue")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	connection.dataProcessing = &teardownBlockingReader{writerReleased: writerReleased}
+	terminalErr := errors.New("terminal websocket write failure")
+	closeDone := make(chan struct{})
+	go func() {
+		connection.closeWithError(terminalErr, "test terminal failure: ")
+		close(closeDone)
+	}()
+
+	select {
+	case <-closeDone:
+	case <-time.After(250 * time.Millisecond):
+		// Let the blocked write complete so the failed regression does not leak goroutines.
+		<-connection.shipWriteChannel
+		<-closeDone
+		t.Fatal("terminal failure callback remained blocked behind the full write queue")
+	}
+
+	select {
+	case err := <-writeDone:
+		assert.ErrorContains(t, err, connIsClosedError)
+	case <-time.After(time.Second):
+		t.Fatal("blocked write was not released by terminal close")
+	}
+
+	assert.ErrorIs(t, connection.connClosedError(), terminalErr)
+	assert.ErrorContains(t, connection.WriteMessageToWebsocketConnection([]byte("late")), connIsClosedError)
+}
+
 func TestWebsocketSuite(t *testing.T) {
 	suite.Run(t, new(WebsocketSuite))
 }
