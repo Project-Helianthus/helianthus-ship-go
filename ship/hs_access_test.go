@@ -78,7 +78,7 @@ func (s *AccessSuite) BeforeTest(suiteName, testName string) {
 }
 
 func (s *AccessSuite) AfterTest(suiteName, testName string) {
-	s.sut.stopHandshakeTimer()
+	s.sut.stopHandshakeTimerAndWait()
 }
 
 func (s *AccessSuite) Test_Init() {

@@ -69,7 +69,10 @@ type ShipConnection struct {
 	handshakeTimerRunning  bool
 	handshakeTimerType     timeoutTimerType
 	handshakeTimerStopChan chan struct{}
+	handshakeTimerDoneChan chan struct{}
 	handshakeTimerMux      sync.Mutex
+	handshakeTimerIdle     *sync.Cond
+	handshakeTimerActive   int
 
 	lastReceivedWaitingValue time.Duration // required for Prolong-Request-Reply-Timer
 
@@ -190,8 +193,7 @@ func newConnectionHandler(
 		smeState:     model.CmiStateInitStart,
 		smeError:     nil,
 	}
-
-	ship.handshakeTimerStopChan = make(chan struct{})
+	ship.handshakeTimerIdle = sync.NewCond(&ship.handshakeTimerMux)
 
 	if initializeDataHandler {
 		ship.initializeDataProcessing()

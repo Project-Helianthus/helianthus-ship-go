@@ -306,32 +306,79 @@ func (c *ShipConnection) endHandshakeWithError(err error) {
 func (c *ShipConnection) setHandshakeTimer(timerType timeoutTimerType, duration time.Duration) {
 	c.stopHandshakeTimer()
 
-	c.setHandshakeTimerRunning(true)
-	c.setHandshakeTimerType(timerType)
+	stopChan := make(chan struct{})
+	doneChan := make(chan struct{})
+	c.handshakeTimerMux.Lock()
+	c.handshakeTimerRunning = true
+	c.handshakeTimerType = timerType
+	c.handshakeTimerStopChan = stopChan
+	c.handshakeTimerDoneChan = doneChan
+	c.handshakeTimerActive++
+	c.handshakeTimerMux.Unlock()
 
 	go func() {
+		defer close(doneChan)
+		defer c.finishHandshakeTimer()
+		timer := time.NewTimer(duration)
+		defer timer.Stop()
+
 		select {
-		case <-c.handshakeTimerStopChan:
+		case <-stopChan:
 			return
-		case <-time.After(duration):
-			c.setHandshakeTimerRunning(false)
+		case <-timer.C:
+			c.handshakeTimerMux.Lock()
+			if c.handshakeTimerStopChan != stopChan || !c.handshakeTimerRunning {
+				c.handshakeTimerMux.Unlock()
+				return
+			}
+			c.handshakeTimerRunning = false
+			c.handshakeTimerMux.Unlock()
 			c.handleState(true, nil)
 			return
 		}
 	}()
 }
 
-// stop the handshake timer and close the channel
+// stopHandshakeTimer reliably revokes the current timer generation. It does
+// not wait because timeout handlers may transition into states that stop or
+// replace their own timer.
 func (c *ShipConnection) stopHandshakeTimer() {
-	if !c.getHandshakeTimerRunning() {
-		return
+	c.handshakeTimerMux.Lock()
+	stopChan := c.handshakeTimerStopChan
+	doneChan := c.handshakeTimerDoneChan
+	wasRunning := c.handshakeTimerRunning
+	if stopChan != nil {
+		c.handshakeTimerStopChan = nil
+		close(stopChan)
 	}
+	c.handshakeTimerRunning = false
+	c.handshakeTimerMux.Unlock()
 
-	select {
-	case c.handshakeTimerStopChan <- struct{}{}:
-	default:
+	if wasRunning && doneChan != nil {
+		<-doneChan
 	}
-	c.setHandshakeTimerRunning(false)
+}
+
+// stopHandshakeTimerAndWait is the teardown barrier for owners that must not
+// release callback dependencies until all timer generations have exited.
+func (c *ShipConnection) stopHandshakeTimerAndWait() {
+	for {
+		c.stopHandshakeTimer()
+		c.handshakeTimerMux.Lock()
+		if c.handshakeTimerActive == 0 {
+			c.handshakeTimerMux.Unlock()
+			return
+		}
+		c.handshakeTimerIdle.Wait()
+		c.handshakeTimerMux.Unlock()
+	}
+}
+
+func (c *ShipConnection) finishHandshakeTimer() {
+	c.handshakeTimerMux.Lock()
+	c.handshakeTimerActive--
+	c.handshakeTimerIdle.Broadcast()
+	c.handshakeTimerMux.Unlock()
 }
 
 func (c *ShipConnection) setHandshakeTimerRunning(value bool) {

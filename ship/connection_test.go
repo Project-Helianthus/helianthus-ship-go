@@ -20,6 +20,63 @@ func TestConnectionSuite(t *testing.T) {
 	suite.Run(t, new(ConnectionSuite))
 }
 
+func (s *ConnectionSuite) AfterTest(_, _ string) {
+	if s.sut != nil {
+		s.sut.stopHandshakeTimerAndWait()
+	}
+}
+
+func (s *ConnectionSuite) TestStopHandshakeTimerAndWaitJoinsAdmittedTimeout() {
+	callbackEntered := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	s.sut.infoProvider = &concurrentConnectionInfoProvider{
+		closed: func(api.ShipConnectionInterface, bool) {
+			close(callbackEntered)
+			<-releaseCallback
+		},
+	}
+	s.sut.setState(model.CmiStateClientWait, nil)
+	s.sut.setHandshakeTimer(timeoutTimerTypeWaitForReady, time.Millisecond)
+
+	waitForConnectionSignal(s.T(), callbackEntered, "admitted timeout callback")
+	waitComplete := make(chan struct{})
+	go func() {
+		s.sut.stopHandshakeTimerAndWait()
+		close(waitComplete)
+	}()
+
+	select {
+	case <-waitComplete:
+		s.T().Fatal("timer teardown returned before admitted callback completed")
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseCallback)
+	waitForConnectionSignal(s.T(), waitComplete, "timer teardown barrier")
+}
+
+func (s *ConnectionSuite) TestStopHandshakeTimerAndWaitCancelsTimerSpawnedByCallback() {
+	callbackEntered := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	s.sut.infoProvider = &concurrentConnectionInfoProvider{
+		allow: func(string) bool {
+			close(callbackEntered)
+			<-releaseCallback
+			return true
+		},
+	}
+	s.sut.setState(model.SmeHelloStatePendingListen, nil)
+	s.sut.setHandshakeTimer(timeoutTimerTypeWaitForReady, time.Millisecond)
+
+	waitForConnectionSignal(s.T(), callbackEntered, "timer replacement callback")
+	waitComplete := make(chan struct{})
+	go func() {
+		s.sut.stopHandshakeTimerAndWait()
+		close(waitComplete)
+	}()
+	close(releaseCallback)
+	waitForConnectionSignal(s.T(), waitComplete, "replacement timer teardown")
+}
+
 type ConnectionSuite struct {
 	suite.Suite
 
@@ -44,6 +101,7 @@ type concurrentConnectionInfoProvider struct {
 	report func(string, string)
 	closed func(api.ShipConnectionInterface, bool)
 	state  func(string, model.ShipState)
+	allow  func(string) bool
 }
 
 func (*concurrentConnectionInfoProvider) IsRemoteServiceForSKIPaired(string) bool { return false }
@@ -58,7 +116,12 @@ func (p *concurrentConnectionInfoProvider) ReportServiceShipID(ski, shipID strin
 		p.report(ski, shipID)
 	}
 }
-func (*concurrentConnectionInfoProvider) AllowWaitingForTrust(string) bool { return false }
+func (p *concurrentConnectionInfoProvider) AllowWaitingForTrust(id string) bool {
+	if p.allow == nil {
+		return false
+	}
+	return p.allow(id)
+}
 func (p *concurrentConnectionInfoProvider) HandleShipHandshakeStateUpdate(ski string, state model.ShipState) {
 	if p.state != nil {
 		p.state(ski, state)

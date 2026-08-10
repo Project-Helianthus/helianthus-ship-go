@@ -75,7 +75,7 @@ func (s *ProClientSuite) BeforeTest(suiteName, testName string) {
 }
 
 func (s *ProClientSuite) AfterTest(suiteName, testName string) {
-	s.sut.stopHandshakeTimer()
+	s.sut.stopHandshakeTimerAndWait()
 }
 
 func (s *ProClientSuite) Test_Init() {
