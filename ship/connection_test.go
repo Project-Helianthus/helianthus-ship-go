@@ -118,6 +118,32 @@ func (s *ConnectionSuite) TestCloseWaitsToReleaseDependenciesUntilAdmittedTimeou
 	assert.Empty(s.T(), s.sentMessage)
 }
 
+func (s *ConnectionSuite) TestTerminalCloseExcludesAdmittedProlongationWrite() {
+	writer := &blockingConnectionWriter{
+		isClosedEntered: make(chan struct{}),
+		isClosedRelease: make(chan struct{}),
+		closed:          make(chan struct{}),
+	}
+	s.sut = NewConnectionHandler(
+		&concurrentConnectionInfoProvider{},
+		writer,
+		ShipRoleServer,
+		"LocalShipID",
+		"RemoteDevice",
+		"RemoteShipID",
+	)
+	s.sut.smeState = model.SmeHelloStatePendingListen
+	s.sut.setHandshakeTimer(timeoutTimerTypeSendProlongationRequest, time.Millisecond)
+	waitForConnectionSignal(s.T(), writer.isClosedEntered, "admitted prolongation write")
+	s.sut.CloseConnection(false, 4001, "terminal before prolongation write")
+	assert.True(s.T(), s.sut.pairingTerminal)
+
+	close(writer.isClosedRelease)
+	waitForConnectionSignal(s.T(), writer.closed, "writer teardown")
+	assert.Zero(s.T(), writer.writeCount())
+	assert.False(s.T(), s.sut.getHandshakeTimerRunning())
+}
+
 type ConnectionSuite struct {
 	suite.Suite
 
@@ -143,6 +169,35 @@ type concurrentConnectionInfoProvider struct {
 	closed func(api.ShipConnectionInterface, bool)
 	state  func(string, model.ShipState)
 	allow  func(string) bool
+}
+
+type blockingConnectionWriter struct {
+	isClosedEntered chan struct{}
+	isClosedRelease chan struct{}
+	closed          chan struct{}
+	writesMux       sync.Mutex
+	writes          [][]byte
+}
+
+func (*blockingConnectionWriter) InitDataProcessing(api.WebsocketDataReaderInterface) {}
+func (w *blockingConnectionWriter) IsDataConnectionClosed() (bool, error) {
+	close(w.isClosedEntered)
+	<-w.isClosedRelease
+	return false, nil
+}
+func (w *blockingConnectionWriter) WriteMessageToWebsocketConnection(message []byte) error {
+	w.writesMux.Lock()
+	defer w.writesMux.Unlock()
+	w.writes = append(w.writes, append([]byte(nil), message...))
+	return nil
+}
+func (w *blockingConnectionWriter) CloseDataConnection(int, string) {
+	close(w.closed)
+}
+func (w *blockingConnectionWriter) writeCount() int {
+	w.writesMux.Lock()
+	defer w.writesMux.Unlock()
+	return len(w.writes)
 }
 
 func (*concurrentConnectionInfoProvider) IsRemoteServiceForSKIPaired(string) bool { return false }

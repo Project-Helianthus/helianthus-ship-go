@@ -14,7 +14,7 @@ func (c *ShipConnection) handshakeInit_cmiStateInitStart() {
 	case ShipRoleClient:
 		// CMI_STATE_CLIENT_SEND
 		c.setState(model.CmiStateClientSend, nil)
-		if err := c.dataWriter.WriteMessageToWebsocketConnection(model.ShipInit); err != nil {
+		if err := c.writeShipMessage(model.ShipInit, false); err != nil {
 			c.endHandshakeWithError(err)
 			return
 		}
@@ -34,7 +34,7 @@ func (c *ShipConnection) handshakeInit_cmiStateServerWait(message []byte) {
 		return
 	}
 
-	if err := c.dataWriter.WriteMessageToWebsocketConnection(model.ShipInit); err != nil {
+	if err := c.writeShipMessage(model.ShipInit, false); err != nil {
 		c.endHandshakeWithError(err)
 		return
 	}
