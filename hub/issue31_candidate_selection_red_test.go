@@ -210,6 +210,14 @@ func TestIssue31QueuedNewerMdnsSnapshotBlocksSelectionOfVisiblePriorRevision(t *
 		close(firstDone)
 	}()
 	waitForPairingCandidateSignal(t, firstCallback, "first mDNS callback")
+	reservation, err := hub.SelectPairingCandidate(pairingCandidateTestRef, pairingCandidateTestSKI)
+	if err != nil {
+		t.Fatalf("select visible prior observation: %v", err)
+	}
+	inbound := hub.reserveInboundPairingConnection(pairingCandidateTestSKI)
+	if inbound == nil || inbound.candidate == nil {
+		t.Fatal("visible prior observation did not create candidate-bound inbound reservation")
+	}
 
 	const newerRef = "shipc_newer-revision"
 	newerAddresses := []net.IP{net.ParseIP("192.168.100.99")}
@@ -226,14 +234,12 @@ func TestIssue31QueuedNewerMdnsSnapshotBlocksSelectionOfVisiblePriorRevision(t *
 		18,
 	)
 
-	if _, err := hub.SelectPairingCandidate(pairingCandidateTestRef, pairingCandidateTestSKI); !errors.Is(err, api.ErrPairingCandidateUnavailable) {
-		t.Fatalf("selection while newer snapshot queued error = %v, want %v", err, api.ErrPairingCandidateUnavailable)
+	if err := hub.ConnectPairingCandidate(reservation); !errors.Is(err, api.ErrPairingCandidateReservationStale) {
+		t.Fatalf("connect while newer snapshot queued error = %v, want %v", err, api.ErrPairingCandidateReservationStale)
 	}
-	hub.muxReg.Lock()
-	active := hub.activePairingCandidates[pairingCandidateTestSKI]
-	hub.muxReg.Unlock()
-	if active != nil {
-		t.Fatal("selection admitted prior revision while newer mDNS snapshot was queued")
+	connection := &attemptCallbackConnection{ski: pairingCandidateTestSKI}
+	if replaced, registered := hub.registerReservedInboundPairingConnection(connection, inbound); registered || replaced != nil {
+		t.Fatalf("candidate-bound inbound registered while newer snapshot queued: registered=%t replaced=%#v", registered, replaced)
 	}
 
 	close(releaseFirst)
@@ -241,4 +247,56 @@ func TestIssue31QueuedNewerMdnsSnapshotBlocksSelectionOfVisiblePriorRevision(t *
 	if _, err := hub.SelectPairingCandidate(newerRef, pairingCandidateTestSKI); err != nil {
 		t.Fatalf("select settled newer observation: %v", err)
 	}
+}
+
+func TestIssue31QueuedMdnsSnapshotDoesNotRejectUnrelatedInbound(t *testing.T) {
+	hub, _, reader := newPairingCandidateHub(t, newScriptedAttemptGate(gatePermit))
+	const unrelatedSKI = "8fce1db764bd31d3014f48fe927c40a044982ec1"
+	hub.RegisterRemoteSKI(unrelatedSKI)
+	inbound := hub.reserveInboundPairingConnection(unrelatedSKI)
+	if inbound == nil || inbound.candidate != nil {
+		t.Fatalf("unrelated inbound reservation = %#v, want non-candidate reservation", inbound)
+	}
+
+	firstCallback := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var blockOnce sync.Once
+	reader.setVisibleUpdate(func(entries []api.RemoteService) {
+		if len(entries) == 0 {
+			return
+		}
+		blockOnce.Do(func() {
+			close(firstCallback)
+			<-releaseFirst
+		})
+	})
+	firstDone := make(chan struct{})
+	go func() {
+		reportPairingCandidate(hub, pairingCandidateTestRef, pairingCandidateTestSKI, "vr940.local", "192.168.100.21")
+		close(firstDone)
+	}()
+	waitForPairingCandidateSignal(t, firstCallback, "first mDNS callback")
+
+	const newerRef = "shipc_unrelated-newer"
+	newerAddresses := []net.IP{net.ParseIP("192.168.100.99")}
+	hub.ReportMdnsEntriesWithCandidates(
+		map[string]*api.MdnsEntry{newerRef: {
+			Name: "VR940", Ski: pairingCandidateTestSKI, Identifier: "vr940-ship-id",
+			Path: "/ship/", Host: "vr940.local", Port: 12480, Addresses: newerAddresses,
+		}},
+		true,
+		[]api.PairingCandidateObservation{{
+			CandidateRef: newerRef, Name: "VR940", SKI: pairingCandidateTestSKI,
+			Identifier: "vr940-ship-id", Path: "/ship/", Port: 12480, Addresses: newerAddresses,
+		}},
+		19,
+	)
+
+	connection := &attemptCallbackConnection{ski: unrelatedSKI}
+	if replaced, registered := hub.registerReservedInboundPairingConnection(connection, inbound); !registered || replaced != nil {
+		t.Fatalf("unrelated inbound registration = (%#v, %t), want (nil, true)", replaced, registered)
+	}
+
+	close(releaseFirst)
+	waitForPairingCandidateSignal(t, firstDone, "mDNS queue drain")
 }
