@@ -1,7 +1,10 @@
 package hub
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
@@ -42,6 +45,13 @@ func TestIssue31SelectionFreezesObservationWithoutDialOrTrust(t *testing.T) {
 	if hub.ServiceForSKI(pairingCandidateTestSKI).Trusted() {
 		t.Fatal("selection granted trust")
 	}
+	formatted := fmt.Sprintf("%v %#v %q", reservation, reservation, reservation)
+	if strings.Contains(formatted, "[32]") || !strings.Contains(formatted, "{redacted}") {
+		t.Fatalf("reservation formatter disclosed or omitted redaction: %q", formatted)
+	}
+	if _, err := json.Marshal(reservation); !errors.Is(err, api.ErrPairingCandidateReservationSerialization) {
+		t.Fatalf("reservation JSON error = %v, want %v", err, api.ErrPairingCandidateReservationSerialization)
+	}
 
 	// Replacement discovery cannot change the endpoint frozen by selection.
 	reportPairingCandidate(hub, "shipc_replacement", pairingCandidateTestSKI, "attacker.local", "192.168.100.99")
@@ -55,6 +65,19 @@ func TestIssue31SelectionFreezesObservationWithoutDialOrTrust(t *testing.T) {
 	request := waitForPairingCandidateRequest(t, gate)
 	if request.RemoteSKI != pairingCandidateTestSKI || request.Endpoint.Host != "192.168.100.21" || request.Endpoint.Port != 12480 || request.Path != "/ship/" {
 		t.Fatalf("selected frozen outgoing request = %#v", request)
+	}
+}
+
+func TestIssue31SelectionBindsExistingInboundWinnerRule(t *testing.T) {
+	hub, _, _ := newPairingCandidateHub(t, nil)
+	reportPairingCandidate(hub, pairingCandidateTestRef, pairingCandidateTestSKI, "vr940.local", "192.168.100.21")
+	reservation, err := hub.SelectPairingCandidate(pairingCandidateTestRef, pairingCandidateTestSKI)
+	if err != nil {
+		t.Fatalf("select pairing candidate: %v", err)
+	}
+	inbound := hub.reserveInboundPairingConnection(pairingCandidateTestSKI)
+	if inbound == nil || inbound.candidate == nil || !inbound.candidate.reservation.Matches(reservation) {
+		t.Fatal("selection did not bind the existing exact-SKI inbound winner rule")
 	}
 }
 

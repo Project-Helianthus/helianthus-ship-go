@@ -87,8 +87,13 @@ type pairingCandidateObservation struct {
 }
 
 type activePairingCandidate struct {
-	service   *api.ServiceDetails
-	authority *outboundAttemptAuthority
+	service       *api.ServiceDetails
+	authority     *outboundAttemptAuthority
+	reservation   api.PairingCandidateReservation
+	host          string
+	port          string
+	path          string
+	connectIssued bool
 }
 
 type pairingCandidateRetirement struct {
@@ -226,6 +231,7 @@ var _ api.HubInterface = (*Hub)(nil)
 var _ api.OutgoingAttemptGateSetter = (*Hub)(nil)
 var _ api.PairingRegistrationSetter = (*Hub)(nil)
 var _ api.PairingCandidateQueuer = (*Hub)(nil)
+var _ api.PairingCandidateController = (*Hub)(nil)
 
 // SetOutgoingAttemptGate installs or removes the optional outgoing dial gate.
 func (h *Hub) SetOutgoingAttemptGate(gate api.OutgoingAttemptGate) error {
