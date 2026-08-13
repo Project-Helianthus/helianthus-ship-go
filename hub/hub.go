@@ -90,6 +90,8 @@ type activePairingCandidate struct {
 	service       *api.ServiceDetails
 	authority     *outboundAttemptAuthority
 	reservation   api.PairingCandidateReservation
+	candidateRef  string
+	revision      uint64
 	host          string
 	port          string
 	path          string

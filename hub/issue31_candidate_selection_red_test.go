@@ -53,8 +53,6 @@ func TestIssue31SelectionFreezesObservationWithoutDialOrTrust(t *testing.T) {
 		t.Fatalf("reservation JSON error = %v, want %v", err, api.ErrPairingCandidateReservationSerialization)
 	}
 
-	// Replacement discovery cannot change the endpoint frozen by selection.
-	reportPairingCandidate(hub, "shipc_replacement", pairingCandidateTestSKI, "attacker.local", "192.168.100.99")
 	if err := hub.ConnectPairingCandidate(reservation); err != nil {
 		t.Fatalf("connect selected candidate: %v", err)
 	}
@@ -65,6 +63,33 @@ func TestIssue31SelectionFreezesObservationWithoutDialOrTrust(t *testing.T) {
 	request := waitForPairingCandidateRequest(t, gate)
 	if request.RemoteSKI != pairingCandidateTestSKI || request.Endpoint.Host != "192.168.100.21" || request.Endpoint.Port != 12480 || request.Path != "/ship/" {
 		t.Fatalf("selected frozen outgoing request = %#v", request)
+	}
+}
+
+func TestIssue31ObservationReplacementRetiresSelectOnlyReservation(t *testing.T) {
+	gate := newScriptedAttemptGate(gatePermit)
+	hub, gate, _ := newPairingCandidateHub(t, gate)
+	var launches []func()
+	hub.testHooks.launchPairingCandidate = func(run func()) { launches = append(launches, run) }
+	reportPairingCandidate(hub, pairingCandidateTestRef, pairingCandidateTestSKI, "vr940.local", "192.168.100.21")
+	reservation, err := hub.SelectPairingCandidate(pairingCandidateTestRef, pairingCandidateTestSKI)
+	if err != nil {
+		t.Fatalf("select pairing candidate: %v", err)
+	}
+
+	reportPairingCandidate(hub, "shipc_replacement", pairingCandidateTestSKI, "vr940.local", "192.168.100.99")
+	if err := hub.ConnectPairingCandidate(reservation); !errors.Is(err, api.ErrPairingCandidateReservationStale) {
+		t.Fatalf("replaced observation reservation error = %v, want %v", err, api.ErrPairingCandidateReservationStale)
+	}
+	if len(launches) != 0 {
+		t.Fatalf("replaced observation scheduled %d launches", len(launches))
+	}
+	requests, authorized, permits, _ := gate.snapshot()
+	if len(requests) != 0 || len(authorized) != 0 || len(permits) != 0 {
+		t.Fatalf("replaced observation reached gate: requests=%d authorized=%d permits=%d", len(requests), len(authorized), len(permits))
+	}
+	if inbound := hub.reserveInboundPairingConnection(pairingCandidateTestSKI); inbound == nil || inbound.candidate != nil {
+		t.Fatalf("replaced observation retained inbound candidate authority: %#v", inbound)
 	}
 }
 

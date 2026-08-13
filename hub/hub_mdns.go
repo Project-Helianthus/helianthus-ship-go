@@ -138,7 +138,23 @@ func (h *Hub) reportMdnsSnapshot(
 			addresses: append([]net.IP(nil), candidate.Addresses...),
 		}
 	}
+	h.muxAttemptGate.Lock()
+	retirements := make([]pairingCandidateRetirement, 0)
+	for ski, active := range h.activePairingCandidates {
+		if active == nil || active.connectIssued {
+			continue
+		}
+		current, exists := h.visiblePairingCandidates[active.candidateRef]
+		if exists && pairingCandidateObservationMatchesActive(current, active) {
+			continue
+		}
+		if retired := h.retireActivePairingCandidateLocked(ski, active, active.authority); retired != nil {
+			retirements = append(retirements, *retired)
+		}
+	}
+	h.muxAttemptGate.Unlock()
 	h.muxReg.Unlock()
+	h.finishPairingCandidateRetirements(retirements)
 
 	// Only durable trust can enter the normal reconnect path. A selected but
 	// untrusted candidate uses its frozen, exact one-dial path below this layer.

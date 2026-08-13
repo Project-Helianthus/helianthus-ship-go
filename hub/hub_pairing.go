@@ -186,6 +186,8 @@ func (h *Hub) admitPairingCandidate(
 		service:       service,
 		authority:     candidateAuthority,
 		reservation:   reservation,
+		candidateRef:  candidateRef,
+		revision:      entry.revision,
 		host:          host,
 		port:          strconv.Itoa(entry.port),
 		path:          entry.path,
@@ -205,6 +207,15 @@ func (h *Hub) admitPairingCandidate(
 	return reservation, &pairingCandidateLaunch{
 		ski: validatedSKI, service: service, candidate: activeCandidate,
 	}, nil
+}
+
+func pairingCandidateObservationMatchesActive(entry pairingCandidateObservation, active *activePairingCandidate) bool {
+	if active == nil || active.service == nil || entry.ski != active.service.SKI() || entry.revision != active.revision ||
+		entry.path != active.path || strconv.Itoa(entry.port) != active.port {
+		return false
+	}
+	host, ok := pairingCandidateAddress(entry.addresses)
+	return ok && host == active.host
 }
 
 // ConnectPairingCandidate launches one outbound attempt for the exact current
