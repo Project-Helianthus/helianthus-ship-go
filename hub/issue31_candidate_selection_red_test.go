@@ -76,6 +76,10 @@ func TestIssue31ObservationReplacementRetiresSelectOnlyReservation(t *testing.T)
 	if err != nil {
 		t.Fatalf("select pairing candidate: %v", err)
 	}
+	inbound := hub.reserveInboundPairingConnection(pairingCandidateTestSKI)
+	if inbound == nil || inbound.candidate == nil {
+		t.Fatal("selection did not become inbound eligible")
+	}
 
 	reportPairingCandidate(hub, "shipc_replacement", pairingCandidateTestSKI, "vr940.local", "192.168.100.99")
 	if err := hub.ConnectPairingCandidate(reservation); !errors.Is(err, api.ErrPairingCandidateReservationStale) {
@@ -88,8 +92,9 @@ func TestIssue31ObservationReplacementRetiresSelectOnlyReservation(t *testing.T)
 	if len(requests) != 0 || len(authorized) != 0 || len(permits) != 0 {
 		t.Fatalf("replaced observation reached gate: requests=%d authorized=%d permits=%d", len(requests), len(authorized), len(permits))
 	}
-	if inbound := hub.reserveInboundPairingConnection(pairingCandidateTestSKI); inbound == nil || inbound.candidate != nil {
-		t.Fatalf("replaced observation retained inbound candidate authority: %#v", inbound)
+	connection := &attemptCallbackConnection{ski: pairingCandidateTestSKI}
+	if replaced, registered := hub.registerReservedInboundPairingConnection(connection, inbound); registered || replaced != nil {
+		t.Fatalf("stale inbound reservation registered: registered=%t replaced=%#v", registered, replaced)
 	}
 }
 
@@ -103,6 +108,10 @@ func TestIssue31SelectionBindsExistingInboundWinnerRule(t *testing.T) {
 	inbound := hub.reserveInboundPairingConnection(pairingCandidateTestSKI)
 	if inbound == nil || inbound.candidate == nil || !inbound.candidate.reservation.Matches(reservation) {
 		t.Fatal("selection did not bind the existing exact-SKI inbound winner rule")
+	}
+	connection := &attemptCallbackConnection{ski: pairingCandidateTestSKI}
+	if replaced, registered := hub.registerReservedInboundPairingConnection(connection, inbound); !registered || replaced != nil {
+		t.Fatalf("current inbound reservation registration = (%#v, %t), want (nil, true)", replaced, registered)
 	}
 }
 

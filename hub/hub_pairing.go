@@ -195,13 +195,12 @@ func (h *Hub) admitPairingCandidate(
 	}
 	h.activePairingCandidates[validatedSKI] = activeCandidate
 	service.SetShipID("")
-	if connect {
-		service.ConnectionStateDetail().SetState(api.ConnectionStateQueued)
-	}
+	service.ConnectionStateDetail().SetState(api.ConnectionStateQueued)
 	h.muxAttemptGate.Unlock()
 	h.muxReg.Unlock()
 
 	if !connect {
+		h.publishPairingDetail(validatedSKI, service.ConnectionStateDetail())
 		return reservation, nil, nil
 	}
 	return reservation, &pairingCandidateLaunch{
