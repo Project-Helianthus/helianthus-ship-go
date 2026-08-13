@@ -1139,7 +1139,9 @@ func (h *Hub) registerReservedInboundPairingConnection(
 		return nil, false
 	}
 	remoteSKI := connection.RemoteSKI()
-	h.muxReg.Lock()
+	if !h.lockPairingCandidateAdmission() {
+		return nil, false
+	}
 	h.muxCon.Lock()
 	activeCandidate := h.activePairingCandidates[remoteSKI]
 	candidateCurrent := reservation.candidate == nil ||
@@ -1152,7 +1154,7 @@ func (h *Hub) registerReservedInboundPairingConnection(
 		(reservation.replaced != nil &&
 			h.supersededConnectionCountForSKILocked(remoteSKI) >= maximumSupersededConnectionsPerSKI) {
 		h.muxCon.Unlock()
-		h.muxReg.Unlock()
+		h.unlockPairingCandidateAdmission()
 		return nil, false
 	}
 	existing := h.connections[remoteSKI]
@@ -1162,7 +1164,7 @@ func (h *Hub) registerReservedInboundPairingConnection(
 		h.supersededConnections[existing] = struct{}{}
 	}
 	h.muxCon.Unlock()
-	h.muxReg.Unlock()
+	h.unlockPairingCandidateAdmission()
 	h.blockOutboundAttemptCallbacks(existing)
 	return existing, true
 }

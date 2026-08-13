@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
 	"github.com/Project-Helianthus/helianthus-ship-go/logging"
@@ -168,6 +169,7 @@ type Hub struct {
 	consumedPairingCandidates        map[string]struct{}
 	activePairingCandidates          map[string]*activePairingCandidate
 	latestPairingObservationRevision uint64
+	mdnsAppliedAdmission             uint64
 	testHooks                        *hubTestHooks
 
 	// The list of known remote services
@@ -194,10 +196,11 @@ type Hub struct {
 	pairingNotificationQueue    []func()
 	pairingNotificationDraining bool
 
-	mdnsSnapshotMux      sync.Mutex
-	mdnsSnapshotQueue    []func()
-	mdnsSnapshotDraining bool
-	mdnsSnapshotRevision uint64
+	mdnsSnapshotMux       sync.Mutex
+	mdnsSnapshotQueue     []func()
+	mdnsSnapshotDraining  bool
+	mdnsSnapshotRevision  uint64
+	mdnsSnapshotAdmission atomic.Uint64
 }
 
 func NewHub(hubReader api.HubReaderInterface,

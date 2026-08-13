@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
@@ -184,5 +186,59 @@ func TestIssue31ZeroReservationFailsClosed(t *testing.T) {
 	requests, authorized, permits, _ := gate.snapshot()
 	if len(requests) != 0 || len(authorized) != 0 || len(permits) != 0 {
 		t.Fatalf("zero reservation reached gate: requests=%d authorized=%d permits=%d", len(requests), len(authorized), len(permits))
+	}
+}
+
+func TestIssue31QueuedNewerMdnsSnapshotBlocksSelectionOfVisiblePriorRevision(t *testing.T) {
+	hub, _, reader := newPairingCandidateHub(t, newScriptedAttemptGate(gatePermit))
+	firstCallback := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var blockOnce sync.Once
+	reader.setVisibleUpdate(func(entries []api.RemoteService) {
+		if len(entries) == 0 {
+			return
+		}
+		blockOnce.Do(func() {
+			close(firstCallback)
+			<-releaseFirst
+		})
+	})
+
+	firstDone := make(chan struct{})
+	go func() {
+		reportPairingCandidate(hub, pairingCandidateTestRef, pairingCandidateTestSKI, "vr940.local", "192.168.100.21")
+		close(firstDone)
+	}()
+	waitForPairingCandidateSignal(t, firstCallback, "first mDNS callback")
+
+	const newerRef = "shipc_newer-revision"
+	newerAddresses := []net.IP{net.ParseIP("192.168.100.99")}
+	hub.ReportMdnsEntriesWithCandidates(
+		map[string]*api.MdnsEntry{newerRef: {
+			Name: "VR940", Ski: pairingCandidateTestSKI, Identifier: "vr940-ship-id",
+			Path: "/ship/", Host: "vr940.local", Port: 12480, Addresses: newerAddresses,
+		}},
+		true,
+		[]api.PairingCandidateObservation{{
+			CandidateRef: newerRef, Name: "VR940", SKI: pairingCandidateTestSKI,
+			Identifier: "vr940-ship-id", Path: "/ship/", Port: 12480, Addresses: newerAddresses,
+		}},
+		18,
+	)
+
+	if _, err := hub.SelectPairingCandidate(pairingCandidateTestRef, pairingCandidateTestSKI); !errors.Is(err, api.ErrPairingCandidateUnavailable) {
+		t.Fatalf("selection while newer snapshot queued error = %v, want %v", err, api.ErrPairingCandidateUnavailable)
+	}
+	hub.muxReg.Lock()
+	active := hub.activePairingCandidates[pairingCandidateTestSKI]
+	hub.muxReg.Unlock()
+	if active != nil {
+		t.Fatal("selection admitted prior revision while newer mDNS snapshot was queued")
+	}
+
+	close(releaseFirst)
+	waitForPairingCandidateSignal(t, firstDone, "mDNS queue drain")
+	if _, err := hub.SelectPairingCandidate(newerRef, pairingCandidateTestSKI); err != nil {
+		t.Fatalf("select settled newer observation: %v", err)
 	}
 }

@@ -139,23 +139,25 @@ func (h *Hub) admitPairingCandidate(
 	}
 	reservation := api.NewPairingCandidateReservation(token)
 
-	h.muxReg.Lock()
+	if !h.lockPairingCandidateAdmission() {
+		return api.PairingCandidateReservation{}, nil, api.ErrPairingCandidateUnavailable
+	}
 	if _, consumed := h.consumedPairingCandidates[candidateRef]; consumed {
-		h.muxReg.Unlock()
+		h.unlockPairingCandidateAdmission()
 		return api.PairingCandidateReservation{}, nil, api.ErrPairingCandidateConsumed
 	}
 	entry, exists := h.visiblePairingCandidates[candidateRef]
 	if !exists {
-		h.muxReg.Unlock()
+		h.unlockPairingCandidateAdmission()
 		return api.PairingCandidateReservation{}, nil, api.ErrPairingCandidateUnavailable
 	}
 	if entry.ski != validatedSKI {
-		h.muxReg.Unlock()
+		h.unlockPairingCandidateAdmission()
 		return api.PairingCandidateReservation{}, nil, api.ErrPairingCandidateSKIMismatch
 	}
 	host, ok := pairingCandidateAddress(entry.addresses)
 	if !ok || entry.port <= 0 || entry.port > 65535 || entry.path == "" {
-		h.muxReg.Unlock()
+		h.unlockPairingCandidateAdmission()
 		return api.PairingCandidateReservation{}, nil, api.ErrPairingCandidateUnavailable
 	}
 	service := h.remoteServices[validatedSKI]
@@ -164,11 +166,11 @@ func (h *Hub) admitPairingCandidate(
 		h.remoteServices[validatedSKI] = service
 	}
 	if service.Trusted() {
-		h.muxReg.Unlock()
+		h.unlockPairingCandidateAdmission()
 		return api.PairingCandidateReservation{}, nil, api.ErrRemoteAlreadyTrusted
 	}
 	if h.activePairingCandidates[validatedSKI] != nil {
-		h.muxReg.Unlock()
+		h.unlockPairingCandidateAdmission()
 		return api.PairingCandidateReservation{}, nil, api.ErrPairingCandidateActive
 	}
 	if h.testHooks != nil && h.testHooks.beforePairingCandidateAdmission != nil {
@@ -177,7 +179,7 @@ func (h *Hub) admitPairingCandidate(
 	h.muxAttemptGate.Lock()
 	if connect && (h.outgoingAttemptGate == nil || isNilOutgoingAttemptValue(h.outgoingAttemptGate)) {
 		h.muxAttemptGate.Unlock()
-		h.muxReg.Unlock()
+		h.unlockPairingCandidateAdmission()
 		return api.PairingCandidateReservation{}, nil, api.ErrOutgoingAttemptGateRequired
 	}
 	h.consumedPairingCandidates[candidateRef] = struct{}{}
@@ -197,7 +199,7 @@ func (h *Hub) admitPairingCandidate(
 	service.SetShipID("")
 	service.ConnectionStateDetail().SetState(api.ConnectionStateQueued)
 	h.muxAttemptGate.Unlock()
-	h.muxReg.Unlock()
+	h.unlockPairingCandidateAdmission()
 
 	if !connect {
 		h.publishPairingDetail(validatedSKI, service.ConnectionStateDetail())
@@ -223,7 +225,9 @@ func (h *Hub) ConnectPairingCandidate(reservation api.PairingCandidateReservatio
 	if !reservation.Valid() {
 		return api.ErrPairingCandidateReservationStale
 	}
-	h.muxReg.Lock()
+	if !h.lockPairingCandidateAdmission() {
+		return api.ErrPairingCandidateReservationStale
+	}
 	var ski string
 	var activeCandidate *activePairingCandidate
 	for candidateSKI, candidate := range h.activePairingCandidates {
@@ -234,17 +238,17 @@ func (h *Hub) ConnectPairingCandidate(reservation api.PairingCandidateReservatio
 		}
 	}
 	if activeCandidate == nil || activeCandidate.service == nil || activeCandidate.service.Trusted() {
-		h.muxReg.Unlock()
+		h.unlockPairingCandidateAdmission()
 		return api.ErrPairingCandidateReservationStale
 	}
 	if activeCandidate.connectIssued {
-		h.muxReg.Unlock()
+		h.unlockPairingCandidateAdmission()
 		return api.ErrPairingCandidateAlreadyConnecting
 	}
 	h.muxAttemptGate.Lock()
 	if h.outgoingAttemptGate == nil || isNilOutgoingAttemptValue(h.outgoingAttemptGate) {
 		h.muxAttemptGate.Unlock()
-		h.muxReg.Unlock()
+		h.unlockPairingCandidateAdmission()
 		return api.ErrOutgoingAttemptGateRequired
 	}
 	activeCandidate.connectIssued = true
@@ -253,7 +257,7 @@ func (h *Hub) ConnectPairingCandidate(reservation api.PairingCandidateReservatio
 		ski: ski, service: activeCandidate.service, candidate: activeCandidate,
 	}
 	h.muxAttemptGate.Unlock()
-	h.muxReg.Unlock()
+	h.unlockPairingCandidateAdmission()
 
 	h.launchPairingCandidate(launch)
 	return nil
