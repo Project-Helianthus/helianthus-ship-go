@@ -1,6 +1,7 @@
 package hub
 
 import (
+	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"net"
@@ -97,33 +98,67 @@ func (h *Hub) SetPairingRegistration(available bool) error {
 	return nil
 }
 
-// QueuePairingCandidate consumes one exact mDNS observation after the operator
-// validates its claimed SKI out of band. The endpoint is frozen from discovery,
-// never accepted as input, and trust remains false until RegisterRemoteSKI.
+type pairingCandidateLaunch struct {
+	ski       string
+	service   *api.ServiceDetails
+	candidate *activePairingCandidate
+}
+
+// SelectPairingCandidate consumes and freezes one exact mDNS observation after
+// the operator validates its claimed SKI. It grants neither trust nor an
+// outbound attempt; the returned process-local reservation is the only later
+// connect authority.
+func (h *Hub) SelectPairingCandidate(candidateRef, expectedSKI string) (api.PairingCandidateReservation, error) {
+	reservation, _, err := h.admitPairingCandidate(candidateRef, expectedSKI, false)
+	return reservation, err
+}
+
+// QueuePairingCandidate preserves the original combined select-and-connect
+// behavior for existing dependency consumers.
 func (h *Hub) QueuePairingCandidate(candidateRef, expectedSKI string) error {
-	validatedSKI, err := validPairingCandidateSKI(expectedSKI)
+	_, launch, err := h.admitPairingCandidate(candidateRef, expectedSKI, true)
 	if err != nil {
 		return err
 	}
+	h.launchPairingCandidate(launch)
+	return nil
+}
 
-	h.muxReg.Lock()
+func (h *Hub) admitPairingCandidate(
+	candidateRef string,
+	expectedSKI string,
+	connect bool,
+) (api.PairingCandidateReservation, *pairingCandidateLaunch, error) {
+	validatedSKI, err := validPairingCandidateSKI(expectedSKI)
+	if err != nil {
+		return api.PairingCandidateReservation{}, nil, err
+	}
+	var token [32]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return api.PairingCandidateReservation{}, nil, api.ErrPairingCandidateReservationUnavailable
+	}
+	reservation := api.NewPairingCandidateReservation(token)
+
+	if !h.lockPairingCandidateAdmission() {
+		return api.PairingCandidateReservation{}, nil, api.ErrPairingCandidateUnavailable
+	}
 	if _, consumed := h.consumedPairingCandidates[candidateRef]; consumed {
-		h.muxReg.Unlock()
-		return api.ErrPairingCandidateConsumed
+		h.unlockPairingCandidateAdmission()
+		return api.PairingCandidateReservation{}, nil, api.ErrPairingCandidateConsumed
 	}
 	entry, exists := h.visiblePairingCandidates[candidateRef]
 	if !exists {
-		h.muxReg.Unlock()
-		return api.ErrPairingCandidateUnavailable
+		h.unlockPairingCandidateAdmission()
+		return api.PairingCandidateReservation{}, nil, api.ErrPairingCandidateUnavailable
 	}
 	if entry.ski != validatedSKI {
-		h.muxReg.Unlock()
-		return api.ErrPairingCandidateSKIMismatch
+		h.unlockPairingCandidateAdmission()
+		return api.PairingCandidateReservation{}, nil, api.ErrPairingCandidateSKIMismatch
 	}
 	host, ok := pairingCandidateAddress(entry.addresses)
 	if !ok || entry.port <= 0 || entry.port > 65535 || entry.path == "" {
-		h.muxReg.Unlock()
-		return api.ErrPairingCandidateUnavailable
+		h.unlockPairingCandidateAdmission()
+		return api.PairingCandidateReservation{}, nil, api.ErrPairingCandidateUnavailable
 	}
 	service := h.remoteServices[validatedSKI]
 	if service == nil {
@@ -131,61 +166,134 @@ func (h *Hub) QueuePairingCandidate(candidateRef, expectedSKI string) error {
 		h.remoteServices[validatedSKI] = service
 	}
 	if service.Trusted() {
-		h.muxReg.Unlock()
-		return api.ErrRemoteAlreadyTrusted
+		h.unlockPairingCandidateAdmission()
+		return api.PairingCandidateReservation{}, nil, api.ErrRemoteAlreadyTrusted
 	}
 	if h.activePairingCandidates[validatedSKI] != nil {
-		h.muxReg.Unlock()
-		return api.ErrPairingCandidateActive
+		h.unlockPairingCandidateAdmission()
+		return api.PairingCandidateReservation{}, nil, api.ErrPairingCandidateActive
 	}
 	if h.testHooks != nil && h.testHooks.beforePairingCandidateAdmission != nil {
 		h.testHooks.beforePairingCandidateAdmission()
 	}
 	h.muxAttemptGate.Lock()
-	if h.outgoingAttemptGate == nil || isNilOutgoingAttemptValue(h.outgoingAttemptGate) {
+	if connect && (h.outgoingAttemptGate == nil || isNilOutgoingAttemptValue(h.outgoingAttemptGate)) {
 		h.muxAttemptGate.Unlock()
-		h.muxReg.Unlock()
-		return api.ErrOutgoingAttemptGateRequired
+		h.unlockPairingCandidateAdmission()
+		return api.PairingCandidateReservation{}, nil, api.ErrOutgoingAttemptGateRequired
 	}
 	h.consumedPairingCandidates[candidateRef] = struct{}{}
 	candidateAuthority := h.rotateOutboundAuthorityLocked(validatedSKI)
 	activeCandidate := &activePairingCandidate{
-		service:   service,
-		authority: candidateAuthority,
+		service:       service,
+		authority:     candidateAuthority,
+		reservation:   reservation,
+		candidateRef:  candidateRef,
+		revision:      entry.revision,
+		host:          host,
+		port:          strconv.Itoa(entry.port),
+		path:          entry.path,
+		connectIssued: connect,
 	}
 	h.activePairingCandidates[validatedSKI] = activeCandidate
 	service.SetShipID("")
 	service.ConnectionStateDetail().SetState(api.ConnectionStateQueued)
 	h.muxAttemptGate.Unlock()
-	h.muxReg.Unlock()
+	h.unlockPairingCandidateAdmission()
 
-	h.publishPairingDetail(validatedSKI, service.ConnectionStateDetail())
+	if !connect {
+		h.publishPairingDetail(validatedSKI, service.ConnectionStateDetail())
+		return reservation, nil, nil
+	}
+	return reservation, &pairingCandidateLaunch{
+		ski: validatedSKI, service: service, candidate: activeCandidate,
+	}, nil
+}
 
-	port := strconv.Itoa(entry.port)
-	path := entry.path
+func pairingCandidateObservationMatchesActive(entry pairingCandidateObservation, active *activePairingCandidate) bool {
+	if active == nil || active.service == nil || entry.ski != active.service.SKI() || entry.revision != active.revision ||
+		entry.path != active.path || strconv.Itoa(entry.port) != active.port {
+		return false
+	}
+	host, ok := pairingCandidateAddress(entry.addresses)
+	return ok && host == active.host
+}
+
+// ConnectPairingCandidate launches one outbound attempt for the exact current
+// selection. It never accepts an endpoint or identity from the caller.
+func (h *Hub) ConnectPairingCandidate(reservation api.PairingCandidateReservation) error {
+	if !reservation.Valid() {
+		return api.ErrPairingCandidateReservationStale
+	}
+	if !h.lockPairingCandidateAdmission() {
+		return api.ErrPairingCandidateReservationStale
+	}
+	var ski string
+	var activeCandidate *activePairingCandidate
+	for candidateSKI, candidate := range h.activePairingCandidates {
+		if candidate != nil && candidate.reservation.Matches(reservation) {
+			ski = candidateSKI
+			activeCandidate = candidate
+			break
+		}
+	}
+	if activeCandidate == nil || activeCandidate.service == nil || activeCandidate.service.Trusted() {
+		h.unlockPairingCandidateAdmission()
+		return api.ErrPairingCandidateReservationStale
+	}
+	if activeCandidate.connectIssued {
+		h.unlockPairingCandidateAdmission()
+		return api.ErrPairingCandidateAlreadyConnecting
+	}
+	h.muxAttemptGate.Lock()
+	if h.outgoingAttemptGate == nil || isNilOutgoingAttemptValue(h.outgoingAttemptGate) {
+		h.muxAttemptGate.Unlock()
+		h.unlockPairingCandidateAdmission()
+		return api.ErrOutgoingAttemptGateRequired
+	}
+	activeCandidate.connectIssued = true
+	activeCandidate.service.ConnectionStateDetail().SetState(api.ConnectionStateQueued)
+	launch := &pairingCandidateLaunch{
+		ski: ski, service: activeCandidate.service, candidate: activeCandidate,
+	}
+	h.muxAttemptGate.Unlock()
+	h.unlockPairingCandidateAdmission()
+
+	h.launchPairingCandidate(launch)
+	return nil
+}
+
+func (h *Hub) launchPairingCandidate(candidateLaunch *pairingCandidateLaunch) {
+	if candidateLaunch == nil || candidateLaunch.candidate == nil || candidateLaunch.service == nil {
+		return
+	}
+	ski := candidateLaunch.ski
+	activeCandidate := candidateLaunch.candidate
+	service := candidateLaunch.service
+	h.publishPairingDetail(ski, service.ConnectionStateDetail())
+
 	launch := func(run func()) { go run() }
 	if h.testHooks != nil && h.testHooks.launchPairingCandidate != nil {
 		launch = h.testHooks.launchPairingCandidate
 	}
 	launch(func() {
 		h.muxReg.Lock()
-		active := h.activePairingCandidates[validatedSKI] == activeCandidate
+		active := h.activePairingCandidates[ski] == activeCandidate && activeCandidate.connectIssued
 		h.muxReg.Unlock()
 		if !active {
 			return
 		}
 		if err := h.connectFoundPairingCandidate(
 			service,
-			host,
-			port,
-			path,
-			validatedSKI,
-			candidateAuthority,
+			activeCandidate.host,
+			activeCandidate.port,
+			activeCandidate.path,
+			ski,
+			activeCandidate.authority,
 		); err != nil && !isInboundPairingDirectionHandoff(err) {
-			h.retirePairingCandidate(validatedSKI, activeCandidate, nil)
+			h.retirePairingCandidate(ski, activeCandidate, nil)
 		}
 	})
-	return nil
 }
 
 func isInboundPairingDirectionHandoff(err error) bool {

@@ -45,8 +45,9 @@ func (h *Hub) enqueueMdnsSnapshot(
 	} else if revision > h.mdnsSnapshotRevision {
 		h.mdnsSnapshotRevision = revision
 	}
+	admission := h.mdnsSnapshotAdmission.Add(1)
 	h.mdnsSnapshotQueue = append(h.mdnsSnapshotQueue, func() {
-		h.reportMdnsSnapshot(entries, newEntries, candidates, revision)
+		h.reportMdnsSnapshot(entries, newEntries, candidates, revision, admission)
 	})
 	if h.mdnsSnapshotDraining {
 		h.mdnsSnapshotMux.Unlock()
@@ -106,18 +107,37 @@ func (h *Hub) drainMdnsSnapshots() {
 	}
 }
 
+// lockPairingCandidateAdmission linearizes candidate authority with every mDNS
+// snapshot already accepted by enqueueMdnsSnapshot. The atomic load is the
+// action's ordering point relative to a concurrent later admission.
+func (h *Hub) lockPairingCandidateAdmission() bool {
+	h.muxReg.Lock()
+	if h.mdnsAppliedAdmission != h.mdnsSnapshotAdmission.Load() {
+		h.muxReg.Unlock()
+		return false
+	}
+	return true
+}
+
+func (h *Hub) unlockPairingCandidateAdmission() {
+	h.muxReg.Unlock()
+}
+
 func (h *Hub) reportMdnsSnapshot(
 	entries map[string]*api.MdnsEntry,
 	_ bool,
 	candidates []api.PairingCandidateObservation,
 	revision uint64,
+	admission uint64,
 ) {
 	h.muxReg.Lock()
 	if revision < h.latestPairingObservationRevision {
+		h.mdnsAppliedAdmission = admission
 		h.muxReg.Unlock()
 		return
 	}
 	h.latestPairingObservationRevision = revision
+	h.mdnsAppliedAdmission = admission
 	retainedConsumed := make(map[string]struct{})
 	for _, candidate := range candidates {
 		if _, consumed := h.consumedPairingCandidates[candidate.CandidateRef]; consumed {
@@ -138,7 +158,23 @@ func (h *Hub) reportMdnsSnapshot(
 			addresses: append([]net.IP(nil), candidate.Addresses...),
 		}
 	}
+	h.muxAttemptGate.Lock()
+	retirements := make([]pairingCandidateRetirement, 0)
+	for ski, active := range h.activePairingCandidates {
+		if active == nil || active.connectIssued {
+			continue
+		}
+		current, exists := h.visiblePairingCandidates[active.candidateRef]
+		if exists && pairingCandidateObservationMatchesActive(current, active) {
+			continue
+		}
+		if retired := h.retireActivePairingCandidateLocked(ski, active, active.authority); retired != nil {
+			retirements = append(retirements, *retired)
+		}
+	}
+	h.muxAttemptGate.Unlock()
 	h.muxReg.Unlock()
+	h.finishPairingCandidateRetirements(retirements)
 
 	// Only durable trust can enter the normal reconnect path. A selected but
 	// untrusted candidate uses its frozen, exact one-dial path below this layer.

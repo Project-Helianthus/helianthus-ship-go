@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
 	"github.com/Project-Helianthus/helianthus-ship-go/logging"
@@ -87,8 +88,15 @@ type pairingCandidateObservation struct {
 }
 
 type activePairingCandidate struct {
-	service   *api.ServiceDetails
-	authority *outboundAttemptAuthority
+	service       *api.ServiceDetails
+	authority     *outboundAttemptAuthority
+	reservation   api.PairingCandidateReservation
+	candidateRef  string
+	revision      uint64
+	host          string
+	port          string
+	path          string
+	connectIssued bool
 }
 
 type pairingCandidateRetirement struct {
@@ -161,6 +169,7 @@ type Hub struct {
 	consumedPairingCandidates        map[string]struct{}
 	activePairingCandidates          map[string]*activePairingCandidate
 	latestPairingObservationRevision uint64
+	mdnsAppliedAdmission             uint64
 	testHooks                        *hubTestHooks
 
 	// The list of known remote services
@@ -187,10 +196,11 @@ type Hub struct {
 	pairingNotificationQueue    []func()
 	pairingNotificationDraining bool
 
-	mdnsSnapshotMux      sync.Mutex
-	mdnsSnapshotQueue    []func()
-	mdnsSnapshotDraining bool
-	mdnsSnapshotRevision uint64
+	mdnsSnapshotMux       sync.Mutex
+	mdnsSnapshotQueue     []func()
+	mdnsSnapshotDraining  bool
+	mdnsSnapshotRevision  uint64
+	mdnsSnapshotAdmission atomic.Uint64
 }
 
 func NewHub(hubReader api.HubReaderInterface,
@@ -226,6 +236,7 @@ var _ api.HubInterface = (*Hub)(nil)
 var _ api.OutgoingAttemptGateSetter = (*Hub)(nil)
 var _ api.PairingRegistrationSetter = (*Hub)(nil)
 var _ api.PairingCandidateQueuer = (*Hub)(nil)
+var _ api.PairingCandidateController = (*Hub)(nil)
 
 // SetOutgoingAttemptGate installs or removes the optional outgoing dial gate.
 func (h *Hub) SetOutgoingAttemptGate(gate api.OutgoingAttemptGate) error {
