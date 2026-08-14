@@ -334,7 +334,17 @@ func (h *Hub) connectFoundPairingCandidate(
 	if h.testHooks != nil && h.testHooks.beforePairingCandidateGate != nil {
 		h.testHooks.beforePairingCandidateGate()
 	}
-	return h.connectFoundServiceWithOptions(remoteService, host, port, path, expectedSKI, false, true, candidateAuthority)
+	return h.connectFoundServiceWithLoggingOptions(
+		remoteService,
+		host,
+		port,
+		path,
+		expectedSKI,
+		false,
+		true,
+		candidateAuthority,
+		"protected SHIP connection",
+	)
 }
 
 func (h *Hub) connectFoundServiceWithOptions(
@@ -346,6 +356,30 @@ func (h *Hub) connectFoundServiceWithOptions(
 	allowEmptyPathFallback bool,
 	requirePairingApproval bool,
 	requiredAuthority *outboundAttemptAuthority,
+) error {
+	return h.connectFoundServiceWithLoggingOptions(
+		remoteService,
+		host,
+		port,
+		path,
+		expectedSKI,
+		allowEmptyPathFallback,
+		requirePairingApproval,
+		requiredAuthority,
+		"",
+	)
+}
+
+func (h *Hub) connectFoundServiceWithLoggingOptions(
+	remoteService *api.ServiceDetails,
+	host,
+	port,
+	path,
+	expectedSKI string,
+	allowEmptyPathFallback bool,
+	requirePairingApproval bool,
+	requiredAuthority *outboundAttemptAuthority,
+	sanitizedLogCategory string,
 ) error {
 	if ski := remoteService.SKI(); ski != "" {
 		h.muxCon.Lock()
@@ -383,7 +417,11 @@ func (h *Hub) connectFoundServiceWithOptions(
 		}()
 	}
 
-	logging.Log().Debugf("initiating connection to %s at %s:%s%s", remoteService.SKI(), host, port, path)
+	if sanitizedLogCategory != "" {
+		logging.Log().Debug("initiating " + sanitizedLogCategory)
+	} else {
+		logging.Log().Debugf("initiating connection to %s at %s:%s%s", remoteService.SKI(), host, port, path)
+	}
 
 	conn, resp, attempt, err := h.gatedDialContextWithExpectedSKI(remoteService, host, port, path, expectedSKI, requiredAuthority)
 	if err == nil {
@@ -1150,7 +1188,7 @@ func (h *Hub) runTrustedRemoteRetry(active *activeTrustedRemoteRetry) {
 	}
 
 	if active.observation.host != "" {
-		_ = h.connectFoundServiceWithOptions(
+		_ = h.connectFoundServiceWithLoggingOptions(
 			active.service,
 			active.observation.host,
 			strconv.Itoa(active.observation.port),
@@ -1159,6 +1197,7 @@ func (h *Hub) runTrustedRemoteRetry(active *activeTrustedRemoteRetry) {
 			false,
 			false,
 			active.authority,
+			"trusted remote retry",
 		)
 	}
 	h.finishTrustedRemoteRetry(ski, active)
@@ -1199,6 +1238,9 @@ func trustedRemoteRetryHost(entry *api.MdnsEntry) (string, bool) {
 		return address, true
 	}
 	host := normalizeOutgoingAttemptHost(entry.Host)
+	if address := net.ParseIP(host); address != nil && (address.IsUnspecified() || address.IsMulticast()) {
+		return "", false
+	}
 	return host, host != ""
 }
 

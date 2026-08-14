@@ -2,12 +2,14 @@ package hub
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
+	"github.com/Project-Helianthus/helianthus-ship-go/logging"
 )
 
 const issue33TrustedRemoteSKI = "0123456789abcdef0123456789abcdef01234567"
@@ -274,6 +276,100 @@ func TestIssue33RetryErrorsDoNotExposeRetainedEndpoint(t *testing.T) {
 	if strings.Contains(err.Error(), "secret-peer.internal") {
 		t.Fatalf("retry error leaks retained endpoint: %v", err)
 	}
+}
+
+func TestIssue33UnsafeFallbackHostNeverReachesGateOrDial(t *testing.T) {
+	for _, host := range []string{"0.0.0.0", "224.0.0.251", "[::]", "[ff02::fb]"} {
+		t.Run(host, func(t *testing.T) {
+			gate := newScriptedAttemptGate(gatePermit)
+			dialer := &fakePeerDialer{err: errAttemptTestDial}
+			hub, _, _ := newAttemptTestHub(t, gate, dialer)
+			hub.ReportMdnsEntries(map[string]*api.MdnsEntry{issue33TrustedRemoteSKI: {
+				Name:       "VR940",
+				Ski:        issue33TrustedRemoteSKI,
+				Identifier: "vr940-ship",
+				Path:       "/ship/private-path",
+				Host:       host,
+				Port:       4712,
+			}}, true)
+			hub.ServiceForSKI(issue33TrustedRemoteSKI).SetTrusted(true)
+
+			if err := hub.RetryTrustedRemote(issue33TrustedRemoteSKI); !errors.Is(err, api.ErrTrustedRemoteRetryUnavailable) {
+				t.Fatalf("unsafe host retry error = %v, want %v", err, api.ErrTrustedRemoteRetryUnavailable)
+			}
+			if requests, _, _, _ := gate.snapshot(); len(requests) != 0 {
+				t.Fatalf("unsafe host reached gate: %d requests", len(requests))
+			}
+			if calls, _ := dialer.snapshot(); len(calls) != 0 {
+				t.Fatalf("unsafe host dialed: %d calls", len(calls))
+			}
+		})
+	}
+}
+
+func TestIssue33TrustedRetryLogOmitsOperationalIdentityAndEndpoint(t *testing.T) {
+	capture := &issue33LogCapture{}
+	logging.SetLogging(capture)
+	t.Cleanup(func() { logging.SetLogging(&logging.NoLogging{}) })
+	gate := newScriptedAttemptGate(gatePermit)
+	hub, _, _ := newAttemptTestHub(t, gate, &fakePeerDialer{err: errAttemptTestDial})
+	issue33ReportUntrustedObservation(hub, issue33TrustedRemoteSKI, "192.0.2.33")
+	hub.ServiceForSKI(issue33TrustedRemoteSKI).SetTrusted(true)
+	var launch func()
+	hub.testHooks = &hubTestHooks{launchTrustedRemoteRetry: func(run func()) { launch = run }}
+
+	if err := hub.RetryTrustedRemote(issue33TrustedRemoteSKI); err != nil {
+		t.Fatalf("schedule retry: %v", err)
+	}
+	launch()
+	logged := capture.String()
+	if !strings.Contains(logged, "trusted remote retry") {
+		t.Fatalf("retry log omitted sanitized category: %q", logged)
+	}
+	for _, privateValue := range []string{
+		issue33TrustedRemoteSKI,
+		"192.0.2.33",
+		"4712",
+		"/ship/",
+	} {
+		if strings.Contains(logged, privateValue) {
+			t.Errorf("retry log leaked %q: %q", privateValue, logged)
+		}
+	}
+}
+
+type issue33LogCapture struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+func (capture *issue33LogCapture) append(value string) {
+	capture.mu.Lock()
+	capture.lines = append(capture.lines, value)
+	capture.mu.Unlock()
+}
+
+func (capture *issue33LogCapture) Trace(args ...interface{}) { capture.append(fmt.Sprint(args...)) }
+func (capture *issue33LogCapture) Tracef(format string, args ...interface{}) {
+	capture.append(fmt.Sprintf(format, args...))
+}
+func (capture *issue33LogCapture) Debug(args ...interface{}) { capture.append(fmt.Sprint(args...)) }
+func (capture *issue33LogCapture) Debugf(format string, args ...interface{}) {
+	capture.append(fmt.Sprintf(format, args...))
+}
+func (capture *issue33LogCapture) Info(args ...interface{}) { capture.append(fmt.Sprint(args...)) }
+func (capture *issue33LogCapture) Infof(format string, args ...interface{}) {
+	capture.append(fmt.Sprintf(format, args...))
+}
+func (capture *issue33LogCapture) Error(args ...interface{}) { capture.append(fmt.Sprint(args...)) }
+func (capture *issue33LogCapture) Errorf(format string, args ...interface{}) {
+	capture.append(fmt.Sprintf(format, args...))
+}
+
+func (capture *issue33LogCapture) String() string {
+	capture.mu.Lock()
+	defer capture.mu.Unlock()
+	return strings.Join(capture.lines, "\n")
 }
 
 func issue33ReportUntrustedObservation(hub *Hub, ski string, addresses ...string) *api.MdnsEntry {
