@@ -1195,9 +1195,8 @@ func trustedRemoteRetryHost(entry *api.MdnsEntry) (string, bool) {
 	if entry == nil {
 		return "", false
 	}
-	addresses := orderedConnectionAddresses(entry.Addresses)
-	if len(addresses) != 0 {
-		return addresses[0].String(), true
+	if address, ok := pairingCandidateAddress(entry.Addresses); ok {
+		return address, true
 	}
 	host := normalizeOutgoingAttemptHost(entry.Host)
 	return host, host != ""

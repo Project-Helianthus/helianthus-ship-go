@@ -37,7 +37,13 @@ func TestIssue33TrustedRemoteRetryUsesCurrentLibraryOwnedObservationAtMostOnce(t
 	gate := newScriptedAttemptGate(gatePermit)
 	dialer := &fakePeerDialer{err: errAttemptTestDial}
 	hub, _, _ := newAttemptTestHub(t, gate, dialer)
-	entry := issue33ReportUntrustedObservation(hub, issue33TrustedRemoteSKI, "192.0.2.33")
+	entry := issue33ReportUntrustedObservation(
+		hub,
+		issue33TrustedRemoteSKI,
+		"0.0.0.0",
+		"224.0.0.1",
+		"192.0.2.33",
+	)
 	service := hub.ServiceForSKI(issue33TrustedRemoteSKI)
 	service.SetTrusted(true)
 	service.ConnectionStateDetail().SetState(api.ConnectionStateNone)
@@ -270,7 +276,11 @@ func TestIssue33RetryErrorsDoNotExposeRetainedEndpoint(t *testing.T) {
 	}
 }
 
-func issue33ReportUntrustedObservation(hub *Hub, ski, address string) *api.MdnsEntry {
+func issue33ReportUntrustedObservation(hub *Hub, ski string, addresses ...string) *api.MdnsEntry {
+	parsed := make([]net.IP, 0, len(addresses))
+	for _, address := range addresses {
+		parsed = append(parsed, net.ParseIP(address))
+	}
 	entry := &api.MdnsEntry{
 		Name:       "VR940",
 		Ski:        ski,
@@ -278,7 +288,7 @@ func issue33ReportUntrustedObservation(hub *Hub, ski, address string) *api.MdnsE
 		Path:       "/ship/",
 		Host:       "vr940.local",
 		Port:       4712,
-		Addresses:  []net.IP{net.ParseIP(address)},
+		Addresses:  parsed,
 	}
 	hub.ReportMdnsEntries(map[string]*api.MdnsEntry{ski: entry}, true)
 	return entry
