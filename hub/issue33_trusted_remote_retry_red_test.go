@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
@@ -171,6 +172,18 @@ func TestIssue33SnapshotChangeOrUntrustInvalidatesScheduledRetry(t *testing.T) {
 				hub.UnregisterRemoteSKI(issue33TrustedRemoteSKI)
 			},
 		},
+		{
+			name: "outgoing gate changed",
+			invalidate: func(hub *Hub) {
+				_ = hub.SetOutgoingAttemptGate(newScriptedAttemptGate(gatePermit))
+			},
+		},
+		{
+			name: "hub shutdown",
+			invalidate: func(hub *Hub) {
+				_, _, _ = hub.beginShutdown()
+			},
+		},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			gate := newScriptedAttemptGate(gatePermit)
@@ -195,6 +208,53 @@ func TestIssue33SnapshotChangeOrUntrustInvalidatesScheduledRetry(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestIssue33QueuedNewerMdnsSnapshotInvalidatesAcceptedRetryBeforeDial(t *testing.T) {
+	gate := newScriptedAttemptGate(gatePermit)
+	hub, gate, reader := newPairingCandidateHub(t, gate)
+	dialer := &fakePeerDialer{err: errAttemptTestDial}
+	hub.dialer = dialer
+	firstCallback := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var blockOnce sync.Once
+	reader.setVisibleUpdate(func(entries []api.RemoteService) {
+		if len(entries) == 0 {
+			return
+		}
+		blockOnce.Do(func() {
+			close(firstCallback)
+			<-releaseFirst
+		})
+	})
+
+	firstDone := make(chan struct{})
+	go func() {
+		issue33ReportUntrustedObservation(hub, issue33TrustedRemoteSKI, "192.0.2.33")
+		close(firstDone)
+	}()
+	waitForPairingCandidateSignal(t, firstCallback, "first trusted-remote mDNS callback")
+	hub.ServiceForSKI(issue33TrustedRemoteSKI).SetTrusted(true)
+	var launch func()
+	hub.testHooks.launchTrustedRemoteRetry = func(run func()) { launch = run }
+	if err := hub.RetryTrustedRemote(issue33TrustedRemoteSKI); err != nil {
+		t.Fatalf("schedule retry from applied observation: %v", err)
+	}
+
+	issue33ReportUntrustedObservation(hub, issue33TrustedRemoteSKI, "192.0.2.99")
+	if err := hub.RetryTrustedRemote(issue33TrustedRemoteSKI); !errors.Is(err, api.ErrTrustedRemoteObservationStale) {
+		t.Fatalf("retry while newer snapshot queued error = %v, want %v", err, api.ErrTrustedRemoteObservationStale)
+	}
+	launch()
+	if requests, _, _, _ := gate.snapshot(); len(requests) != 0 {
+		t.Fatalf("queued-snapshot retry reached gate: %d requests", len(requests))
+	}
+	if calls, _ := dialer.snapshot(); len(calls) != 0 {
+		t.Fatalf("queued-snapshot retry dialed: %d calls", len(calls))
+	}
+
+	close(releaseFirst)
+	waitForPairingCandidateSignal(t, firstDone, "trusted-remote mDNS queue drain")
 }
 
 func TestIssue33RetryErrorsDoNotExposeRetainedEndpoint(t *testing.T) {

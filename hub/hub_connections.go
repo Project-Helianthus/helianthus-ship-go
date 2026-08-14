@@ -1051,6 +1051,169 @@ func (h *Hub) isConnectionAttemptRunning(ski string) bool {
 	return running
 }
 
+// RetryTrustedRemote starts one explicit reconnect path for an exact trusted,
+// disconnected remote. The selected endpoint is retained by the Hub from the
+// latest applied mDNS snapshot; callers cannot supply or replace it.
+func (h *Hub) RetryTrustedRemote(expectedSKI string) error {
+	ski, err := validPairingCandidateSKI(expectedSKI)
+	if err != nil {
+		return err
+	}
+
+	h.muxReg.Lock()
+	if h.mdnsAppliedAdmission != h.mdnsSnapshotAdmission.Load() {
+		h.muxReg.Unlock()
+		return api.ErrTrustedRemoteObservationStale
+	}
+	observation, observed := h.visibleTrustedRemoteObservations[ski]
+	if !observed {
+		h.muxReg.Unlock()
+		return api.ErrTrustedRemoteRetryUnavailable
+	}
+	service := h.remoteServices[ski]
+	if service == nil || !service.Trusted() {
+		h.muxReg.Unlock()
+		return api.ErrTrustedRemoteRetryNotTrusted
+	}
+	if h.activeTrustedRemoteRetries[ski] != nil {
+		h.muxReg.Unlock()
+		return api.ErrTrustedRemoteRetryBusy
+	}
+
+	h.muxCon.Lock()
+	if h.hasShutdown {
+		h.muxCon.Unlock()
+		h.muxReg.Unlock()
+		return api.ErrTrustedRemoteRetryUnavailable
+	}
+	if h.connections[ski] != nil {
+		h.muxCon.Unlock()
+		h.muxReg.Unlock()
+		return api.ErrTrustedRemoteRetryConnected
+	}
+	if h.connectionsInitiating[ski] || h.inboundPairingReservations[ski] != nil {
+		h.muxCon.Unlock()
+		h.muxReg.Unlock()
+		return api.ErrTrustedRemoteRetryBusy
+	}
+
+	h.muxConAttempt.Lock()
+	if h.connectionAttemptRunning[ski] {
+		h.muxConAttempt.Unlock()
+		h.muxCon.Unlock()
+		h.muxReg.Unlock()
+		return api.ErrTrustedRemoteRetryBusy
+	}
+	h.connectionAttemptRunning[ski] = true
+
+	h.muxAttemptGate.Lock()
+	if h.outboundShutdown {
+		h.muxAttemptGate.Unlock()
+		h.connectionAttemptRunning[ski] = false
+		h.muxConAttempt.Unlock()
+		h.muxCon.Unlock()
+		h.muxReg.Unlock()
+		return api.ErrTrustedRemoteRetryUnavailable
+	}
+	active := &activeTrustedRemoteRetry{
+		service:     service,
+		authority:   h.currentOutboundAuthorityLocked(ski),
+		observation: observation,
+	}
+	h.activeTrustedRemoteRetries[ski] = active
+	h.muxAttemptGate.Unlock()
+	h.muxConAttempt.Unlock()
+	h.muxCon.Unlock()
+	h.muxReg.Unlock()
+
+	h.launchTrustedRemoteRetry(active)
+	return nil
+}
+
+func (h *Hub) launchTrustedRemoteRetry(active *activeTrustedRemoteRetry) {
+	run := func() { h.runTrustedRemoteRetry(active) }
+	if h.testHooks != nil && h.testHooks.launchTrustedRemoteRetry != nil {
+		h.testHooks.launchTrustedRemoteRetry(run)
+		return
+	}
+	go run()
+}
+
+func (h *Hub) runTrustedRemoteRetry(active *activeTrustedRemoteRetry) {
+	if active == nil || active.service == nil {
+		return
+	}
+	ski := active.service.SKI()
+	if !h.trustedRemoteRetryStillCurrent(ski, active) {
+		h.finishTrustedRemoteRetry(ski, active)
+		return
+	}
+
+	if active.observation.host != "" {
+		_ = h.connectFoundServiceWithOptions(
+			active.service,
+			active.observation.host,
+			strconv.Itoa(active.observation.port),
+			active.observation.path,
+			"",
+			false,
+			false,
+			active.authority,
+		)
+	}
+	h.finishTrustedRemoteRetry(ski, active)
+}
+
+func (h *Hub) trustedRemoteRetryStillCurrent(ski string, active *activeTrustedRemoteRetry) bool {
+	h.muxReg.Lock()
+	defer h.muxReg.Unlock()
+	if h.activeTrustedRemoteRetries[ski] != active ||
+		h.mdnsAppliedAdmission != h.mdnsSnapshotAdmission.Load() ||
+		active.service != h.remoteServices[ski] ||
+		!active.service.Trusted() {
+		return false
+	}
+	observation, exists := h.visibleTrustedRemoteObservations[ski]
+	if !exists || observation.revision != active.observation.revision ||
+		observation.admission != active.observation.admission {
+		return false
+	}
+
+	h.muxCon.Lock()
+	defer h.muxCon.Unlock()
+	if h.hasShutdown || h.connections[ski] != nil ||
+		h.connectionsInitiating[ski] || h.inboundPairingReservations[ski] != nil {
+		return false
+	}
+
+	h.muxAttemptGate.Lock()
+	defer h.muxAttemptGate.Unlock()
+	return !h.outboundShutdown && h.outboundAuthorities[ski] == active.authority
+}
+
+func trustedRemoteRetryHost(entry *api.MdnsEntry) (string, bool) {
+	if entry == nil {
+		return "", false
+	}
+	addresses := orderedConnectionAddresses(entry.Addresses)
+	if len(addresses) != 0 {
+		return addresses[0].String(), true
+	}
+	host := normalizeOutgoingAttemptHost(entry.Host)
+	return host, host != ""
+}
+
+func (h *Hub) finishTrustedRemoteRetry(ski string, active *activeTrustedRemoteRetry) {
+	h.muxReg.Lock()
+	if h.activeTrustedRemoteRetries[ski] != active {
+		h.muxReg.Unlock()
+		return
+	}
+	delete(h.activeTrustedRemoteRetries, ski)
+	h.muxReg.Unlock()
+	h.setConnectionAttemptRunning(ski, false)
+}
+
 // register a new ship Connection
 func (h *Hub) registerConnection(connection api.ShipConnectionInterface) bool {
 	remoteSKI := connection.RemoteSKI()

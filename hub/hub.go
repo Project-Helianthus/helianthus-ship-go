@@ -99,6 +99,20 @@ type activePairingCandidate struct {
 	connectIssued bool
 }
 
+type trustedRemoteObservation struct {
+	revision  uint64
+	admission uint64
+	host      string
+	port      int
+	path      string
+}
+
+type activeTrustedRemoteRetry struct {
+	service     *api.ServiceDetails
+	authority   *outboundAttemptAuthority
+	observation trustedRemoteObservation
+}
+
 type pairingCandidateRetirement struct {
 	ski       string
 	service   *api.ServiceDetails
@@ -121,6 +135,7 @@ type hubTestHooks struct {
 	beforePairingCandidateRetire     func()
 	beforeOutboundAttemptRelease     func()
 	afterRegisterRemoteServiceLookup func()
+	launchTrustedRemoteRetry         func(func())
 }
 
 // defines the delay timeframes in seconds depening on the connection attempt counter
@@ -168,6 +183,8 @@ type Hub struct {
 	visiblePairingCandidates         map[string]pairingCandidateObservation
 	consumedPairingCandidates        map[string]struct{}
 	activePairingCandidates          map[string]*activePairingCandidate
+	visibleTrustedRemoteObservations map[string]trustedRemoteObservation
+	activeTrustedRemoteRetries       map[string]*activeTrustedRemoteRetry
 	latestPairingObservationRevision uint64
 	mdnsAppliedAdmission             uint64
 	testHooks                        *hubTestHooks
@@ -209,24 +226,26 @@ func NewHub(hubReader api.HubReaderInterface,
 	certificate tls.Certificate,
 	localService *api.ServiceDetails) *Hub {
 	hub := &Hub{
-		connections:                make(map[string]api.ShipConnectionInterface),
-		connectionAttemptCounter:   make(map[string]int),
-		connectionAttemptRunning:   make(map[string]bool),
-		connectionsInitiating:      make(map[string]bool),
-		inboundPairingReservations: make(map[string]*inboundPairingReservation),
-		supersededConnections:      make(map[api.ShipConnectionInterface]struct{}),
-		remoteServices:             make(map[string]*api.ServiceDetails),
-		visiblePairingCandidates:   make(map[string]pairingCandidateObservation),
-		consumedPairingCandidates:  make(map[string]struct{}),
-		activePairingCandidates:    make(map[string]*activePairingCandidate),
-		hubReader:                  hubReader,
-		port:                       port,
-		certifciate:                certificate,
-		localService:               localService,
-		mdns:                       mdns,
-		dialer:                     newOutgoingAttemptDialer(certificate),
-		outboundAuthorities:        make(map[string]*outboundAttemptAuthority),
-		outboundAttempts:           make(map[string]map[*outboundAttemptRegistration]struct{}),
+		connections:                      make(map[string]api.ShipConnectionInterface),
+		connectionAttemptCounter:         make(map[string]int),
+		connectionAttemptRunning:         make(map[string]bool),
+		connectionsInitiating:            make(map[string]bool),
+		inboundPairingReservations:       make(map[string]*inboundPairingReservation),
+		supersededConnections:            make(map[api.ShipConnectionInterface]struct{}),
+		remoteServices:                   make(map[string]*api.ServiceDetails),
+		visiblePairingCandidates:         make(map[string]pairingCandidateObservation),
+		consumedPairingCandidates:        make(map[string]struct{}),
+		activePairingCandidates:          make(map[string]*activePairingCandidate),
+		visibleTrustedRemoteObservations: make(map[string]trustedRemoteObservation),
+		activeTrustedRemoteRetries:       make(map[string]*activeTrustedRemoteRetry),
+		hubReader:                        hubReader,
+		port:                             port,
+		certifciate:                      certificate,
+		localService:                     localService,
+		mdns:                             mdns,
+		dialer:                           newOutgoingAttemptDialer(certificate),
+		outboundAuthorities:              make(map[string]*outboundAttemptAuthority),
+		outboundAttempts:                 make(map[string]map[*outboundAttemptRegistration]struct{}),
 	}
 
 	return hub
@@ -237,6 +256,7 @@ var _ api.OutgoingAttemptGateSetter = (*Hub)(nil)
 var _ api.PairingRegistrationSetter = (*Hub)(nil)
 var _ api.PairingCandidateQueuer = (*Hub)(nil)
 var _ api.PairingCandidateController = (*Hub)(nil)
+var _ api.TrustedRemoteRetryController = (*Hub)(nil)
 
 // SetOutgoingAttemptGate installs or removes the optional outgoing dial gate.
 func (h *Hub) SetOutgoingAttemptGate(gate api.OutgoingAttemptGate) error {
@@ -260,12 +280,21 @@ func (h *Hub) SetOutgoingAttemptGate(gate api.OutgoingAttemptGate) error {
 			retirements = append(retirements, *retired)
 		}
 	}
+	retriedSKIs := make([]string, 0, len(h.activeTrustedRemoteRetries))
+	for ski := range h.activeTrustedRemoteRetries {
+		h.rotateOutboundAuthorityLocked(ski)
+		delete(h.activeTrustedRemoteRetries, ski)
+		retriedSKIs = append(retriedSKIs, ski)
+	}
 	cancellations := h.removeAllOutboundAttemptRegistrationsLocked()
 	h.muxAttemptGate.Unlock()
 	h.removeOutboundAttemptConnections(cancellations)
 	h.muxReg.Unlock()
 	cancelOutboundAttemptRegistrations(cancellations)
 	h.finishPairingCandidateRetirements(retirements)
+	for _, ski := range retriedSKIs {
+		h.setConnectionAttemptRunning(ski, false)
+	}
 	return nil
 }
 
@@ -275,6 +304,8 @@ func (h *Hub) revokeOutboundAttempts(ski string, service *api.ServiceDetails) {
 	h.rotateOutboundAuthorityLocked(ski)
 	cancellations := h.removeOutboundAttemptRegistrationsLocked(ski)
 	delete(h.activePairingCandidates, ski)
+	_, retried := h.activeTrustedRemoteRetries[ski]
+	delete(h.activeTrustedRemoteRetries, ski)
 	service.SetTrusted(false)
 	service.ConnectionStateDetail().SetState(api.ConnectionStateNone)
 	h.muxAttemptGate.Unlock()
@@ -283,6 +314,9 @@ func (h *Hub) revokeOutboundAttempts(ski string, service *api.ServiceDetails) {
 
 	// Cancellation may close a SHIP connection and re-enter the Hub.
 	cancelOutboundAttemptRegistrations(cancellations)
+	if retried {
+		h.setConnectionAttemptRunning(ski, false)
+	}
 }
 
 func (h *Hub) outgoingAttemptGateSnapshot(
