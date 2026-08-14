@@ -133,11 +133,19 @@ func (h *Hub) reportMdnsSnapshot(
 	h.muxReg.Lock()
 	if revision < h.latestPairingObservationRevision {
 		h.mdnsAppliedAdmission = admission
+		h.muxAttemptGate.Lock()
+		cancellations, retriedSKIs := h.invalidateTrustedRemoteRetriesLocked(nil)
+		h.muxAttemptGate.Unlock()
+		h.removeOutboundAttemptConnections(cancellations)
 		h.muxReg.Unlock()
+		cancelOutboundAttemptRegistrations(cancellations)
+		h.clearTrustedRemoteRetryRunning(retriedSKIs)
 		return
 	}
 	h.latestPairingObservationRevision = revision
 	h.mdnsAppliedAdmission = admission
+	trustedObservations := trustedRemoteObservations(entries, revision, admission)
+	h.visibleTrustedRemoteObservations = trustedObservations
 	retainedConsumed := make(map[string]struct{})
 	for _, candidate := range candidates {
 		if _, consumed := h.consumedPairingCandidates[candidate.CandidateRef]; consumed {
@@ -172,9 +180,13 @@ func (h *Hub) reportMdnsSnapshot(
 			retirements = append(retirements, *retired)
 		}
 	}
+	cancellations, retriedSKIs := h.invalidateTrustedRemoteRetriesLocked(trustedObservations)
 	h.muxAttemptGate.Unlock()
+	h.removeOutboundAttemptConnections(cancellations)
 	h.muxReg.Unlock()
 	h.finishPairingCandidateRetirements(retirements)
+	cancelOutboundAttemptRegistrations(cancellations)
+	h.clearTrustedRemoteRetryRunning(retriedSKIs)
 
 	// Only durable trust can enter the normal reconnect path. A selected but
 	// untrusted candidate uses its frozen, exact one-dial path below this layer.
@@ -241,5 +253,72 @@ func (h *Hub) reportMdnsSnapshot(
 	})
 	if reader, ok := h.hubReader.(api.PairingCandidateHubReaderInterface); ok {
 		reader.VisiblePairingCandidatesUpdated(candidateRefs)
+	}
+}
+
+func trustedRemoteObservations(
+	entries map[string]*api.MdnsEntry,
+	revision uint64,
+	admission uint64,
+) map[string]trustedRemoteObservation {
+	observations := make(map[string]trustedRemoteObservation)
+	ambiguous := make(map[string]struct{})
+	for _, entry := range entries {
+		if entry == nil || entry.Port <= 0 || entry.Port > 65535 {
+			continue
+		}
+		ski, err := validPairingCandidateSKI(entry.Ski)
+		if err != nil {
+			continue
+		}
+		if _, duplicate := observations[ski]; duplicate {
+			delete(observations, ski)
+			ambiguous[ski] = struct{}{}
+			continue
+		}
+		if _, duplicate := ambiguous[ski]; duplicate {
+			continue
+		}
+		host, ok := trustedRemoteRetryHost(entry)
+		if !ok {
+			continue
+		}
+		observations[ski] = trustedRemoteObservation{
+			revision:  revision,
+			admission: admission,
+			host:      host,
+			port:      entry.Port,
+			path:      entry.Path,
+		}
+	}
+	return observations
+}
+
+// invalidateTrustedRemoteRetriesLocked requires muxReg and muxAttemptGate.
+// Each retry is bound to one exact applied mDNS observation. A later admitted
+// observation rotates its outbound authority and cancels any registered dial.
+func (h *Hub) invalidateTrustedRemoteRetriesLocked(
+	current map[string]trustedRemoteObservation,
+) ([]*outboundAttemptRegistration, []string) {
+	var cancellations []*outboundAttemptRegistration
+	var retriedSKIs []string
+	for ski, active := range h.activeTrustedRemoteRetries {
+		observation, exists := current[ski]
+		if exists && active != nil &&
+			observation.revision == active.observation.revision &&
+			observation.admission == active.observation.admission {
+			continue
+		}
+		h.rotateOutboundAuthorityLocked(ski)
+		cancellations = append(cancellations, h.removeOutboundAttemptRegistrationsLocked(ski)...)
+		delete(h.activeTrustedRemoteRetries, ski)
+		retriedSKIs = append(retriedSKIs, ski)
+	}
+	return cancellations, retriedSKIs
+}
+
+func (h *Hub) clearTrustedRemoteRetryRunning(skis []string) {
+	for _, ski := range skis {
+		h.setConnectionAttemptRunning(ski, false)
 	}
 }
