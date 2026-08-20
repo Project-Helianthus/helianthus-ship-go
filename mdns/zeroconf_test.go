@@ -219,6 +219,87 @@ func TestIssue35DefaultAndMultiInterfaceZeroconfRouteReceiveScopeToCandidate(t *
 	}
 }
 
+func TestIssue35SameSHIPPublicationRetainsAllInterfaceRoutesWithoutCandidateRotation(t *testing.T) {
+	interfaces := []net.Interface{
+		{Index: 7, Name: "en7", Flags: net.FlagUp | net.FlagMulticast},
+		{Index: 8, Name: "en8", Flags: net.FlagUp | net.FlagMulticast},
+	}
+	wantAddresses := []netip.Addr{
+		netip.MustParseAddr("fe80::35").WithZone("en7"),
+		netip.MustParseAddr("fe80::35").WithZone("en8"),
+	}
+	for _, order := range [][]int{{1, 0}, {0, 1}} {
+		name := interfaces[order[0]].Name + "_then_" + interfaces[order[1]].Name
+		t.Run(name, func(t *testing.T) {
+			provider := NewZeroconfProvider(interfaces)
+			router, ok := any(provider).(issue35ZeroconfInterfaceRouter)
+			if !ok {
+				t.Fatal("Zeroconf provider has no per-interface browse routing seam")
+			}
+			manager := NewMDNS(
+				"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				"Helianthus",
+				"Gateway",
+				"HEMS",
+				"local-ship-id",
+				"helianthus",
+				4712,
+				nil,
+				MdnsProviderSelectionGoZeroConfOnly,
+			)
+			service := &zeroconf.ServiceEntry{
+				ServiceRecord: zeroconf.ServiceRecord{Instance: "VR940"},
+				HostName:      "vr940.local",
+				Port:          12480,
+				Text: []string{
+					"txtvers=1",
+					"id=vr940-ship-id",
+					"path=/ship/",
+					"ski=3535353535353535353535353535353535353535",
+					"register=true",
+				},
+				AddrIPv6: []net.IP{net.ParseIP("fe80::35")},
+			}
+
+			router.processScopedServiceForInterface(
+				interfaces[order[0]], service, false, manager.processScopedMdnsEntry,
+			)
+			_, firstCandidates, _ := manager.copyMdnsSnapshot()
+			if len(firstCandidates) != 1 || firstCandidates[0].CandidateRef == "" {
+				t.Fatalf("first scoped observation candidates = %#v, want one stable capability", firstCandidates)
+			}
+			candidateRef := firstCandidates[0].CandidateRef
+
+			router.processScopedServiceForInterface(
+				interfaces[order[1]], service, false, manager.processScopedMdnsEntry,
+			)
+			_, candidates, _ := manager.copyMdnsSnapshot()
+			if len(candidates) != 1 {
+				t.Fatalf("combined scoped observations candidates = %#v, want one", candidates)
+			}
+			if candidates[0].CandidateRef != candidateRef {
+				t.Errorf("CandidateRef rotated without remove: got %q, want %q",
+					candidates[0].CandidateRef, candidateRef)
+			}
+			if !reflect.DeepEqual(candidates[0].ScopedAddresses, wantAddresses) {
+				t.Errorf("combined scoped routes = %v, want deterministic %v",
+					candidates[0].ScopedAddresses, wantAddresses)
+			}
+
+			// A repeated add from an already-observed interface is idempotent and
+			// must neither duplicate routes nor stale the existing selection.
+			router.processScopedServiceForInterface(
+				interfaces[order[0]], service, false, manager.processScopedMdnsEntry,
+			)
+			_, repeated, _ := manager.copyMdnsSnapshot()
+			if len(repeated) != 1 || repeated[0].CandidateRef != candidateRef ||
+				!reflect.DeepEqual(repeated[0].ScopedAddresses, wantAddresses) {
+				t.Fatalf("repeated scoped add changed stable selection: %#v", repeated)
+			}
+		})
+	}
+}
+
 func TestScopedZeroconfReannounceShutsDownPreviousServer(t *testing.T) {
 	iface, address := localMulticastAddress(t)
 	provider := newScopedZeroconfProvider([]net.Interface{iface}, "repeat-test-host", address)
