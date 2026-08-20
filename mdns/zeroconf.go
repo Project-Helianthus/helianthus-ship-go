@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sort"
 	"sync"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
@@ -24,15 +25,24 @@ type ZeroconfProvider struct {
 	mux  sync.Mutex
 	wait sync.WaitGroup
 
+	observationMux      sync.Mutex
+	serviceObservations map[string]map[zeroconfInterfaceScope][]netip.Addr
+
 	register      func(string, string, string, int, []string, []net.Interface, ...zeroconf.ServerOption) (*zeroconf.Server, error)
 	registerProxy func(string, string, string, int, string, []string, []string, []net.Interface, ...zeroconf.ServerOption) (*zeroconf.Server, error)
 }
 
+type zeroconfInterfaceScope struct {
+	index int
+	name  string
+}
+
 func NewZeroconfProvider(ifaces []net.Interface) *ZeroconfProvider {
 	return &ZeroconfProvider{
-		ifaces:        ifaces,
-		register:      zeroconf.Register,
-		registerProxy: zeroconf.RegisterProxy,
+		ifaces:              ifaces,
+		serviceObservations: make(map[string]map[zeroconfInterfaceScope][]netip.Addr),
+		register:            zeroconf.Register,
+		registerProxy:       zeroconf.RegisterProxy,
 	}
 }
 
@@ -95,6 +105,9 @@ func (z *ZeroconfProvider) Shutdown() {
 		cancel()
 	}
 	z.wait.Wait()
+	z.observationMux.Lock()
+	clear(z.serviceObservations)
+	z.observationMux.Unlock()
 }
 
 func (z *ZeroconfProvider) Announce(serviceName string, port int, txt []string) error {
@@ -258,8 +271,51 @@ func (z *ZeroconfProvider) processScopedServiceForInterface(
 		return
 	}
 	elements := parseTxt(service.Text)
-	addresses := scopedServiceAddressesForZone(service, iface.Name)
-	cb(elements, service.Instance, service.HostName, addresses, service.Port, remove)
+	observationKey := mdnsObservationKey(service.Instance, service.HostName, service.Port, elements)
+	scope := zeroconfInterfaceScope{index: iface.Index, name: iface.Name}
+
+	z.observationMux.Lock()
+	defer z.observationMux.Unlock()
+	observations := z.serviceObservations[observationKey]
+	if remove {
+		if _, exists := observations[scope]; !exists {
+			return
+		}
+		delete(observations, scope)
+		if len(observations) == 0 {
+			delete(z.serviceObservations, observationKey)
+			cb(elements, service.Instance, service.HostName, nil, service.Port, true)
+			return
+		}
+	} else {
+		if observations == nil {
+			observations = make(map[zeroconfInterfaceScope][]netip.Addr)
+			z.serviceObservations[observationKey] = observations
+		}
+		observations[scope] = scopedServiceAddressesForZone(service, iface.Name)
+	}
+	addresses := aggregateScopedServiceAddresses(observations)
+	cb(elements, service.Instance, service.HostName, addresses, service.Port, false)
+}
+
+func aggregateScopedServiceAddresses(
+	observations map[zeroconfInterfaceScope][]netip.Addr,
+) []netip.Addr {
+	seen := make(map[netip.Addr]struct{})
+	addresses := make([]netip.Addr, 0)
+	for _, scoped := range observations {
+		for _, address := range scoped {
+			if _, exists := seen[address]; exists {
+				continue
+			}
+			seen[address] = struct{}{}
+			addresses = append(addresses, address)
+		}
+	}
+	sort.Slice(addresses, func(left, right int) bool {
+		return addresses[left].Compare(addresses[right]) < 0
+	})
+	return addresses
 }
 
 func (z *ZeroconfProvider) scopedServiceAddresses(service *zeroconf.ServiceEntry) []netip.Addr {

@@ -142,3 +142,36 @@ func TestIssue35ScopedAddressPathPreservesIPv4AndGlobalIPv6(t *testing.T) {
 
 	assertIssue20EndpointSweep(t, entry, []string{"192.0.2.24", "2001:db8::24"})
 }
+
+func TestIssue35AdditiveScopedRouteDoesNotStaleFrozenSelection(t *testing.T) {
+	const ski = "1111111111111111111111111111111111111111"
+	active := &activePairingCandidate{
+		service:  api.NewServiceDetails(ski),
+		revision: 7,
+		host:     "fe80::35%en8",
+		port:     "12480",
+		path:     "/ship/",
+	}
+	additive := pairingCandidateObservation{
+		ski:      ski,
+		revision: 8,
+		port:     12480,
+		path:     "/ship/",
+		scopedAddresses: []netip.Addr{
+			netip.MustParseAddr("fe80::35").WithZone("en7"),
+			netip.MustParseAddr("fe80::35").WithZone("en8"),
+		},
+	}
+	if !pairingCandidateObservationMatchesActive(additive, active) {
+		t.Fatal("additive scoped route staled a frozen endpoint that remains observable")
+	}
+
+	withdrawn := additive
+	withdrawn.revision++
+	withdrawn.scopedAddresses = []netip.Addr{
+		netip.MustParseAddr("fe80::35").WithZone("en7"),
+	}
+	if pairingCandidateObservationMatchesActive(withdrawn, active) {
+		t.Fatal("frozen selection survived withdrawal of its exact scoped endpoint")
+	}
+}

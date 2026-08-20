@@ -296,6 +296,41 @@ func TestIssue35SameSHIPPublicationRetainsAllInterfaceRoutesWithoutCandidateRota
 				!reflect.DeepEqual(repeated[0].ScopedAddresses, wantAddresses) {
 				t.Fatalf("repeated scoped add changed stable selection: %#v", repeated)
 			}
+
+			router.processScopedServiceForInterface(
+				interfaces[order[0]], service, true, manager.processScopedMdnsEntry,
+			)
+			_, afterPartialRemove, _ := manager.copyMdnsSnapshot()
+			remainingAddress := netip.MustParseAddr("fe80::35").WithZone(interfaces[order[1]].Name)
+			if len(afterPartialRemove) != 1 ||
+				!reflect.DeepEqual(afterPartialRemove[0].ScopedAddresses, []netip.Addr{remainingAddress}) {
+				t.Fatalf("partial interface remove withdrew wrong routes: %#v, want only %s",
+					afterPartialRemove, remainingAddress)
+			}
+			if afterPartialRemove[0].CandidateRef == candidateRef {
+				t.Fatalf("CandidateRef did not rotate after effective route withdrawal: %q",
+					afterPartialRemove[0].CandidateRef)
+			}
+			postRemoveRef := afterPartialRemove[0].CandidateRef
+
+			// Repeating the same remove is a no-op: it must not retract the other
+			// scope or rotate the still-valid selection.
+			router.processScopedServiceForInterface(
+				interfaces[order[0]], service, true, manager.processScopedMdnsEntry,
+			)
+			_, repeatedRemove, _ := manager.copyMdnsSnapshot()
+			if len(repeatedRemove) != 1 || repeatedRemove[0].CandidateRef != postRemoveRef ||
+				!reflect.DeepEqual(repeatedRemove[0].ScopedAddresses, []netip.Addr{remainingAddress}) {
+				t.Fatalf("duplicate interface remove changed remaining selection: %#v", repeatedRemove)
+			}
+
+			router.processScopedServiceForInterface(
+				interfaces[order[1]], service, true, manager.processScopedMdnsEntry,
+			)
+			_, afterFinalRemove, _ := manager.copyMdnsSnapshot()
+			if len(afterFinalRemove) != 0 {
+				t.Fatalf("final interface remove retained candidate: %#v", afterFinalRemove)
+			}
 		})
 	}
 }

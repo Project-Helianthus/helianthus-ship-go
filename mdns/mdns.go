@@ -668,6 +668,9 @@ func (m *MdnsManager) processScopedMdnsEntry(elements map[string]string, name, h
 		updated = true
 		logging.Log().Debug("mdns: remove - ski:", ski, "name:", name, "brand:", brand, "model:", model, "typ:", deviceType, "identifier:", identifier, "register:", register, "host:", host, "port:", port, "addresses:", addresses)
 	case exists && !remove:
+		rotateCandidate := scopedAddressSetLost(entry.ScopedAddresses, addresses) ||
+			entry.Register != (register == "true") || entry.Brand != brand ||
+			entry.Type != deviceType || entry.Model != model
 		if !sameIPList(entry.Addresses, legacyAddresses) ||
 			!sameScopedIPList(entry.ScopedAddresses, addresses) ||
 			entry.UnscopedLinkLocalObserved != unscopedLinkLocalObserved ||
@@ -679,7 +682,9 @@ func (m *MdnsManager) processScopedMdnsEntry(elements map[string]string, name, h
 			entry.Brand = brand
 			entry.Type = deviceType
 			entry.Model = model
-			m.candidateRefs[observationKey] = m.nextCandidateRefLocked(observationKey)
+			if rotateCandidate {
+				m.candidateRefs[observationKey] = m.nextCandidateRefLocked(observationKey)
+			}
 			updated = true
 			logging.Log().Debug("mdns: update - ski:", ski, "name:", name, "brand:", brand, "model:", model, "typ:", deviceType, "identifier:", identifier, "register:", register, "host:", host, "port:", port, "addresses:", addresses)
 		}
@@ -721,6 +726,22 @@ func (m *MdnsManager) processScopedMdnsEntry(elements map[string]string, name, h
 	if m.report != nil && updated {
 		m.reportEntries(entries, candidates, true, revision)
 	}
+}
+
+func scopedAddressSetLost(previous, current []netip.Addr) bool {
+	for _, previousAddress := range previous {
+		found := false
+		for _, currentAddress := range current {
+			if previousAddress == currentAddress {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return true
+		}
+	}
+	return false
 }
 
 func normalizeMdnsAddresses(addresses []netip.Addr) ([]netip.Addr, []net.IP, bool) {

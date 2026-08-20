@@ -211,12 +211,16 @@ func (h *Hub) admitPairingCandidate(
 }
 
 func pairingCandidateObservationMatchesActive(entry pairingCandidateObservation, active *activePairingCandidate) bool {
-	if active == nil || active.service == nil || entry.ski != active.service.SKI() || entry.revision != active.revision ||
+	if active == nil || active.service == nil || entry.ski != active.service.SKI() ||
 		entry.path != active.path || strconv.Itoa(entry.port) != active.port {
 		return false
 	}
-	host, ok := pairingCandidateAddress(entry.scopedAddresses, entry.addresses)
-	return ok && host == active.host
+	for _, address := range orderedConnectionAddresses(entry.scopedAddresses, entry.addresses) {
+		if address.String() == active.host {
+			return true
+		}
+	}
+	return false
 }
 
 // ConnectPairingCandidate launches one outbound attempt for the exact current
