@@ -952,7 +952,6 @@ func (h *Hub) initateConnectionWithError(remoteService *api.ServiceDetails, entr
 	}
 
 	addresses := orderedConnectionAddresses(entry.ScopedAddresses, entry.Addresses)
-	hadObservedAddresses := len(entry.ScopedAddresses) > 0 || len(entry.Addresses) > 0
 	for _, address := range addresses {
 		logging.Log().Debug("trying to connect to", remoteService.SKI(), "at", address)
 		addressValue := address.String()
@@ -976,8 +975,7 @@ func (h *Hub) initateConnectionWithError(remoteService *api.ServiceDetails, entr
 	}
 
 	if entry.Host != "" &&
-		!entry.UnscopedLinkLocalObserved &&
-		(!hadObservedAddresses || len(addresses) > 0) &&
+		!mdnsEntryHasUnscopedLinkLocal(entry) &&
 		!hostMatchesConnectionAddress(entry.Host, addresses) {
 		logging.Log().Debug("trying to connect to", remoteService.SKI(), "at", entry.Host)
 		if err = h.connectFoundService(
@@ -1295,10 +1293,7 @@ func trustedRemoteRetryHost(entry *api.MdnsEntry) (string, bool) {
 	if address, ok := pairingCandidateAddress(entry.ScopedAddresses, entry.Addresses); ok {
 		return address, true
 	}
-	if entry.UnscopedLinkLocalObserved {
-		return "", false
-	}
-	if len(entry.ScopedAddresses) > 0 || len(entry.Addresses) > 0 {
+	if mdnsEntryHasUnscopedLinkLocal(entry) {
 		return "", false
 	}
 	host, valid := validatedOutgoingAttemptHost(entry.Host)
@@ -1306,6 +1301,26 @@ func trustedRemoteRetryHost(entry *api.MdnsEntry) (string, bool) {
 		return "", false
 	}
 	return host, true
+}
+
+func mdnsEntryHasUnscopedLinkLocal(entry *api.MdnsEntry) bool {
+	if entry == nil {
+		return false
+	}
+	if entry.UnscopedLinkLocalObserved {
+		return true
+	}
+	for _, address := range entry.ScopedAddresses {
+		if address.Is6() && address.IsLinkLocalUnicast() && address.Zone() == "" {
+			return true
+		}
+	}
+	for _, address := range entry.Addresses {
+		if address != nil && address.To4() == nil && address.IsLinkLocalUnicast() {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *Hub) finishTrustedRemoteRetry(ski string, active *activeTrustedRemoteRetry) {
