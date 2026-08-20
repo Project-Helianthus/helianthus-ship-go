@@ -368,6 +368,15 @@ func (h *Hub) takeTransientPINProviderForAuthorityLocked(
 	return registration.provider
 }
 
+func (h *Hub) takeAllTransientPINProvidersLocked() map[string]api.TransientPINProvider {
+	providers := make(map[string]api.TransientPINProvider, len(h.transientPINProviders))
+	for remoteSKI, registration := range h.transientPINProviders {
+		providers[remoteSKI] = registration.provider
+		delete(h.transientPINProviders, remoteSKI)
+	}
+	return providers
+}
+
 func discardTransientPINProvider(remoteSKI string, provider api.TransientPINProvider) {
 	if provider == nil || isNilOutgoingAttemptValue(provider) {
 		return
@@ -377,6 +386,12 @@ func discardTransientPINProvider(remoteSKI string, provider api.TransientPINProv
 		return
 	}
 	discarder.DiscardTransientPIN(remoteSKI)
+}
+
+func discardTransientPINProviders(providers map[string]api.TransientPINProvider) {
+	for remoteSKI, provider := range providers {
+		discardTransientPINProvider(remoteSKI, provider)
+	}
 }
 
 func (h *Hub) launchPairingCandidate(candidateLaunch *pairingCandidateLaunch) {
@@ -479,14 +494,12 @@ func (h *Hub) retireActivePairingCandidateLocked(
 	retirementAuthority := h.rotateOutboundAuthorityLocked(ski)
 	active.service.ConnectionStateDetail().SetState(api.ConnectionStateNone)
 	delete(h.activePairingCandidates, ski)
-	if registration, exists := h.transientPINProviders[ski]; exists &&
-		registration.authority == active.authority {
-		delete(h.transientPINProviders, ski)
-	}
+	pinProvider := h.takeTransientPINProviderForAuthorityLocked(ski, active.authority)
 	return &pairingCandidateRetirement{
-		ski:       ski,
-		service:   active.service,
-		authority: retirementAuthority,
+		ski:         ski,
+		service:     active.service,
+		authority:   retirementAuthority,
+		pinProvider: pinProvider,
 	}
 }
 
@@ -501,6 +514,7 @@ func (h *Hub) finishPairingCandidateRetirements(retirements []pairingCandidateRe
 		}
 		h.muxAttemptGate.RUnlock()
 		h.muxReg.Unlock()
+		discardTransientPINProvider(retirement.ski, retirement.pinProvider)
 		h.publishPairingDetail(retirement.ski, retirement.service.ConnectionStateDetail())
 	}
 }
