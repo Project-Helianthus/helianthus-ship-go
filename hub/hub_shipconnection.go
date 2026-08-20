@@ -101,16 +101,15 @@ func (h *Hub) claimClosedOutboundAttempt(
 	}
 	removed, releasedAuthority := h.releaseOutboundAttemptForConnectionLocked(remoteSKI, connection, metadata)
 	var retirement *pairingCandidateRetirement
+	var pinProvider api.TransientPINProvider
 	if !superseded && releasedAuthority != nil {
-		if registration, exists := h.transientPINProviders[remoteSKI]; exists &&
-			registration.authority == releasedAuthority {
-			delete(h.transientPINProviders, remoteSKI)
-		}
+		pinProvider = h.takeTransientPINProviderForAuthorityLocked(remoteSKI, releasedAuthority)
 		retirement = h.retireActivePairingCandidateLocked(remoteSKI, nil, releasedAuthority)
 	}
 	h.muxAttemptGate.Unlock()
 	h.muxReg.Unlock()
 
+	discardTransientPINProvider(remoteSKI, pinProvider)
 	cancelOutboundAttemptRegistrations(removed)
 	return retirement, superseded
 }

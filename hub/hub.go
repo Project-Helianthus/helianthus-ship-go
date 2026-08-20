@@ -121,9 +121,10 @@ type activeTrustedRemoteRetry struct {
 }
 
 type pairingCandidateRetirement struct {
-	ski       string
-	service   *api.ServiceDetails
-	authority *outboundAttemptAuthority
+	ski         string
+	service     *api.ServiceDetails
+	authority   *outboundAttemptAuthority
+	pinProvider api.TransientPINProvider
 }
 
 type inboundPairingReservation struct {
@@ -316,7 +317,7 @@ func (h *Hub) revokeOutboundAttempts(ski string, service *api.ServiceDetails) {
 	h.rotateOutboundAuthorityLocked(ski)
 	cancellations := h.removeOutboundAttemptRegistrationsLocked(ski)
 	delete(h.activePairingCandidates, ski)
-	delete(h.transientPINProviders, ski)
+	pinProvider := h.takeTransientPINProviderLocked(ski)
 	_, retried := h.activeTrustedRemoteRetries[ski]
 	delete(h.activeTrustedRemoteRetries, ski)
 	service.SetTrusted(false)
@@ -324,6 +325,7 @@ func (h *Hub) revokeOutboundAttempts(ski string, service *api.ServiceDetails) {
 	h.muxAttemptGate.Unlock()
 	h.removeOutboundAttemptConnections(cancellations)
 	h.muxReg.Unlock()
+	discardTransientPINProvider(ski, pinProvider)
 
 	// Cancellation may close a SHIP connection and re-enter the Hub.
 	cancelOutboundAttemptRegistrations(cancellations)
@@ -658,8 +660,9 @@ func (h *Hub) beginShutdown() (
 	cancellations := h.removeAllOutboundAttemptRegistrationsLocked()
 	h.muxAttemptGate.Unlock()
 	h.muxReg.Lock()
-	clear(h.transientPINProviders)
+	pinProviders := h.takeAllTransientPINProvidersLocked()
 	h.muxReg.Unlock()
+	discardTransientPINProviders(pinProviders)
 
 	return connections, cancellations, true
 }

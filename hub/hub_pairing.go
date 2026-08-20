@@ -302,24 +302,20 @@ func (h *Hub) WithTransientPIN(
 ) (bool, error) {
 	remoteSKI = util.NormalizeSKI(remoteSKI)
 	h.muxReg.Lock()
-	registration, exists := h.transientPINProviders[remoteSKI]
-	if exists {
-		delete(h.transientPINProviders, remoteSKI)
-	} else {
-		registration = transientPINProviderRegistration{}
-	}
+	provider := h.takeTransientPINProviderLocked(remoteSKI)
 	h.muxReg.Unlock()
-	if registration.provider == nil || isNilOutgoingAttemptValue(registration.provider) {
+	if provider == nil || isNilOutgoingAttemptValue(provider) {
 		return false, nil
 	}
-	return registration.provider.WithTransientPIN(remoteSKI, consume)
+	return provider.WithTransientPIN(remoteSKI, consume)
 }
 
 func (h *Hub) DiscardTransientPIN(remoteSKI string) {
 	remoteSKI = util.NormalizeSKI(remoteSKI)
 	h.muxReg.Lock()
-	delete(h.transientPINProviders, remoteSKI)
+	provider := h.takeTransientPINProviderLocked(remoteSKI)
 	h.muxReg.Unlock()
+	discardTransientPINProvider(remoteSKI, provider)
 }
 
 func (h *Hub) withTransientPINForAuthority(
@@ -329,17 +325,12 @@ func (h *Hub) withTransientPINForAuthority(
 ) (bool, error) {
 	remoteSKI = util.NormalizeSKI(remoteSKI)
 	h.muxReg.Lock()
-	registration, exists := h.transientPINProviders[remoteSKI]
-	if exists && authority != nil && registration.authority == authority {
-		delete(h.transientPINProviders, remoteSKI)
-	} else {
-		registration = transientPINProviderRegistration{}
-	}
+	provider := h.takeTransientPINProviderForAuthorityLocked(remoteSKI, authority)
 	h.muxReg.Unlock()
-	if registration.provider == nil || isNilOutgoingAttemptValue(registration.provider) {
+	if provider == nil || isNilOutgoingAttemptValue(provider) {
 		return false, nil
 	}
-	return registration.provider.WithTransientPIN(remoteSKI, consume)
+	return provider.WithTransientPIN(remoteSKI, consume)
 }
 
 func (h *Hub) discardTransientPINForAuthority(
@@ -348,11 +339,59 @@ func (h *Hub) discardTransientPINForAuthority(
 ) {
 	remoteSKI = util.NormalizeSKI(remoteSKI)
 	h.muxReg.Lock()
+	provider := h.takeTransientPINProviderForAuthorityLocked(remoteSKI, authority)
+	h.muxReg.Unlock()
+	discardTransientPINProvider(remoteSKI, provider)
+}
+
+// takeTransientPINProviderLocked transfers one registration out of the Hub.
+// The caller must hold muxReg and must invoke external provider capabilities
+// only after releasing every Hub lock.
+func (h *Hub) takeTransientPINProviderLocked(remoteSKI string) api.TransientPINProvider {
 	registration, exists := h.transientPINProviders[remoteSKI]
-	if exists && authority != nil && registration.authority == authority {
+	if !exists {
+		return nil
+	}
+	delete(h.transientPINProviders, remoteSKI)
+	return registration.provider
+}
+
+func (h *Hub) takeTransientPINProviderForAuthorityLocked(
+	remoteSKI string,
+	authority *outboundAttemptAuthority,
+) api.TransientPINProvider {
+	registration, exists := h.transientPINProviders[remoteSKI]
+	if !exists || authority == nil || registration.authority != authority {
+		return nil
+	}
+	delete(h.transientPINProviders, remoteSKI)
+	return registration.provider
+}
+
+func (h *Hub) takeAllTransientPINProvidersLocked() map[string]api.TransientPINProvider {
+	providers := make(map[string]api.TransientPINProvider, len(h.transientPINProviders))
+	for remoteSKI, registration := range h.transientPINProviders {
+		providers[remoteSKI] = registration.provider
 		delete(h.transientPINProviders, remoteSKI)
 	}
-	h.muxReg.Unlock()
+	return providers
+}
+
+func discardTransientPINProvider(remoteSKI string, provider api.TransientPINProvider) {
+	if provider == nil || isNilOutgoingAttemptValue(provider) {
+		return
+	}
+	discarder, ok := provider.(api.TransientPINDiscarder)
+	if !ok || discarder == nil || isNilOutgoingAttemptValue(discarder) {
+		return
+	}
+	discarder.DiscardTransientPIN(remoteSKI)
+}
+
+func discardTransientPINProviders(providers map[string]api.TransientPINProvider) {
+	for remoteSKI, provider := range providers {
+		discardTransientPINProvider(remoteSKI, provider)
+	}
 }
 
 func (h *Hub) launchPairingCandidate(candidateLaunch *pairingCandidateLaunch) {
@@ -455,14 +494,12 @@ func (h *Hub) retireActivePairingCandidateLocked(
 	retirementAuthority := h.rotateOutboundAuthorityLocked(ski)
 	active.service.ConnectionStateDetail().SetState(api.ConnectionStateNone)
 	delete(h.activePairingCandidates, ski)
-	if registration, exists := h.transientPINProviders[ski]; exists &&
-		registration.authority == active.authority {
-		delete(h.transientPINProviders, ski)
-	}
+	pinProvider := h.takeTransientPINProviderForAuthorityLocked(ski, active.authority)
 	return &pairingCandidateRetirement{
-		ski:       ski,
-		service:   active.service,
-		authority: retirementAuthority,
+		ski:         ski,
+		service:     active.service,
+		authority:   retirementAuthority,
+		pinProvider: pinProvider,
 	}
 }
 
@@ -477,6 +514,7 @@ func (h *Hub) finishPairingCandidateRetirements(retirements []pairingCandidateRe
 		}
 		h.muxAttemptGate.RUnlock()
 		h.muxReg.Unlock()
+		discardTransientPINProvider(retirement.ski, retirement.pinProvider)
 		h.publishPairingDetail(retirement.ski, retirement.service.ConnectionStateDetail())
 	}
 }
