@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Project-Helianthus/helianthus-ship-go/api"
 	"github.com/enbility/zeroconf/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
@@ -131,6 +132,87 @@ func TestIssue35ScopedZeroconfObservationAppliesConfiguredInterfaceZone(t *testi
 	}
 	if !reflect.DeepEqual(addresses, want) {
 		t.Fatalf("scoped Zeroconf addresses = %v, want %v", addresses, want)
+	}
+}
+
+type issue35ZeroconfInterfaceRouter interface {
+	browseInterfaces(available []net.Interface) []net.Interface
+	processScopedServiceForInterface(
+		iface net.Interface,
+		service *zeroconf.ServiceEntry,
+		remove bool,
+		cb api.MdnsScopedResolveCB,
+	)
+}
+
+func TestIssue35DefaultAndMultiInterfaceZeroconfRouteReceiveScopeToCandidate(t *testing.T) {
+	available := []net.Interface{{Index: 7, Name: "en7"}, {Index: 8, Name: "en8"}}
+	for _, test := range []struct {
+		name     string
+		provider *ZeroconfProvider
+		want     []net.Interface
+		received net.Interface
+	}{
+		{
+			name:     "default provider browses each available interface",
+			provider: NewZeroconfProvider(nil),
+			want:     available,
+			received: available[0],
+		},
+		{
+			name:     "multi-interface provider keeps exact receiving interface",
+			provider: NewZeroconfProvider(available),
+			want:     available,
+			received: available[1],
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			router, ok := any(test.provider).(issue35ZeroconfInterfaceRouter)
+			if !ok {
+				t.Fatal("Zeroconf provider has no per-interface browse routing seam")
+			}
+			if got := router.browseInterfaces(available); !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("browse interfaces = %#v, want %#v", got, test.want)
+			}
+
+			manager := NewMDNS(
+				"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				"Helianthus",
+				"Gateway",
+				"HEMS",
+				"local-ship-id",
+				"helianthus",
+				4712,
+				nil,
+				MdnsProviderSelectionGoZeroConfOnly,
+			)
+			service := &zeroconf.ServiceEntry{
+				ServiceRecord: zeroconf.ServiceRecord{Instance: "VR940"},
+				HostName:      "vr940.local",
+				Port:          12480,
+				Text: []string{
+					"txtvers=1",
+					"id=vr940-ship-id",
+					"path=/ship/",
+					"ski=3535353535353535353535353535353535353535",
+					"register=true",
+				},
+				AddrIPv6: []net.IP{net.ParseIP("fe80::35")},
+			}
+			router.processScopedServiceForInterface(
+				test.received,
+				service,
+				false,
+				manager.processScopedMdnsEntry,
+			)
+			_, candidates, _ := manager.copyMdnsSnapshot()
+			wantAddress := netip.MustParseAddr("fe80::35").WithZone(test.received.Name)
+			if len(candidates) != 1 || len(candidates[0].ScopedAddresses) != 1 ||
+				candidates[0].ScopedAddresses[0] != wantAddress {
+				t.Fatalf("provider→candidate scoped addresses = %#v, want %s",
+					candidates, wantAddress)
+			}
+		})
 	}
 }
 
