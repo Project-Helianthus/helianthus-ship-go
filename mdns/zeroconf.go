@@ -6,6 +6,7 @@ import (
 	"net/netip"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
 	"github.com/Project-Helianthus/helianthus-ship-go/logging"
@@ -278,6 +279,16 @@ func (z *ZeroconfProvider) processScopedServiceForInterface(
 	defer z.observationMux.Unlock()
 	observations := z.serviceObservations[observationKey]
 	if remove {
+		// Zeroconf forwards the cached, still-live entry for a TTL=0 goodbye;
+		// its per-interface cleanup path only emits after Expiry has elapsed.
+		if service.Expiry.After(time.Now()) {
+			if len(observations) == 0 {
+				return
+			}
+			delete(z.serviceObservations, observationKey)
+			cb(elements, service.Instance, service.HostName, nil, service.Port, true)
+			return
+		}
 		if _, exists := observations[scope]; !exists {
 			return
 		}
