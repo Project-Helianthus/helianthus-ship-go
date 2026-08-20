@@ -11,9 +11,10 @@ import (
 type issue37TransientPINProbe struct {
 	hub *Hub
 
-	mu           sync.Mutex
-	consumeCalls int
-	discardCalls int
+	mu                     sync.Mutex
+	consumeCalls           int
+	discardCalls           int
+	discardSawRegistration bool
 }
 
 func (probe *issue37TransientPINProbe) WithTransientPIN(
@@ -30,15 +31,17 @@ func (probe *issue37TransientPINProbe) WithTransientPIN(
 	return true, err
 }
 
-func (probe *issue37TransientPINProbe) DiscardTransientPIN(_ string) {
+func (probe *issue37TransientPINProbe) DiscardTransientPIN(remoteSKI string) {
 	// A Hub cleanup must release its registration lock before calling an
 	// untrusted owner. Re-entering the same lock makes a violation observable
 	// as a bounded test timeout instead of inspecting mutex internals.
 	probe.hub.muxReg.Lock()
+	_, registrationVisible := probe.hub.transientPINProviders[remoteSKI]
 	probe.hub.muxReg.Unlock()
 
 	probe.mu.Lock()
 	probe.discardCalls++
+	probe.discardSawRegistration = probe.discardSawRegistration || registrationVisible
 	probe.mu.Unlock()
 }
 
@@ -46,6 +49,12 @@ func (probe *issue37TransientPINProbe) counts() (consume, discard int) {
 	probe.mu.Lock()
 	defer probe.mu.Unlock()
 	return probe.consumeCalls, probe.discardCalls
+}
+
+func (probe *issue37TransientPINProbe) sawRegistrationDuringDiscard() bool {
+	probe.mu.Lock()
+	defer probe.mu.Unlock()
+	return probe.discardSawRegistration
 }
 
 func issue37InstallTransientPIN(
@@ -145,6 +154,9 @@ func TestIssue37UnconsumedPINCleanupDiscardsInnerOwnerExactlyOnceOutsideLock(t *
 					discardCalls,
 				)
 			}
+			if probe.sawRegistrationDuringDiscard() {
+				t.Fatal("inner discarder ran before atomic registration removal")
+			}
 		})
 	}
 }
@@ -234,6 +246,9 @@ func TestIssue37ConcurrentConsumeDiscardAndCloseHasOneTerminalOwner(t *testing.T
 			consumeCalls,
 			discardCalls,
 		)
+	}
+	if probe.sawRegistrationDuringDiscard() {
+		t.Fatal("concurrent inner discarder observed a still-registered provider")
 	}
 }
 
