@@ -27,6 +27,7 @@ func (h *Hub) HandleConnectionClosed(connection api.ShipConnectionInterface, han
 	if superseded || !removed {
 		return
 	}
+	h.DiscardTransientPIN(remoteSki)
 	// connection close was after a completed handshake, so we can reset the attetmpt counter
 	if handshakeCompleted {
 		h.removeConnectionAttemptCounter(remoteSki)
@@ -101,6 +102,10 @@ func (h *Hub) claimClosedOutboundAttempt(
 	removed, releasedAuthority := h.releaseOutboundAttemptForConnectionLocked(remoteSKI, connection, metadata)
 	var retirement *pairingCandidateRetirement
 	if !superseded && releasedAuthority != nil {
+		if registration, exists := h.transientPINProviders[remoteSKI]; exists &&
+			registration.authority == releasedAuthority {
+			delete(h.transientPINProviders, remoteSKI)
+		}
 		retirement = h.retireActivePairingCandidateLocked(remoteSKI, nil, releasedAuthority)
 	}
 	h.muxAttemptGate.Unlock()

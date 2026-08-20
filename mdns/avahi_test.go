@@ -3,6 +3,7 @@ package mdns
 import (
 	"errors"
 	"net"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -118,6 +119,41 @@ func TestAvahiRemovalReplaysResolvedIdentityAndRetainsOtherInterfaces(t *testing
 			len(provider.serviceElements),
 			len(provider.serviceObservations),
 		)
+	}
+}
+
+func TestIssue35AvahiObservationPreservesResolvedInterfaceZone(t *testing.T) {
+	provider := NewAvahiProvider([]int32{7})
+	server := mocks.NewServerInterface(t)
+	provider.avServer = server
+	server.EXPECT().GetNetworkInterfaceNameByIndex(int32(7)).Return("en7", nil).Once()
+
+	service := avahi.Service{
+		Interface: 7,
+		Name:      "VR940",
+		Type:      "_ship._tcp",
+		Domain:    "local",
+		Host:      "vr940.local",
+		Address:   "fe80::35",
+		Port:      4712,
+		Txt:       [][]byte{[]byte("ski=3535353535353535353535353535353535353535")},
+	}
+	var got []netip.Addr
+	err := provider.processAddedScopedService(service, func(
+		_ map[string]string,
+		_, _ string,
+		addresses []netip.Addr,
+		_ int,
+		_ bool,
+	) {
+		got = append([]netip.Addr(nil), addresses...)
+	})
+	if err != nil {
+		t.Fatalf("process scoped Avahi observation: %v", err)
+	}
+	want := []netip.Addr{netip.MustParseAddr("fe80::35").WithZone("en7")}
+	if len(got) != 1 || got[0] != want[0] {
+		t.Fatalf("scoped Avahi addresses = %v, want %v", got, want)
 	}
 }
 

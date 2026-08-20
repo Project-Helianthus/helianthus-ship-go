@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 
@@ -23,6 +24,11 @@ type connectionInitiationDelayTimeRange struct {
 
 type outboundAttemptAuthority struct {
 	epoch uint64
+}
+
+type transientPINProviderRegistration struct {
+	authority *outboundAttemptAuthority
+	provider  api.TransientPINProvider
 }
 
 type outboundAttemptRegistration struct {
@@ -80,11 +86,12 @@ func (registration *outboundAttemptRegistration) blockCallbacksAndWait() {
 }
 
 type pairingCandidateObservation struct {
-	ski       string
-	revision  uint64
-	path      string
-	port      int
-	addresses []net.IP
+	ski             string
+	revision        uint64
+	path            string
+	port            int
+	addresses       []net.IP
+	scopedAddresses []netip.Addr
 }
 
 type activePairingCandidate struct {
@@ -185,6 +192,7 @@ type Hub struct {
 	activePairingCandidates          map[string]*activePairingCandidate
 	visibleTrustedRemoteObservations map[string]trustedRemoteObservation
 	activeTrustedRemoteRetries       map[string]*activeTrustedRemoteRetry
+	transientPINProviders            map[string]transientPINProviderRegistration
 	latestPairingObservationRevision uint64
 	mdnsAppliedAdmission             uint64
 	testHooks                        *hubTestHooks
@@ -238,6 +246,7 @@ func NewHub(hubReader api.HubReaderInterface,
 		activePairingCandidates:          make(map[string]*activePairingCandidate),
 		visibleTrustedRemoteObservations: make(map[string]trustedRemoteObservation),
 		activeTrustedRemoteRetries:       make(map[string]*activeTrustedRemoteRetry),
+		transientPINProviders:            make(map[string]transientPINProviderRegistration),
 		hubReader:                        hubReader,
 		port:                             port,
 		certifciate:                      certificate,
@@ -256,6 +265,9 @@ var _ api.OutgoingAttemptGateSetter = (*Hub)(nil)
 var _ api.PairingRegistrationSetter = (*Hub)(nil)
 var _ api.PairingCandidateQueuer = (*Hub)(nil)
 var _ api.PairingCandidateController = (*Hub)(nil)
+var _ api.PairingCandidatePINController = (*Hub)(nil)
+var _ api.TransientPINProvider = (*Hub)(nil)
+var _ api.TransientPINDiscarder = (*Hub)(nil)
 var _ api.TrustedRemoteRetryController = (*Hub)(nil)
 
 // SetOutgoingAttemptGate installs or removes the optional outgoing dial gate.
@@ -304,6 +316,7 @@ func (h *Hub) revokeOutboundAttempts(ski string, service *api.ServiceDetails) {
 	h.rotateOutboundAuthorityLocked(ski)
 	cancellations := h.removeOutboundAttemptRegistrationsLocked(ski)
 	delete(h.activePairingCandidates, ski)
+	delete(h.transientPINProviders, ski)
 	_, retried := h.activeTrustedRemoteRetries[ski]
 	delete(h.activeTrustedRemoteRetries, ski)
 	service.SetTrusted(false)
@@ -644,6 +657,9 @@ func (h *Hub) beginShutdown() (
 	h.outgoingGateEpoch++
 	cancellations := h.removeAllOutboundAttemptRegistrationsLocked()
 	h.muxAttemptGate.Unlock()
+	h.muxReg.Lock()
+	clear(h.transientPINProviders)
+	h.muxReg.Unlock()
 
 	return connections, cancellations, true
 }

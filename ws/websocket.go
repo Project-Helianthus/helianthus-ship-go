@@ -192,6 +192,9 @@ func (w *WebsocketConnection) readShipPump() {
 func (w *WebsocketConnection) textFromMessage(msg []byte) string {
 	text := "unknown single byte"
 	if len(msg) > 2 {
+		if msg[0] == model.MsgTypeControl && containsJSONToken(msg[1:], []byte("connectionPinInput")) {
+			return "ship control: connectionPinInput [redacted]"
+		}
 		text = string(msg[1:])
 	} else if bytes.Equal(msg, model.ShipInit) {
 		text = "ship init"
@@ -250,6 +253,7 @@ func (w *WebsocketConnection) close() {
 }
 
 var _ api.WebsocketDataWriterInterface = (*WebsocketConnection)(nil)
+var _ api.SensitiveWebsocketDataWriterInterface = (*WebsocketConnection)(nil)
 
 func (w *WebsocketConnection) InitDataProcessing(dataProcessing api.WebsocketDataReaderInterface) {
 	w.dataProcessing = dataProcessing
@@ -282,6 +286,106 @@ func (w *WebsocketConnection) WriteMessageToWebsocketConnection(message []byte) 
 		return errors.New(connIsClosedError)
 	default:
 		return nil
+	}
+}
+
+// WriteSensitiveMessageToWebsocketConnection writes synchronously so the
+// caller can clear its transient buffer immediately after return. The payload
+// bypasses the ordinary queue and its trace logging.
+func (w *WebsocketConnection) WriteSensitiveMessageToWebsocketConnection(message []byte) error {
+	if w.isConnClosed() {
+		return errors.New(connIsClosedError)
+	}
+	if !w.writeSensitiveMessage(message) {
+		return errors.New(connIsClosedError)
+	}
+	return nil
+}
+
+func (w *WebsocketConnection) writeSensitiveMessage(data []byte) bool {
+	if w.isConnClosed() {
+		return false
+	}
+	err := w.writeMessageWithFreshDeadline(websocket.BinaryMessage, data)
+	if err != nil {
+		w.closeWithError(err, "error writing sensitive websocket control frame: ")
+		logging.Log().Debug("SENSITIVE WRITE ERROR: ", err)
+		return false
+	}
+	return true
+}
+
+func (w *WebsocketConnection) writeMessageWithFreshDeadline(messageType int, data []byte) error {
+	if w.isConnClosed() {
+		return errors.New(connIsClosedError)
+	}
+	w.muxConWrite.Lock()
+	defer w.muxConWrite.Unlock()
+	if w.conn == nil {
+		return errors.New(connIsClosedError)
+	}
+	if err := w.conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
+		return err
+	}
+	return w.conn.WriteMessage(messageType, data)
+}
+
+func containsJSONToken(data, target []byte) bool {
+	if len(target) == 0 {
+		return false
+	}
+	for start := range data {
+		index := start
+		matched := 0
+		for matched < len(target) {
+			value, next, ok := nextJSONTokenByte(data, index)
+			if !ok || value != target[matched] {
+				break
+			}
+			index = next
+			matched++
+		}
+		if matched == len(target) {
+			return true
+		}
+	}
+	return false
+}
+
+func nextJSONTokenByte(data []byte, index int) (byte, int, bool) {
+	if index >= len(data) {
+		return 0, index, false
+	}
+	if data[index] != '\\' {
+		return data[index], index + 1, true
+	}
+	if index+5 >= len(data) || data[index+1] != 'u' {
+		return 0, index, false
+	}
+	var value byte
+	for offset := 2; offset < 6; offset++ {
+		nibble, ok := jsonHexNibble(data[index+offset])
+		if !ok {
+			return 0, index, false
+		}
+		if offset < 4 && nibble != 0 {
+			return 0, index, false
+		}
+		value = value<<4 | nibble
+	}
+	return value, index + 6, true
+}
+
+func jsonHexNibble(value byte) (byte, bool) {
+	switch {
+	case value >= '0' && value <= '9':
+		return value - '0', true
+	case value >= 'a' && value <= 'f':
+		return value - 'a' + 10, true
+	case value >= 'A' && value <= 'F':
+		return value - 'A' + 10, true
+	default:
+		return 0, false
 	}
 }
 

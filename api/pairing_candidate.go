@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 )
 
 var (
@@ -94,6 +95,9 @@ type PairingCandidateObservation struct {
 	Path         string
 	Port         int
 	Addresses    []net.IP
+	// ScopedAddresses retains zones only inside the process-local candidate
+	// pipeline. It is intentionally absent from PairingCandidateRef.
+	ScopedAddresses []netip.Addr
 }
 
 // PairingCandidateMdnsReportInterface atomically reports stable discovery and

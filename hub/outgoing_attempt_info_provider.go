@@ -89,6 +89,32 @@ func (provider *outgoingAttemptInfoProvider) SetupRemoteDevice(
 	return &outgoingAttemptDataReader{provider: provider, reader: reader}
 }
 
+func (provider *outgoingAttemptInfoProvider) WithTransientPIN(
+	remoteSKI string,
+	consume func([]byte) error,
+) (bool, error) {
+	if provider == nil || provider.hub == nil || provider.registration == nil ||
+		!provider.registration.beginCallback() {
+		return false, nil
+	}
+	defer provider.registration.endCallback()
+	if !provider.hub.outboundAttemptRegistrationOwnsCallbacks(provider.registration) {
+		return false, nil
+	}
+	return provider.hub.withTransientPINForAuthority(
+		remoteSKI,
+		provider.registration.authority,
+		consume,
+	)
+}
+
+func (provider *outgoingAttemptInfoProvider) DiscardTransientPIN(remoteSKI string) {
+	if provider == nil || provider.hub == nil || provider.registration == nil {
+		return
+	}
+	provider.hub.discardTransientPINForAuthority(remoteSKI, provider.registration.authority)
+}
+
 func (provider *outgoingAttemptInfoProvider) HandleConnectionClosedWithAttempt(
 	connection api.ShipConnectionInterface,
 	handshakeCompleted bool,
@@ -142,3 +168,5 @@ func (h *Hub) outboundAttemptRegistrationOwnsCallbacks(
 
 var _ api.ShipConnectionInfoProviderInterface = (*outgoingAttemptInfoProvider)(nil)
 var _ api.OutgoingAttemptShipConnectionInfoProviderInterface = (*outgoingAttemptInfoProvider)(nil)
+var _ api.TransientPINProvider = (*outgoingAttemptInfoProvider)(nil)
+var _ api.TransientPINDiscarder = (*outgoingAttemptInfoProvider)(nil)

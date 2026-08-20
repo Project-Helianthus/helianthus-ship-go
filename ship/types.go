@@ -19,6 +19,8 @@ const (
 	tHelloProlongThrInc     = 30 * time.Second
 	tHelloProlongWaitingGap = 15 * time.Second
 	tHelloProlongMin        = 1 * time.Second
+	pinResponseTimeout      = 30 * time.Second // SHIP 13.4.4.3.5.2: minimum response wait
+	pinBusyTimeout          = 90 * time.Second // bounded wait while remote inputPermission is busy
 )
 
 type timeoutTimerType uint

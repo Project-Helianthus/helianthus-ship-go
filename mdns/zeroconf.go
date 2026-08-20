@@ -4,7 +4,9 @@ import (
 	"context"
 	"net"
 	"net/netip"
+	"sort"
 	"sync"
+	"time"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
 	"github.com/Project-Helianthus/helianthus-ship-go/logging"
@@ -24,15 +26,24 @@ type ZeroconfProvider struct {
 	mux  sync.Mutex
 	wait sync.WaitGroup
 
+	observationMux      sync.Mutex
+	serviceObservations map[string]map[zeroconfInterfaceScope][]netip.Addr
+
 	register      func(string, string, string, int, []string, []net.Interface, ...zeroconf.ServerOption) (*zeroconf.Server, error)
 	registerProxy func(string, string, string, int, string, []string, []string, []net.Interface, ...zeroconf.ServerOption) (*zeroconf.Server, error)
 }
 
+type zeroconfInterfaceScope struct {
+	index int
+	name  string
+}
+
 func NewZeroconfProvider(ifaces []net.Interface) *ZeroconfProvider {
 	return &ZeroconfProvider{
-		ifaces:        ifaces,
-		register:      zeroconf.Register,
-		registerProxy: zeroconf.RegisterProxy,
+		ifaces:              ifaces,
+		serviceObservations: make(map[string]map[zeroconfInterfaceScope][]netip.Addr),
+		register:            zeroconf.Register,
+		registerProxy:       zeroconf.RegisterProxy,
 	}
 }
 
@@ -44,8 +55,30 @@ func newScopedZeroconfProvider(ifaces []net.Interface, host string, address neti
 }
 
 var _ api.MdnsProviderInterface = (*ZeroconfProvider)(nil)
+var _ api.ScopedMdnsProviderInterface = (*ZeroconfProvider)(nil)
 
 func (z *ZeroconfProvider) Start(autoReconnect bool, cb api.MdnsResolveCB) bool {
+	return z.start(func(
+		elements map[string]string,
+		name,
+		host string,
+		addresses []netip.Addr,
+		port int,
+		remove bool,
+	) {
+		legacy := make([]net.IP, 0, len(addresses))
+		for _, address := range addresses {
+			legacy = append(legacy, append(net.IP(nil), address.AsSlice()...))
+		}
+		cb(elements, name, host, legacy, port, remove)
+	})
+}
+
+func (z *ZeroconfProvider) StartScoped(_ bool, cb api.MdnsScopedResolveCB) bool {
+	return z.start(cb)
+}
+
+func (z *ZeroconfProvider) start(cb api.MdnsScopedResolveCB) bool {
 	z.mux.Lock()
 	if z.cancel != nil {
 		z.mux.Unlock()
@@ -73,6 +106,9 @@ func (z *ZeroconfProvider) Shutdown() {
 		cancel()
 	}
 	z.wait.Wait()
+	z.observationMux.Lock()
+	clear(z.serviceObservations)
+	z.observationMux.Unlock()
 }
 
 func (z *ZeroconfProvider) Announce(serviceName string, port int, txt []string) error {
@@ -133,8 +169,50 @@ func (z *ZeroconfProvider) Unannounce() {
 	z.zc = nil
 }
 
-func (z *ZeroconfProvider) chanListener(ctx context.Context, cb api.MdnsResolveCB) {
+func (z *ZeroconfProvider) chanListener(ctx context.Context, cb api.MdnsScopedResolveCB) {
 	defer z.wait.Done()
+	available, err := net.Interfaces()
+	if err != nil {
+		logging.Log().Debug("mdns: zeroconf - list interfaces:", err)
+		return
+	}
+	ifaces := z.browseInterfaces(available)
+	if len(ifaces) == 0 {
+		logging.Log().Debug("mdns: zeroconf - no interface available for scoped browse")
+		return
+	}
+
+	var browsers sync.WaitGroup
+	browsers.Add(len(ifaces))
+	for _, iface := range ifaces {
+		iface := iface
+		go func() {
+			defer browsers.Done()
+			z.chanListenerForInterface(ctx, iface, cb)
+		}()
+	}
+	browsers.Wait()
+}
+
+func (z *ZeroconfProvider) browseInterfaces(available []net.Interface) []net.Interface {
+	if len(z.ifaces) > 0 {
+		return append([]net.Interface(nil), z.ifaces...)
+	}
+	ifaces := make([]net.Interface, 0, len(available))
+	for _, iface := range available {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 {
+			continue
+		}
+		ifaces = append(ifaces, iface)
+	}
+	return ifaces
+}
+
+func (z *ZeroconfProvider) chanListenerForInterface(
+	ctx context.Context,
+	iface net.Interface,
+	cb api.MdnsScopedResolveCB,
+) {
 	zcEntries := make(chan *zeroconf.ServiceEntry)
 	zcRemoved := make(chan *zeroconf.ServiceEntry)
 	browseDone := make(chan struct{})
@@ -146,7 +224,7 @@ func (z *ZeroconfProvider) chanListener(ctx context.Context, cb api.MdnsResolveC
 			shipZeroConfDomain,
 			zcEntries,
 			zcRemoved,
-			zeroconf.SelectIfaces(z.ifaces),
+			zeroconf.SelectIfaces([]net.Interface{iface}),
 		)
 	}()
 
@@ -157,28 +235,126 @@ func (z *ZeroconfProvider) chanListener(ctx context.Context, cb api.MdnsResolveC
 			return
 		case <-browseDone:
 			return
-		case service := <-zcRemoved:
+		case service, ok := <-zcRemoved:
+			if !ok {
+				zcRemoved = nil
+				continue
+			}
 			// Zeroconf has issues with merging mDNS data and sometimes reports incomplete records
 			if service == nil || len(service.Text) == 0 {
 				continue
 			}
 
-			elements := parseTxt(service.Text)
+			z.processScopedServiceForInterface(iface, service, true, cb)
 
-			addresses := service.AddrIPv4
-			cb(elements, service.Instance, service.HostName, addresses, service.Port, true)
-
-		case service := <-zcEntries:
+		case service, ok := <-zcEntries:
+			if !ok {
+				zcEntries = nil
+				continue
+			}
 			// Zeroconf has issues with merging mDNS data and sometimes reports incomplete records
 			if service == nil || len(service.Text) == 0 {
 				continue
 			}
 
-			elements := parseTxt(service.Text)
-
-			addresses := service.AddrIPv4
-			addresses = append(addresses, service.AddrIPv6...)
-			cb(elements, service.Instance, service.HostName, addresses, service.Port, false)
+			z.processScopedServiceForInterface(iface, service, false, cb)
 		}
 	}
+}
+
+func (z *ZeroconfProvider) processScopedServiceForInterface(
+	iface net.Interface,
+	service *zeroconf.ServiceEntry,
+	remove bool,
+	cb api.MdnsScopedResolveCB,
+) {
+	if service == nil || cb == nil {
+		return
+	}
+	elements := parseTxt(service.Text)
+	observationKey := mdnsObservationKey(service.Instance, service.HostName, service.Port, elements)
+	scope := zeroconfInterfaceScope{index: iface.Index, name: iface.Name}
+
+	z.observationMux.Lock()
+	defer z.observationMux.Unlock()
+	observations := z.serviceObservations[observationKey]
+	if remove {
+		// Zeroconf forwards the cached, still-live entry for a TTL=0 goodbye;
+		// its per-interface cleanup path only emits after Expiry has elapsed.
+		if service.Expiry.After(time.Now()) {
+			if len(observations) == 0 {
+				return
+			}
+			delete(z.serviceObservations, observationKey)
+			cb(elements, service.Instance, service.HostName, nil, service.Port, true)
+			return
+		}
+		if _, exists := observations[scope]; !exists {
+			return
+		}
+		delete(observations, scope)
+		if len(observations) == 0 {
+			delete(z.serviceObservations, observationKey)
+			cb(elements, service.Instance, service.HostName, nil, service.Port, true)
+			return
+		}
+	} else {
+		if observations == nil {
+			observations = make(map[zeroconfInterfaceScope][]netip.Addr)
+			z.serviceObservations[observationKey] = observations
+		}
+		observations[scope] = scopedServiceAddressesForZone(service, iface.Name)
+	}
+	addresses := aggregateScopedServiceAddresses(observations)
+	cb(elements, service.Instance, service.HostName, addresses, service.Port, false)
+}
+
+func aggregateScopedServiceAddresses(
+	observations map[zeroconfInterfaceScope][]netip.Addr,
+) []netip.Addr {
+	seen := make(map[netip.Addr]struct{})
+	addresses := make([]netip.Addr, 0)
+	for _, scoped := range observations {
+		for _, address := range scoped {
+			if _, exists := seen[address]; exists {
+				continue
+			}
+			seen[address] = struct{}{}
+			addresses = append(addresses, address)
+		}
+	}
+	sort.Slice(addresses, func(left, right int) bool {
+		return addresses[left].Compare(addresses[right]) < 0
+	})
+	return addresses
+}
+
+func (z *ZeroconfProvider) scopedServiceAddresses(service *zeroconf.ServiceEntry) []netip.Addr {
+	if service == nil {
+		return nil
+	}
+	zone := ""
+	if len(z.ifaces) == 1 {
+		zone = z.ifaces[0].Name
+	}
+	return scopedServiceAddressesForZone(service, zone)
+}
+
+func scopedServiceAddressesForZone(service *zeroconf.ServiceEntry, zone string) []netip.Addr {
+	if service == nil {
+		return nil
+	}
+	addresses := make([]netip.Addr, 0, len(service.AddrIPv4)+len(service.AddrIPv6))
+	for _, value := range append(append([]net.IP(nil), service.AddrIPv4...), service.AddrIPv6...) {
+		address, ok := netip.AddrFromSlice(value)
+		if !ok {
+			continue
+		}
+		address = address.Unmap()
+		if address.Is6() && address.IsLinkLocalUnicast() && zone != "" {
+			address = address.WithZone(zone)
+		}
+		addresses = append(addresses, address)
+	}
+	return addresses
 }

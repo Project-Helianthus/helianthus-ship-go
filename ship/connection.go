@@ -44,6 +44,7 @@ type ShipConnection struct {
 	pairingClosing            bool
 	pairingTerminal           bool
 	spineSetupStarted         bool
+	pinInputSent              bool
 	pairingApprovalMux        sync.Mutex
 	testHooks                 *shipConnectionTestHooks
 
@@ -68,6 +69,7 @@ type ShipConnection struct {
 	// ProlongationRequestReply SHIP 13.4.4.1.3: Detection of response timeout on prolongation request.
 	handshakeTimerRunning  bool
 	handshakeTimerType     timeoutTimerType
+	handshakeTimerDuration time.Duration
 	handshakeTimerStopChan chan struct{}
 	handshakeTimerDoneChan chan struct{}
 	handshakeTimerMux      sync.Mutex
@@ -298,6 +300,28 @@ func (c *ShipConnection) ShipHandshakeState() (model.ShipMessageExchangeState, e
 	defer c.mux.Unlock()
 
 	return c.smeState, c.smeError
+}
+
+func (c *ShipConnection) beginPINInput() bool {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+	if c.pinInputSent {
+		return false
+	}
+	c.pinInputSent = true
+	return true
+}
+
+func (c *ShipConnection) rollbackPINInput() {
+	c.mux.Lock()
+	c.pinInputSent = false
+	c.mux.Unlock()
+}
+
+func (c *ShipConnection) wasPINInputSent() bool {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+	return c.pinInputSent
 }
 
 // invoked when pairing for a pending request is approved

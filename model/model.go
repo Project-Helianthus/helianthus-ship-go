@@ -114,8 +114,17 @@ type ConnectionPinInputType struct {
 
 type ConnectionPinErrorErrorType uint8
 
+const (
+	ConnectionPinErrorErrorTypeRFU      ConnectionPinErrorErrorType = 0
+	ConnectionPinErrorErrorTypeWrongPIN ConnectionPinErrorErrorType = 1
+)
+
 type ConnectionPinErrorType struct {
 	Error ConnectionPinErrorErrorType `json:"error"`
+}
+
+type ConnectionPinError struct {
+	ConnectionPinError ConnectionPinErrorType `json:"connectionPinError"`
 }
 
 type ProtocolIdType string

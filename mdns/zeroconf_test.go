@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Project-Helianthus/helianthus-ship-go/api"
 	"github.com/enbility/zeroconf/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/suite"
@@ -110,6 +111,343 @@ func TestScopedZeroconfAnnounceUsesRegisterProxyWithOnlyConfiguredAddress(t *tes
 	}
 	if legacyCalled {
 		t.Fatal("scoped Announce called stock Register")
+	}
+}
+
+func TestIssue35ScopedZeroconfObservationAppliesConfiguredInterfaceZone(t *testing.T) {
+	provider := NewZeroconfProvider([]net.Interface{{Index: 7, Name: "en7"}})
+	entry := &zeroconf.ServiceEntry{
+		AddrIPv4: []net.IP{net.ParseIP("192.0.2.35")},
+		AddrIPv6: []net.IP{
+			net.ParseIP("fe80::35"),
+			net.ParseIP("2001:db8::35"),
+		},
+	}
+
+	addresses := provider.scopedServiceAddresses(entry)
+	want := []netip.Addr{
+		netip.MustParseAddr("192.0.2.35"),
+		netip.MustParseAddr("fe80::35").WithZone("en7"),
+		netip.MustParseAddr("2001:db8::35"),
+	}
+	if !reflect.DeepEqual(addresses, want) {
+		t.Fatalf("scoped Zeroconf addresses = %v, want %v", addresses, want)
+	}
+}
+
+type issue35ZeroconfInterfaceRouter interface {
+	browseInterfaces(available []net.Interface) []net.Interface
+	processScopedServiceForInterface(
+		iface net.Interface,
+		service *zeroconf.ServiceEntry,
+		remove bool,
+		cb api.MdnsScopedResolveCB,
+	)
+}
+
+func TestIssue35DefaultAndMultiInterfaceZeroconfRouteReceiveScopeToCandidate(t *testing.T) {
+	available := []net.Interface{
+		{Index: 7, Name: "en7", Flags: net.FlagUp | net.FlagMulticast},
+		{Index: 8, Name: "en8", Flags: net.FlagUp | net.FlagMulticast},
+	}
+	for _, test := range []struct {
+		name     string
+		provider *ZeroconfProvider
+		want     []net.Interface
+		received net.Interface
+	}{
+		{
+			name:     "default provider browses each available interface",
+			provider: NewZeroconfProvider(nil),
+			want:     available,
+			received: available[0],
+		},
+		{
+			name:     "multi-interface provider keeps exact receiving interface",
+			provider: NewZeroconfProvider(available),
+			want:     available,
+			received: available[1],
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			router, ok := any(test.provider).(issue35ZeroconfInterfaceRouter)
+			if !ok {
+				t.Fatal("Zeroconf provider has no per-interface browse routing seam")
+			}
+			if got := router.browseInterfaces(available); !reflect.DeepEqual(got, test.want) {
+				t.Fatalf("browse interfaces = %#v, want %#v", got, test.want)
+			}
+
+			manager := NewMDNS(
+				"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				"Helianthus",
+				"Gateway",
+				"HEMS",
+				"local-ship-id",
+				"helianthus",
+				4712,
+				nil,
+				MdnsProviderSelectionGoZeroConfOnly,
+			)
+			service := &zeroconf.ServiceEntry{
+				ServiceRecord: zeroconf.ServiceRecord{Instance: "VR940"},
+				HostName:      "vr940.local",
+				Port:          12480,
+				Text: []string{
+					"txtvers=1",
+					"id=vr940-ship-id",
+					"path=/ship/",
+					"ski=3535353535353535353535353535353535353535",
+					"register=true",
+				},
+				AddrIPv6: []net.IP{net.ParseIP("fe80::35")},
+			}
+			router.processScopedServiceForInterface(
+				test.received,
+				service,
+				false,
+				manager.processScopedMdnsEntry,
+			)
+			_, candidates, _ := manager.copyMdnsSnapshot()
+			wantAddress := netip.MustParseAddr("fe80::35").WithZone(test.received.Name)
+			if len(candidates) != 1 || len(candidates[0].ScopedAddresses) != 1 ||
+				candidates[0].ScopedAddresses[0] != wantAddress {
+				t.Fatalf("provider→candidate scoped addresses = %#v, want %s",
+					candidates, wantAddress)
+			}
+		})
+	}
+}
+
+func TestIssue35SameSHIPPublicationRetainsAllInterfaceRoutesWithoutCandidateRotation(t *testing.T) {
+	interfaces := []net.Interface{
+		{Index: 7, Name: "en7", Flags: net.FlagUp | net.FlagMulticast},
+		{Index: 8, Name: "en8", Flags: net.FlagUp | net.FlagMulticast},
+	}
+	wantAddresses := []netip.Addr{
+		netip.MustParseAddr("fe80::35").WithZone("en7"),
+		netip.MustParseAddr("fe80::35").WithZone("en8"),
+	}
+	for _, order := range [][]int{{1, 0}, {0, 1}} {
+		name := interfaces[order[0]].Name + "_then_" + interfaces[order[1]].Name
+		t.Run(name, func(t *testing.T) {
+			provider := NewZeroconfProvider(interfaces)
+			router, ok := any(provider).(issue35ZeroconfInterfaceRouter)
+			if !ok {
+				t.Fatal("Zeroconf provider has no per-interface browse routing seam")
+			}
+			manager := NewMDNS(
+				"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+				"Helianthus",
+				"Gateway",
+				"HEMS",
+				"local-ship-id",
+				"helianthus",
+				4712,
+				nil,
+				MdnsProviderSelectionGoZeroConfOnly,
+			)
+			service := &zeroconf.ServiceEntry{
+				ServiceRecord: zeroconf.ServiceRecord{Instance: "VR940"},
+				HostName:      "vr940.local",
+				Port:          12480,
+				Text: []string{
+					"txtvers=1",
+					"id=vr940-ship-id",
+					"path=/ship/",
+					"ski=3535353535353535353535353535353535353535",
+					"register=true",
+				},
+				AddrIPv6: []net.IP{net.ParseIP("fe80::35")},
+			}
+
+			router.processScopedServiceForInterface(
+				interfaces[order[0]], service, false, manager.processScopedMdnsEntry,
+			)
+			_, firstCandidates, _ := manager.copyMdnsSnapshot()
+			if len(firstCandidates) != 1 || firstCandidates[0].CandidateRef == "" {
+				t.Fatalf("first scoped observation candidates = %#v, want one stable capability", firstCandidates)
+			}
+			candidateRef := firstCandidates[0].CandidateRef
+
+			router.processScopedServiceForInterface(
+				interfaces[order[1]], service, false, manager.processScopedMdnsEntry,
+			)
+			_, candidates, _ := manager.copyMdnsSnapshot()
+			if len(candidates) != 1 {
+				t.Fatalf("combined scoped observations candidates = %#v, want one", candidates)
+			}
+			if candidates[0].CandidateRef != candidateRef {
+				t.Errorf("CandidateRef rotated without remove: got %q, want %q",
+					candidates[0].CandidateRef, candidateRef)
+			}
+			if !reflect.DeepEqual(candidates[0].ScopedAddresses, wantAddresses) {
+				t.Errorf("combined scoped routes = %v, want deterministic %v",
+					candidates[0].ScopedAddresses, wantAddresses)
+			}
+
+			// A repeated add from an already-observed interface is idempotent and
+			// must neither duplicate routes nor stale the existing selection.
+			router.processScopedServiceForInterface(
+				interfaces[order[0]], service, false, manager.processScopedMdnsEntry,
+			)
+			_, repeated, _ := manager.copyMdnsSnapshot()
+			if len(repeated) != 1 || repeated[0].CandidateRef != candidateRef ||
+				!reflect.DeepEqual(repeated[0].ScopedAddresses, wantAddresses) {
+				t.Fatalf("repeated scoped add changed stable selection: %#v", repeated)
+			}
+
+			router.processScopedServiceForInterface(
+				interfaces[order[0]], service, true, manager.processScopedMdnsEntry,
+			)
+			_, afterPartialRemove, _ := manager.copyMdnsSnapshot()
+			remainingAddress := netip.MustParseAddr("fe80::35").WithZone(interfaces[order[1]].Name)
+			if len(afterPartialRemove) != 1 ||
+				!reflect.DeepEqual(afterPartialRemove[0].ScopedAddresses, []netip.Addr{remainingAddress}) {
+				t.Fatalf("partial interface remove withdrew wrong routes: %#v, want only %s",
+					afterPartialRemove, remainingAddress)
+			}
+			if afterPartialRemove[0].CandidateRef == candidateRef {
+				t.Fatalf("CandidateRef did not rotate after effective route withdrawal: %q",
+					afterPartialRemove[0].CandidateRef)
+			}
+			postRemoveRef := afterPartialRemove[0].CandidateRef
+
+			// Repeating the same remove is a no-op: it must not retract the other
+			// scope or rotate the still-valid selection.
+			router.processScopedServiceForInterface(
+				interfaces[order[0]], service, true, manager.processScopedMdnsEntry,
+			)
+			_, repeatedRemove, _ := manager.copyMdnsSnapshot()
+			if len(repeatedRemove) != 1 || repeatedRemove[0].CandidateRef != postRemoveRef ||
+				!reflect.DeepEqual(repeatedRemove[0].ScopedAddresses, []netip.Addr{remainingAddress}) {
+				t.Fatalf("duplicate interface remove changed remaining selection: %#v", repeatedRemove)
+			}
+
+			router.processScopedServiceForInterface(
+				interfaces[order[1]], service, true, manager.processScopedMdnsEntry,
+			)
+			_, afterFinalRemove, _ := manager.copyMdnsSnapshot()
+			if len(afterFinalRemove) != 0 {
+				t.Fatalf("final interface remove retained candidate: %#v", afterFinalRemove)
+			}
+		})
+	}
+}
+
+func TestIssue35ZeroconfRemovalDistinguishesUnannounceFromInterfaceExpiry(t *testing.T) {
+	interfaces := []net.Interface{
+		{Index: 7, Name: "en7", Flags: net.FlagUp | net.FlagMulticast},
+		{Index: 8, Name: "en8", Flags: net.FlagUp | net.FlagMulticast},
+	}
+	wantRemaining := []netip.Addr{
+		netip.MustParseAddr("fe80::35").WithZone("en8"),
+	}
+
+	for _, providerCase := range []struct {
+		name string
+		new  func() *ZeroconfProvider
+	}{
+		{name: "default_interfaces", new: func() *ZeroconfProvider { return NewZeroconfProvider(nil) }},
+		{name: "configured_multi_interface", new: func() *ZeroconfProvider {
+			return NewZeroconfProvider(interfaces)
+		}},
+	} {
+		for _, removalCase := range []struct {
+			name             string
+			expiry           time.Time
+			wantRemove       bool
+			wantAddresses    []netip.Addr
+			wantCandidateLen int
+		}{
+			{
+				name:             "definitive_unannounce_retires_every_scope",
+				expiry:           time.Now().Add(time.Hour),
+				wantRemove:       true,
+				wantCandidateLen: 0,
+			},
+			{
+				name:             "one_interface_expiry_retains_other_scope",
+				expiry:           time.Now().Add(-time.Hour),
+				wantAddresses:    wantRemaining,
+				wantCandidateLen: 1,
+			},
+		} {
+			t.Run(providerCase.name+"/"+removalCase.name, func(t *testing.T) {
+				provider := providerCase.new()
+				manager := NewMDNS(
+					"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					"Helianthus",
+					"Gateway",
+					"HEMS",
+					"local-ship-id",
+					"helianthus",
+					4712,
+					nil,
+					MdnsProviderSelectionGoZeroConfOnly,
+				)
+				service := &zeroconf.ServiceEntry{
+					ServiceRecord: zeroconf.ServiceRecord{Instance: "VR940"},
+					HostName:      "vr940.local",
+					Port:          12480,
+					Text: []string{
+						"txtvers=1",
+						"id=vr940-ship-id",
+						"path=/ship/",
+						"ski=3535353535353535353535353535353535353535",
+						"register=true",
+					},
+					Expiry:   removalCase.expiry,
+					AddrIPv6: []net.IP{net.ParseIP("fe80::35")},
+				}
+
+				var callbackCount int
+				var callbackRemove bool
+				var callbackAddresses []netip.Addr
+				record := false
+				callback := func(
+					elements map[string]string,
+					name,
+					host string,
+					addresses []netip.Addr,
+					port int,
+					remove bool,
+				) {
+					if record {
+						callbackCount++
+						callbackRemove = remove
+						callbackAddresses = append([]netip.Addr(nil), addresses...)
+					}
+					manager.processScopedMdnsEntry(elements, name, host, addresses, port, remove)
+				}
+
+				for _, iface := range interfaces {
+					provider.processScopedServiceForInterface(iface, service, false, callback)
+				}
+				record = true
+
+				// enbility/zeroconf forwards the cached, still-live entry for a
+				// TTL=0 goodbye, whereas its cleanup path forwards an entry whose
+				// Expiry has elapsed. The provider must preserve that distinction.
+				provider.processScopedServiceForInterface(interfaces[0], service, true, callback)
+
+				if callbackCount != 1 || callbackRemove != removalCase.wantRemove ||
+					!reflect.DeepEqual(callbackAddresses, removalCase.wantAddresses) {
+					t.Fatalf(
+						"removal callback = count:%d remove:%t addresses:%v, want count:1 remove:%t addresses:%v",
+						callbackCount,
+						callbackRemove,
+						callbackAddresses,
+						removalCase.wantRemove,
+						removalCase.wantAddresses,
+					)
+				}
+				_, candidates, _ := manager.copyMdnsSnapshot()
+				if len(candidates) != removalCase.wantCandidateLen {
+					t.Fatalf("candidates after removal = %#v, want len %d", candidates, removalCase.wantCandidateLen)
+				}
+			})
+		}
 	}
 }
 
