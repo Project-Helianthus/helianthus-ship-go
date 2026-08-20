@@ -2,6 +2,7 @@ package hub
 
 import (
 	"net"
+	"net/netip"
 	"sort"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
@@ -67,6 +68,7 @@ func cloneMdnsEntries(entries map[string]*api.MdnsEntry) map[string]*api.MdnsEnt
 		}
 		value := *entry
 		value.Addresses = cloneIPAddresses(entry.Addresses)
+		value.ScopedAddresses = cloneScopedIPAddresses(entry.ScopedAddresses)
 		cloned[key] = &value
 	}
 	return cloned
@@ -79,8 +81,13 @@ func clonePairingCandidateObservations(
 	for index, candidate := range candidates {
 		cloned[index] = candidate
 		cloned[index].Addresses = cloneIPAddresses(candidate.Addresses)
+		cloned[index].ScopedAddresses = cloneScopedIPAddresses(candidate.ScopedAddresses)
 	}
 	return cloned
+}
+
+func cloneScopedIPAddresses(addresses []netip.Addr) []netip.Addr {
+	return append([]netip.Addr(nil), addresses...)
 }
 
 func cloneIPAddresses(addresses []net.IP) []net.IP {
@@ -164,6 +171,10 @@ func (h *Hub) reportMdnsSnapshot(
 			path:      candidate.Path,
 			port:      candidate.Port,
 			addresses: append([]net.IP(nil), candidate.Addresses...),
+			scopedAddresses: append(
+				[]netip.Addr(nil),
+				candidate.ScopedAddresses...,
+			),
 		}
 	}
 	h.muxAttemptGate.Lock()

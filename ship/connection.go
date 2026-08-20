@@ -44,6 +44,7 @@ type ShipConnection struct {
 	pairingClosing            bool
 	pairingTerminal           bool
 	spineSetupStarted         bool
+	pinInputSent              bool
 	pairingApprovalMux        sync.Mutex
 	testHooks                 *shipConnectionTestHooks
 
@@ -298,6 +299,18 @@ func (c *ShipConnection) ShipHandshakeState() (model.ShipMessageExchangeState, e
 	defer c.mux.Unlock()
 
 	return c.smeState, c.smeError
+}
+
+func (c *ShipConnection) markPINInputSent() {
+	c.mux.Lock()
+	c.pinInputSent = true
+	c.mux.Unlock()
+}
+
+func (c *ShipConnection) wasPINInputSent() bool {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+	return c.pinInputSent
 }
 
 // invoked when pairing for a pending request is approved

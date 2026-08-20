@@ -20,7 +20,6 @@ import (
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
 	"github.com/Project-Helianthus/helianthus-ship-go/logging"
-	"github.com/Project-Helianthus/helianthus-ship-go/util"
 	"github.com/enbility/go-avahi"
 )
 
@@ -232,7 +231,7 @@ func (m *MdnsManager) startProvider(policy api.ListenerPolicy, scoped bool) (api
 			host,
 			policy.ListenAddress.Addr().WithZone(""),
 		)
-		if !provider.Start(true, m.processMdnsEntry) {
+		if !m.startProviderInstance(provider, true) {
 			provider.Shutdown()
 			return nil, errors.New("scoped Zeroconf provider unavailable")
 		}
@@ -247,27 +246,27 @@ func (m *MdnsManager) startProvider(policy api.ListenerPolicy, scoped bool) (api
 	switch m.providerSelection {
 	case MdnsProviderSelectionAll:
 		provider := m.newAvahiProvider(ifaceIndexes)
-		if provider.Start(false, m.processMdnsEntry) {
+		if m.startProviderInstance(provider, false) {
 			return provider, nil
 		}
 		provider.Shutdown()
 
 		provider = m.newZeroconfProvider(ifaces)
-		if !provider.Start(false, m.processMdnsEntry) {
+		if !m.startProviderInstance(provider, false) {
 			provider.Shutdown()
 			return nil, errors.New("no mDNS provider available")
 		}
 		return provider, nil
 	case MdnsProviderSelectionAvahiOnly:
 		provider := m.newAvahiProvider(ifaceIndexes)
-		if !provider.Start(true, m.processMdnsEntry) {
+		if !m.startProviderInstance(provider, true) {
 			provider.Shutdown()
 			return nil, errors.New("avahi mDNS provider is unavailable")
 		}
 		return provider, nil
 	case MdnsProviderSelectionGoZeroConfOnly:
 		provider := m.newZeroconfProvider(ifaces)
-		if !provider.Start(true, m.processMdnsEntry) {
+		if !m.startProviderInstance(provider, true) {
 			provider.Shutdown()
 			return nil, errors.New("zeroconf mDNS provider is unavailable")
 		}
@@ -275,6 +274,13 @@ func (m *MdnsManager) startProvider(policy api.ListenerPolicy, scoped bool) (api
 	default:
 		return nil, fmt.Errorf("unknown mDNS provider selection %d", m.providerSelection)
 	}
+}
+
+func (m *MdnsManager) startProviderInstance(provider api.MdnsProviderInterface, autoReconnect bool) bool {
+	if scoped, ok := provider.(api.ScopedMdnsProviderInterface); ok {
+		return scoped.StartScoped(autoReconnect, m.processScopedMdnsEntry)
+	}
+	return provider.Start(autoReconnect, m.processMdnsEntry)
 }
 
 func (m *MdnsManager) installProvider(provider api.MdnsProviderInterface) error {
@@ -487,9 +493,10 @@ func (m *MdnsManager) copyMdnsEntriesLocked() map[string]*api.MdnsEntry {
 		if _, exists := mdnsEntries[v.Ski]; exists {
 			continue
 		}
-		newEntry := &api.MdnsEntry{}
-		util.DeepCopy[*api.MdnsEntry](v, newEntry)
-		mdnsEntries[v.Ski] = newEntry
+		newEntry := *v
+		newEntry.Addresses = cloneIPs(v.Addresses)
+		newEntry.ScopedAddresses = append([]netip.Addr(nil), v.ScopedAddresses...)
+		mdnsEntries[v.Ski] = &newEntry
 	}
 
 	return mdnsEntries
@@ -513,6 +520,10 @@ func (m *MdnsManager) copyPairingCandidatesLocked() []api.PairingCandidateObserv
 			Path:         entry.Path,
 			Port:         entry.Port,
 			Addresses:    append([]net.IP(nil), entry.Addresses...),
+			ScopedAddresses: append(
+				[]netip.Addr(nil),
+				entry.ScopedAddresses...,
+			),
 		})
 	}
 	sort.Slice(candidates, func(left, right int) bool {
@@ -560,8 +571,42 @@ func sameIPList(left, right []net.IP) bool {
 	return true
 }
 
+func sameScopedIPList(left, right []netip.Addr) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func cloneIPs(addresses []net.IP) []net.IP {
+	cloned := make([]net.IP, len(addresses))
+	for index, address := range addresses {
+		cloned[index] = append(net.IP(nil), address...)
+	}
+	return cloned
+}
+
 // process an mDNS entry and manage mDNS entries map
 func (m *MdnsManager) processMdnsEntry(elements map[string]string, name, host string, addresses []net.IP, port int, remove bool) {
+	scoped := make([]netip.Addr, 0, len(addresses))
+	for _, address := range addresses {
+		value, ok := netip.AddrFromSlice(address)
+		if !ok {
+			continue
+		}
+		scoped = append(scoped, value.Unmap())
+	}
+	m.processScopedMdnsEntry(elements, name, host, scoped, port, remove)
+}
+
+// processScopedMdnsEntry manages one mDNS observation while preserving the
+// interface zone required to dial IPv6 link-local addresses.
+func (m *MdnsManager) processScopedMdnsEntry(elements map[string]string, name, host string, addresses []netip.Addr, port int, remove bool) {
 	// check for mandatory text elements
 	mapItems := []string{"txtvers", "id", "path", "ski", "register"}
 	for _, item := range mapItems {
@@ -598,15 +643,7 @@ func (m *MdnsManager) processMdnsEntry(elements map[string]string, name, host st
 		return
 	}
 
-	// remove IPv6 local link addresses
-	var newAddresses []net.IP
-	for _, address := range addresses {
-		if address.To4() == nil && address.IsLinkLocalUnicast() {
-			continue
-		}
-		newAddresses = append(newAddresses, address)
-	}
-	addresses = newAddresses
+	addresses, legacyAddresses := normalizeMdnsAddresses(addresses)
 
 	var deviceType, model, brand string
 
@@ -631,8 +668,11 @@ func (m *MdnsManager) processMdnsEntry(elements map[string]string, name, host st
 		updated = true
 		logging.Log().Debug("mdns: remove - ski:", ski, "name:", name, "brand:", brand, "model:", model, "typ:", deviceType, "identifier:", identifier, "register:", register, "host:", host, "port:", port, "addresses:", addresses)
 	case exists && !remove:
-		if !sameIPList(entry.Addresses, addresses) || entry.Register != (register == "true") || entry.Brand != brand || entry.Type != deviceType || entry.Model != model {
-			entry.Addresses = append([]net.IP(nil), addresses...)
+		if !sameIPList(entry.Addresses, legacyAddresses) ||
+			!sameScopedIPList(entry.ScopedAddresses, addresses) ||
+			entry.Register != (register == "true") || entry.Brand != brand || entry.Type != deviceType || entry.Model != model {
+			entry.Addresses = cloneIPs(legacyAddresses)
+			entry.ScopedAddresses = append([]netip.Addr(nil), addresses...)
 			entry.Register = register == "true"
 			entry.Brand = brand
 			entry.Type = deviceType
@@ -653,7 +693,11 @@ func (m *MdnsManager) processMdnsEntry(elements map[string]string, name, host st
 			Model:      model,
 			Host:       host,
 			Port:       port,
-			Addresses:  append([]net.IP(nil), addresses...),
+			Addresses:  cloneIPs(legacyAddresses),
+			ScopedAddresses: append(
+				[]netip.Addr(nil),
+				addresses...,
+			),
 		}
 		m.candidateRefs[observationKey] = m.nextCandidateRefLocked(observationKey)
 		updated = true
@@ -674,6 +718,35 @@ func (m *MdnsManager) processMdnsEntry(elements map[string]string, name, host st
 	if m.report != nil && updated {
 		m.reportEntries(entries, candidates, true, revision)
 	}
+}
+
+func normalizeMdnsAddresses(addresses []netip.Addr) ([]netip.Addr, []net.IP) {
+	scoped := make([]netip.Addr, 0, len(addresses))
+	legacy := make([]net.IP, 0, len(addresses))
+	seen := make(map[netip.Addr]struct{}, len(addresses))
+	for _, address := range addresses {
+		if !address.IsValid() {
+			continue
+		}
+		address = address.Unmap()
+		linkLocalIPv6 := address.Is6() && address.IsLinkLocalUnicast()
+		if linkLocalIPv6 {
+			if address.Zone() == "" {
+				continue
+			}
+		} else if address.Zone() != "" {
+			address = address.WithZone("")
+		}
+		if _, exists := seen[address]; exists {
+			continue
+		}
+		seen[address] = struct{}{}
+		scoped = append(scoped, address)
+		if !linkLocalIPv6 {
+			legacy = append(legacy, append(net.IP(nil), address.AsSlice()...))
+		}
+	}
+	return scoped, legacy
 }
 
 func (m *MdnsManager) RequestMdnsEntries() {

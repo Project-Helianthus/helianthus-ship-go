@@ -5,7 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"net"
-	"sort"
+	"net/netip"
 	"strconv"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
@@ -155,7 +155,7 @@ func (h *Hub) admitPairingCandidate(
 		h.unlockPairingCandidateAdmission()
 		return api.PairingCandidateReservation{}, nil, api.ErrPairingCandidateSKIMismatch
 	}
-	host, ok := pairingCandidateAddress(entry.addresses)
+	host, ok := pairingCandidateAddress(entry.scopedAddresses, entry.addresses)
 	if !ok || entry.port <= 0 || entry.port > 65535 || entry.path == "" {
 		h.unlockPairingCandidateAdmission()
 		return api.PairingCandidateReservation{}, nil, api.ErrPairingCandidateUnavailable
@@ -215,13 +215,33 @@ func pairingCandidateObservationMatchesActive(entry pairingCandidateObservation,
 		entry.path != active.path || strconv.Itoa(entry.port) != active.port {
 		return false
 	}
-	host, ok := pairingCandidateAddress(entry.addresses)
+	host, ok := pairingCandidateAddress(entry.scopedAddresses, entry.addresses)
 	return ok && host == active.host
 }
 
 // ConnectPairingCandidate launches one outbound attempt for the exact current
 // selection. It never accepts an endpoint or identity from the caller.
 func (h *Hub) ConnectPairingCandidate(reservation api.PairingCandidateReservation) error {
+	return h.connectPairingCandidate(reservation, nil)
+}
+
+// ConnectPairingCandidateWithPIN attaches a one-shot provider to this exact
+// selected connection. The Hub stores only the provider capability, never PIN
+// bytes, and removes it on first use or terminal cleanup.
+func (h *Hub) ConnectPairingCandidateWithPIN(
+	reservation api.PairingCandidateReservation,
+	provider api.TransientPINProvider,
+) error {
+	if provider == nil || isNilOutgoingAttemptValue(provider) {
+		return api.ErrPINProviderInvalid
+	}
+	return h.connectPairingCandidate(reservation, provider)
+}
+
+func (h *Hub) connectPairingCandidate(
+	reservation api.PairingCandidateReservation,
+	provider api.TransientPINProvider,
+) error {
 	if !reservation.Valid() {
 		return api.ErrPairingCandidateReservationStale
 	}
@@ -252,6 +272,12 @@ func (h *Hub) ConnectPairingCandidate(reservation api.PairingCandidateReservatio
 		return api.ErrOutgoingAttemptGateRequired
 	}
 	activeCandidate.connectIssued = true
+	if provider != nil {
+		h.transientPINProviders[ski] = transientPINProviderRegistration{
+			authority: activeCandidate.authority,
+			provider:  provider,
+		}
+	}
 	activeCandidate.service.ConnectionStateDetail().SetState(api.ConnectionStateQueued)
 	launch := &pairingCandidateLaunch{
 		ski: ski, service: activeCandidate.service, candidate: activeCandidate,
@@ -261,6 +287,68 @@ func (h *Hub) ConnectPairingCandidate(reservation api.PairingCandidateReservatio
 
 	h.launchPairingCandidate(launch)
 	return nil
+}
+
+// WithTransientPIN consumes the provider attached to one selected connection.
+// Provider errors are returned only to shipConnection, which maps them to
+// categorical secret-free public errors.
+func (h *Hub) WithTransientPIN(
+	remoteSKI string,
+	consume func([]byte) error,
+) (bool, error) {
+	remoteSKI = util.NormalizeSKI(remoteSKI)
+	h.muxReg.Lock()
+	registration, exists := h.transientPINProviders[remoteSKI]
+	if exists {
+		delete(h.transientPINProviders, remoteSKI)
+	} else {
+		registration = transientPINProviderRegistration{}
+	}
+	h.muxReg.Unlock()
+	if registration.provider == nil || isNilOutgoingAttemptValue(registration.provider) {
+		return false, nil
+	}
+	return registration.provider.WithTransientPIN(remoteSKI, consume)
+}
+
+func (h *Hub) DiscardTransientPIN(remoteSKI string) {
+	remoteSKI = util.NormalizeSKI(remoteSKI)
+	h.muxReg.Lock()
+	delete(h.transientPINProviders, remoteSKI)
+	h.muxReg.Unlock()
+}
+
+func (h *Hub) withTransientPINForAuthority(
+	remoteSKI string,
+	authority *outboundAttemptAuthority,
+	consume func([]byte) error,
+) (bool, error) {
+	remoteSKI = util.NormalizeSKI(remoteSKI)
+	h.muxReg.Lock()
+	registration, exists := h.transientPINProviders[remoteSKI]
+	if exists && authority != nil && registration.authority == authority {
+		delete(h.transientPINProviders, remoteSKI)
+	} else {
+		registration = transientPINProviderRegistration{}
+	}
+	h.muxReg.Unlock()
+	if registration.provider == nil || isNilOutgoingAttemptValue(registration.provider) {
+		return false, nil
+	}
+	return registration.provider.WithTransientPIN(remoteSKI, consume)
+}
+
+func (h *Hub) discardTransientPINForAuthority(
+	remoteSKI string,
+	authority *outboundAttemptAuthority,
+) {
+	remoteSKI = util.NormalizeSKI(remoteSKI)
+	h.muxReg.Lock()
+	registration, exists := h.transientPINProviders[remoteSKI]
+	if exists && authority != nil && registration.authority == authority {
+		delete(h.transientPINProviders, remoteSKI)
+	}
+	h.muxReg.Unlock()
 }
 
 func (h *Hub) launchPairingCandidate(candidateLaunch *pairingCandidateLaunch) {
@@ -312,26 +400,12 @@ func validPairingCandidateSKI(ski string) (string, error) {
 	return ski, nil
 }
 
-func pairingCandidateAddress(addresses []net.IP) (string, bool) {
-	values := make([]string, 0, len(addresses))
-	for _, address := range addresses {
-		if address == nil || address.IsUnspecified() || address.IsMulticast() {
-			continue
-		}
-		values = append(values, address.String())
-	}
-	if len(values) == 0 {
+func pairingCandidateAddress(scoped []netip.Addr, legacy []net.IP) (string, bool) {
+	addresses := orderedConnectionAddresses(scoped, legacy)
+	if len(addresses) == 0 {
 		return "", false
 	}
-	sort.Slice(values, func(left, right int) bool {
-		leftIP := net.ParseIP(values[left])
-		rightIP := net.ParseIP(values[right])
-		if (leftIP.To4() != nil) != (rightIP.To4() != nil) {
-			return leftIP.To4() != nil
-		}
-		return values[left] < values[right]
-	})
-	return values[0], true
+	return addresses[0].String(), true
 }
 
 func (h *Hub) retirePairingCandidate(
@@ -377,6 +451,10 @@ func (h *Hub) retireActivePairingCandidateLocked(
 	retirementAuthority := h.rotateOutboundAuthorityLocked(ski)
 	active.service.ConnectionStateDetail().SetState(api.ConnectionStateNone)
 	delete(h.activePairingCandidates, ski)
+	if registration, exists := h.transientPINProviders[ski]; exists &&
+		registration.authority == active.authority {
+		delete(h.transientPINProviders, ski)
+	}
 	return &pairingCandidateRetirement{
 		ski:       ski,
 		service:   active.service,

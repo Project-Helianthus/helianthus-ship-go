@@ -107,10 +107,10 @@ func (s *ProClientSuite) Test_ListenChoice() {
 
 	s.sut.handleState(false, msg)
 
-	assert.Equal(s.T(), false, s.sut.handshakeTimerRunning)
+	assert.Equal(s.T(), true, s.sut.handshakeTimerRunning)
 
-	// state goes directly from smeProtHStateClientOk to smePinStateCheckInit to smePinStateCheckListen
-	assert.Equal(s.T(), model.SmePinStateCheckListen, s.sut.getState())
+	// state goes directly from smeProtHStateClientOk to smePinStateCheckInit to smePinStateAskInit
+	assert.Equal(s.T(), model.SmePinStateAskInit, s.sut.getState())
 	assert.NotNil(s.T(), s.lastMessage())
 }
 

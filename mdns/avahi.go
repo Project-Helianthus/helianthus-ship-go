@@ -3,6 +3,7 @@ package mdns
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"sort"
 	"sync"
 	"time"
@@ -25,7 +26,7 @@ type avahiServiceObservation struct {
 	elements  map[string]string
 	name      string
 	host      string
-	addresses []net.IP
+	addresses []netip.Addr
 	port      int
 }
 
@@ -43,7 +44,7 @@ type AvahiProvider struct {
 
 	mdnsServiceData *mdnsServiceData
 
-	resolveCB api.MdnsResolveCB
+	resolveCB api.MdnsScopedResolveCB
 
 	// Used to store the service elements for each service, so that we can recall them when a service is removed
 	serviceElements     map[string]map[string]string
@@ -67,8 +68,30 @@ func NewAvahiProvider(ifaceIndexes []int32) *AvahiProvider {
 }
 
 var _ api.MdnsProviderInterface = (*AvahiProvider)(nil)
+var _ api.ScopedMdnsProviderInterface = (*AvahiProvider)(nil)
 
 func (a *AvahiProvider) Start(autoReconnect bool, cb api.MdnsResolveCB) bool {
+	return a.start(autoReconnect, func(
+		elements map[string]string,
+		name,
+		host string,
+		addresses []netip.Addr,
+		port int,
+		remove bool,
+	) {
+		legacy := make([]net.IP, 0, len(addresses))
+		for _, address := range addresses {
+			legacy = append(legacy, append(net.IP(nil), address.AsSlice()...))
+		}
+		cb(elements, name, host, legacy, port, remove)
+	})
+}
+
+func (a *AvahiProvider) StartScoped(autoReconnect bool, cb api.MdnsScopedResolveCB) bool {
+	return a.start(autoReconnect, cb)
+}
+
+func (a *AvahiProvider) start(autoReconnect bool, cb api.MdnsScopedResolveCB) bool {
 	a.mux.Lock()
 	defer a.mux.Unlock()
 
@@ -247,7 +270,7 @@ func (a *AvahiProvider) avahiCallback(event avahi.Event) {
 }
 
 // attempt to reconnect to the avahi daemon endlessly
-func (a *AvahiProvider) attemptReconnect(cb api.MdnsResolveCB, serviceData *mdnsServiceData) {
+func (a *AvahiProvider) attemptReconnect(cb api.MdnsScopedResolveCB, serviceData *mdnsServiceData) {
 	for {
 		a.mux.Lock()
 		isManualShutdown := a.manualShutdown
@@ -258,7 +281,7 @@ func (a *AvahiProvider) attemptReconnect(cb api.MdnsResolveCB, serviceData *mdns
 
 		<-time.After(time.Second)
 
-		if !a.Start(true, cb) {
+		if !a.start(true, cb) {
 			continue
 		}
 
@@ -275,17 +298,17 @@ func (a *AvahiProvider) attemptReconnect(cb api.MdnsResolveCB, serviceData *mdns
 }
 
 // listen to service changes and shutdown
-func (a *AvahiProvider) chanListener(cb api.MdnsResolveCB) {
+func (a *AvahiProvider) chanListener(cb api.MdnsScopedResolveCB) {
 	for {
 		select {
 		case <-a.shutdownChan:
 			return
 		case service := <-a.addServiceChan:
-			if err := a.processService(service, false, cb); err != nil {
+			if err := a.processScopedService(service, false, cb); err != nil {
 				logging.Log().Debug("mdns: avahi -", err)
 			}
 		case service := <-a.removeServiceChan:
-			if err := a.processService(service, true, cb); err != nil {
+			if err := a.processScopedService(service, true, cb); err != nil {
 				logging.Log().Debug("mdns: avahi -", err)
 			}
 		}
@@ -295,6 +318,10 @@ func (a *AvahiProvider) chanListener(cb api.MdnsResolveCB) {
 // process an avahi mDNS service
 // as avahi returns a service per interface, we need to combine them
 func (a *AvahiProvider) processService(service avahi.Service, remove bool, cb api.MdnsResolveCB) error {
+	return a.processScopedService(service, remove, legacyMdnsCallback(cb))
+}
+
+func (a *AvahiProvider) processScopedService(service avahi.Service, remove bool, cb api.MdnsScopedResolveCB) error {
 	// check if the service is within the allowed list
 	allow := false
 	if len(a.ifaceIndexes) == 1 && a.ifaceIndexes[0] == avahi.InterfaceUnspec {
@@ -313,7 +340,7 @@ func (a *AvahiProvider) processService(service avahi.Service, remove bool, cb ap
 	}
 
 	if remove {
-		return a.processRemovedService(service, cb)
+		return a.processRemovedScopedService(service, cb)
 	}
 
 	// resolve the new service
@@ -322,10 +349,14 @@ func (a *AvahiProvider) processService(service avahi.Service, remove bool, cb ap
 		return fmt.Errorf("error resolving service: %s error: %w", service.Name, err)
 	}
 
-	return a.processAddedService(resolved, cb)
+	return a.processAddedScopedService(resolved, cb)
 }
 
 func (a *AvahiProvider) processRemovedService(service avahi.Service, cb api.MdnsResolveCB) error {
+	return a.processRemovedScopedService(service, legacyMdnsCallback(cb))
+}
+
+func (a *AvahiProvider) processRemovedScopedService(service avahi.Service, cb api.MdnsScopedResolveCB) error {
 	logging.Log().Tracef("mdns: avahi - process remove service: %v", service)
 
 	key := getServiceUniqueKey(service)
@@ -364,6 +395,10 @@ func (a *AvahiProvider) processRemovedService(service avahi.Service, cb api.Mdns
 }
 
 func (a *AvahiProvider) processAddedService(service avahi.Service, cb api.MdnsResolveCB) error {
+	return a.processAddedScopedService(service, legacyMdnsCallback(cb))
+}
+
+func (a *AvahiProvider) processAddedScopedService(service avahi.Service, cb api.MdnsScopedResolveCB) error {
 	// convert [][]byte to []string manually
 	var txt []string
 	for _, element := range service.Txt {
@@ -373,17 +408,23 @@ func (a *AvahiProvider) processAddedService(service avahi.Service, cb api.MdnsRe
 
 	logging.Log().Trace("mdns: avahi - process add service:", service.Name, service.Type, service.Domain, service.Host, service.Address, service.Port, elements)
 
-	address := net.ParseIP(service.Address)
+	address, err := netip.ParseAddr(service.Address)
 	// if the address can not be used, ignore the entry
-	if address == nil || address.IsUnspecified() {
+	if err != nil || address.IsUnspecified() {
 		return fmt.Errorf("service provides unusable address: %s", service.Name)
+	}
+	address = address.Unmap()
+	if address.Is6() && address.IsLinkLocalUnicast() {
+		if zone, zoneErr := a.avServer.GetNetworkInterfaceNameByIndex(service.Interface); zoneErr == nil && zone != "" {
+			address = address.WithZone(zone)
+		}
 	}
 
 	observation := avahiServiceObservation{
 		elements:  elements,
 		name:      service.Name,
 		host:      service.Host,
-		addresses: []net.IP{append(net.IP(nil), address...)},
+		addresses: []netip.Addr{address},
 		port:      int(service.Port),
 	}
 	a.muxEl.Lock()
@@ -398,9 +439,9 @@ func (a *AvahiProvider) processAddedService(service avahi.Service, cb api.MdnsRe
 	return nil
 }
 
-func (a *AvahiProvider) observationAddressesLocked(reference avahiServiceObservation) []net.IP {
+func (a *AvahiProvider) observationAddressesLocked(reference avahiServiceObservation) []netip.Addr {
 	referenceKey := mdnsObservationKey(reference.name, reference.host, reference.port, reference.elements)
-	var addresses []net.IP
+	var addresses []netip.Addr
 	for _, observation := range a.serviceObservations {
 		if mdnsObservationKey(observation.name, observation.host, observation.port, observation.elements) != referenceKey {
 			continue
@@ -408,13 +449,13 @@ func (a *AvahiProvider) observationAddressesLocked(reference avahiServiceObserva
 		for _, address := range observation.addresses {
 			found := false
 			for _, current := range addresses {
-				if current.Equal(address) {
+				if current == address {
 					found = true
 					break
 				}
 			}
 			if !found {
-				addresses = append(addresses, append(net.IP(nil), address...))
+				addresses = append(addresses, address)
 			}
 		}
 	}
@@ -426,7 +467,7 @@ func (a *AvahiProvider) observationAddressesLocked(reference avahiServiceObserva
 
 func (a *AvahiProvider) survivingObservationLocked(
 	reference avahiServiceObservation,
-) (avahiServiceObservation, []net.IP, bool) {
+) (avahiServiceObservation, []netip.Addr, bool) {
 	referenceKey := mdnsObservationKey(reference.name, reference.host, reference.port, reference.elements)
 	keys := make([]string, 0, len(a.serviceObservations))
 	for key, observation := range a.serviceObservations {
@@ -440,6 +481,23 @@ func (a *AvahiProvider) survivingObservationLocked(
 	sort.Strings(keys)
 	survivor := a.serviceObservations[keys[0]]
 	return survivor, a.observationAddressesLocked(survivor), true
+}
+
+func legacyMdnsCallback(cb api.MdnsResolveCB) api.MdnsScopedResolveCB {
+	return func(
+		elements map[string]string,
+		name,
+		host string,
+		addresses []netip.Addr,
+		port int,
+		remove bool,
+	) {
+		legacy := make([]net.IP, 0, len(addresses))
+		for _, address := range addresses {
+			legacy = append(legacy, append(net.IP(nil), address.AsSlice()...))
+		}
+		cb(elements, name, host, legacy, port, remove)
+	}
 }
 
 // Create a unique key for a ship service

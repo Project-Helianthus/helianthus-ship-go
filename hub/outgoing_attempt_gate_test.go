@@ -528,7 +528,7 @@ func TestNoGatePreservesUpstreamRetryFallbackAndReannounce(t *testing.T) {
 	}
 }
 
-func TestNoGatePreservesUpstreamRawIPv6URLConstruction(t *testing.T) {
+func TestNoGateConstructsValidGlobalIPv6URL(t *testing.T) {
 	dialer := &fakePeerDialer{err: errAttemptTestDial}
 	hub, _, remote := newAttemptTestHub(t, nil, dialer)
 
@@ -538,15 +538,15 @@ func TestNoGatePreservesUpstreamRawIPv6URLConstruction(t *testing.T) {
 	}
 	calls, _ := dialer.snapshot()
 	want := []string{
-		"wss://2001:db8::77:4712/ship/",
-		"wss://2001:db8::77:4712",
+		"wss://[2001:db8::77]:4712/ship/",
+		"wss://[2001:db8::77]:4712",
 	}
 	if len(calls) != len(want) {
 		t.Fatalf("ungated raw IPv6 dial count = %d, want %d", len(calls), len(want))
 	}
 	for index := range want {
 		if calls[index].url != want[index] {
-			t.Errorf("ungated raw IPv6 URL %d = %q, want upstream %q", index, calls[index].url, want[index])
+			t.Errorf("ungated global IPv6 URL %d = %q, want %q", index, calls[index].url, want[index])
 		}
 	}
 }

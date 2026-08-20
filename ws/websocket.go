@@ -192,6 +192,9 @@ func (w *WebsocketConnection) readShipPump() {
 func (w *WebsocketConnection) textFromMessage(msg []byte) string {
 	text := "unknown single byte"
 	if len(msg) > 2 {
+		if msg[0] == model.MsgTypeControl && bytes.Contains(msg[1:], []byte(`"connectionPinInput"`)) {
+			return "ship control: connectionPinInput [redacted]"
+		}
 		text = string(msg[1:])
 	} else if bytes.Equal(msg, model.ShipInit) {
 		text = "ship init"
@@ -250,6 +253,7 @@ func (w *WebsocketConnection) close() {
 }
 
 var _ api.WebsocketDataWriterInterface = (*WebsocketConnection)(nil)
+var _ api.SensitiveWebsocketDataWriterInterface = (*WebsocketConnection)(nil)
 
 func (w *WebsocketConnection) InitDataProcessing(dataProcessing api.WebsocketDataReaderInterface) {
 	w.dataProcessing = dataProcessing
@@ -283,6 +287,19 @@ func (w *WebsocketConnection) WriteMessageToWebsocketConnection(message []byte) 
 	default:
 		return nil
 	}
+}
+
+// WriteSensitiveMessageToWebsocketConnection writes synchronously so the
+// caller can clear its transient buffer immediately after return. The payload
+// bypasses the ordinary queue and its trace logging.
+func (w *WebsocketConnection) WriteSensitiveMessageToWebsocketConnection(message []byte) error {
+	if w.isConnClosed() {
+		return errors.New(connIsClosedError)
+	}
+	if !w.writeMessage(websocket.BinaryMessage, message) {
+		return errors.New(connIsClosedError)
+	}
+	return nil
 }
 
 // make sure websocket Write is only called once at a time

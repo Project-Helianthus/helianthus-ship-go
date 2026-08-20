@@ -44,8 +44,30 @@ func newScopedZeroconfProvider(ifaces []net.Interface, host string, address neti
 }
 
 var _ api.MdnsProviderInterface = (*ZeroconfProvider)(nil)
+var _ api.ScopedMdnsProviderInterface = (*ZeroconfProvider)(nil)
 
 func (z *ZeroconfProvider) Start(autoReconnect bool, cb api.MdnsResolveCB) bool {
+	return z.start(func(
+		elements map[string]string,
+		name,
+		host string,
+		addresses []netip.Addr,
+		port int,
+		remove bool,
+	) {
+		legacy := make([]net.IP, 0, len(addresses))
+		for _, address := range addresses {
+			legacy = append(legacy, append(net.IP(nil), address.AsSlice()...))
+		}
+		cb(elements, name, host, legacy, port, remove)
+	})
+}
+
+func (z *ZeroconfProvider) StartScoped(_ bool, cb api.MdnsScopedResolveCB) bool {
+	return z.start(cb)
+}
+
+func (z *ZeroconfProvider) start(cb api.MdnsScopedResolveCB) bool {
 	z.mux.Lock()
 	if z.cancel != nil {
 		z.mux.Unlock()
@@ -133,7 +155,7 @@ func (z *ZeroconfProvider) Unannounce() {
 	z.zc = nil
 }
 
-func (z *ZeroconfProvider) chanListener(ctx context.Context, cb api.MdnsResolveCB) {
+func (z *ZeroconfProvider) chanListener(ctx context.Context, cb api.MdnsScopedResolveCB) {
 	defer z.wait.Done()
 	zcEntries := make(chan *zeroconf.ServiceEntry)
 	zcRemoved := make(chan *zeroconf.ServiceEntry)
@@ -165,7 +187,7 @@ func (z *ZeroconfProvider) chanListener(ctx context.Context, cb api.MdnsResolveC
 
 			elements := parseTxt(service.Text)
 
-			addresses := service.AddrIPv4
+			addresses := z.scopedServiceAddresses(service)
 			cb(elements, service.Instance, service.HostName, addresses, service.Port, true)
 
 		case service := <-zcEntries:
@@ -176,9 +198,31 @@ func (z *ZeroconfProvider) chanListener(ctx context.Context, cb api.MdnsResolveC
 
 			elements := parseTxt(service.Text)
 
-			addresses := service.AddrIPv4
-			addresses = append(addresses, service.AddrIPv6...)
+			addresses := z.scopedServiceAddresses(service)
 			cb(elements, service.Instance, service.HostName, addresses, service.Port, false)
 		}
 	}
+}
+
+func (z *ZeroconfProvider) scopedServiceAddresses(service *zeroconf.ServiceEntry) []netip.Addr {
+	if service == nil {
+		return nil
+	}
+	zone := ""
+	if len(z.ifaces) == 1 {
+		zone = z.ifaces[0].Name
+	}
+	addresses := make([]netip.Addr, 0, len(service.AddrIPv4)+len(service.AddrIPv6))
+	for _, value := range append(append([]net.IP(nil), service.AddrIPv4...), service.AddrIPv6...) {
+		address, ok := netip.AddrFromSlice(value)
+		if !ok {
+			continue
+		}
+		address = address.Unmap()
+		if address.Is6() && address.IsLinkLocalUnicast() && zone != "" {
+			address = address.WithZone(zone)
+		}
+		addresses = append(addresses, address)
+	}
+	return addresses
 }

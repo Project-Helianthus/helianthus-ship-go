@@ -154,10 +154,10 @@ func (s *ProServerSuite) Test_ListenConfirm() {
 
 	s.sut.handleState(false, msg)
 
-	assert.Equal(s.T(), false, s.sut.handshakeTimerRunning)
+	assert.Equal(s.T(), true, s.sut.handshakeTimerRunning)
 
-	// state smeProtHStateServerOk directly goes to smePinStateCheckInit to smePinStateCheckListen
-	assert.Equal(s.T(), model.SmePinStateCheckListen, s.sut.getState())
+	// state smeProtHStateServerOk directly goes to smePinStateCheckInit to smePinStateAskInit
+	assert.Equal(s.T(), model.SmePinStateAskInit, s.sut.getState())
 	assert.NotNil(s.T(), s.lastMessage())
 }
 

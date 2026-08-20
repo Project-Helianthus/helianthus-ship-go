@@ -113,6 +113,27 @@ func TestScopedZeroconfAnnounceUsesRegisterProxyWithOnlyConfiguredAddress(t *tes
 	}
 }
 
+func TestIssue35ScopedZeroconfObservationAppliesConfiguredInterfaceZone(t *testing.T) {
+	provider := NewZeroconfProvider([]net.Interface{{Index: 7, Name: "en7"}})
+	entry := &zeroconf.ServiceEntry{
+		AddrIPv4: []net.IP{net.ParseIP("192.0.2.35")},
+		AddrIPv6: []net.IP{
+			net.ParseIP("fe80::35"),
+			net.ParseIP("2001:db8::35"),
+		},
+	}
+
+	addresses := provider.scopedServiceAddresses(entry)
+	want := []netip.Addr{
+		netip.MustParseAddr("192.0.2.35"),
+		netip.MustParseAddr("fe80::35").WithZone("en7"),
+		netip.MustParseAddr("2001:db8::35"),
+	}
+	if !reflect.DeepEqual(addresses, want) {
+		t.Fatalf("scoped Zeroconf addresses = %v, want %v", addresses, want)
+	}
+}
+
 func TestScopedZeroconfReannounceShutsDownPreviousServer(t *testing.T) {
 	iface, address := localMulticastAddress(t)
 	provider := newScopedZeroconfProvider([]net.Interface{iface}, "repeat-test-host", address)

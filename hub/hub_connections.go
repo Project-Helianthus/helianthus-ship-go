@@ -9,7 +9,9 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	"net/netip"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -559,13 +561,18 @@ func (h *Hub) gatedDialContextWithExpectedSKI(
 	if remoteService == nil {
 		return nil, nil, nil, outgoingAttemptDeniedError{}
 	}
+	host, validHost := validatedOutgoingAttemptHost(host)
+	parsedPort, parseErr := strconv.ParseUint(port, 10, 16)
+	if !validHost || parseErr != nil || parsedPort == 0 {
+		return nil, nil, nil, outgoingAttemptDeniedError{}
+	}
 
 	gate, gateGeneration, authority, active := h.outgoingAttemptGateSnapshot(remoteService, requiredAuthority)
 	if !active {
 		return nil, nil, nil, outgoingAttemptDeniedError{}
 	}
 	permit := api.OutgoingAttemptPermit{Context: context.Background()}
-	address := fmt.Sprintf("wss://%s:%s%s", host, port, path)
+	address := "wss://" + net.JoinHostPort(host, port) + path
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			if attempt == nil {
@@ -588,13 +595,6 @@ func (h *Hub) gatedDialContextWithExpectedSKI(
 		if isNilOutgoingAttemptValue(gate) {
 			return nil, nil, nil, outgoingAttemptDeniedError{}
 		}
-
-		host = normalizeOutgoingAttemptHost(host)
-		parsedPort, parseErr := strconv.ParseUint(port, 10, 16)
-		if parseErr != nil || parsedPort == 0 || host == "" {
-			return nil, nil, nil, outgoingAttemptDeniedError{}
-		}
-		address = "wss://" + net.JoinHostPort(host, port) + path
 
 		request := api.OutgoingAttemptRequest{
 			RemoteSKI: remoteService.SKI(),
@@ -797,6 +797,27 @@ func normalizeOutgoingAttemptHost(host string) string {
 	return host
 }
 
+func validatedOutgoingAttemptHost(host string) (string, bool) {
+	host = normalizeOutgoingAttemptHost(host)
+	if host == "" {
+		return "", false
+	}
+	if address, err := netip.ParseAddr(host); err == nil {
+		address, valid := normalizeConnectionAddress(address)
+		if !valid {
+			return "", false
+		}
+		return address.String(), true
+	}
+	// A percent sign is meaningful only as an IPv6 zone separator. Reject it
+	// on an otherwise unparsable host instead of passing ambiguous input to URL
+	// construction or DNS.
+	if strings.Contains(host, "%") || strings.ContainsAny(host, "[]:") {
+		return "", false
+	}
+	return host, true
+}
+
 func isOutgoingAttemptDenied(err error) bool {
 	var denied outgoingAttemptDeniedError
 	return errors.As(err, &denied)
@@ -925,11 +946,11 @@ func (h *Hub) initateConnectionWithError(remoteService *api.ServiceDetails, entr
 		return false, nil
 	}
 
-	addresses := orderedConnectionAddresses(entry.Addresses)
+	addresses := orderedConnectionAddresses(entry.ScopedAddresses, entry.Addresses)
 	for _, address := range addresses {
 		logging.Log().Debug("trying to connect to", remoteService.SKI(), "at", address)
 		addressValue := address.String()
-		if address.To4() == nil {
+		if address.Is6() {
 			addressValue = "[" + address.String() + "]"
 		}
 		if err = h.connectFoundService(
@@ -969,42 +990,70 @@ func (h *Hub) initateConnectionWithError(remoteService *api.ServiceDetails, entr
 	return false, err
 }
 
-func orderedConnectionAddresses(addresses []net.IP) []net.IP {
-	ipv4 := make([]net.IP, 0, len(addresses))
-	ipv6 := make([]net.IP, 0, len(addresses))
-	seen := make(map[string]struct{}, len(addresses))
-	for _, address := range addresses {
-		canonical := address.To4()
-		family := byte(4)
-		if canonical == nil {
-			canonical = address.To16()
-			family = 6
+func orderedConnectionAddresses(scoped []netip.Addr, legacy []net.IP) []netip.Addr {
+	ipv4 := make([]netip.Addr, 0, len(scoped)+len(legacy))
+	ipv6 := make([]netip.Addr, 0, len(scoped)+len(legacy))
+	seen := make(map[netip.Addr]struct{}, len(scoped)+len(legacy))
+	appendAddress := func(address netip.Addr) {
+		address, valid := normalizeConnectionAddress(address)
+		if !valid {
+			return
 		}
-		if canonical == nil {
-			continue
+		if _, exists := seen[address]; exists {
+			return
 		}
-		key := string(append([]byte{family}, canonical...))
-		if _, exists := seen[key]; exists {
-			continue
-		}
-		seen[key] = struct{}{}
-		cloned := append(net.IP(nil), address...)
-		if family == 4 {
-			ipv4 = append(ipv4, cloned)
+		seen[address] = struct{}{}
+		if address.Is4() {
+			ipv4 = append(ipv4, address)
 		} else {
-			ipv6 = append(ipv6, cloned)
+			ipv6 = append(ipv6, address)
 		}
 	}
+	for _, address := range scoped {
+		appendAddress(address)
+	}
+	for _, address := range legacy {
+		value, ok := netip.AddrFromSlice(address)
+		if ok {
+			appendAddress(value)
+		}
+	}
+	sort.Slice(ipv4, func(left, right int) bool { return ipv4[left].Compare(ipv4[right]) < 0 })
+	sort.Slice(ipv6, func(left, right int) bool { return ipv6[left].Compare(ipv6[right]) < 0 })
 	return append(ipv4, ipv6...)
 }
 
-func hostMatchesConnectionAddress(host string, addresses []net.IP) bool {
-	hostAddress := net.ParseIP(normalizeOutgoingAttemptHost(host))
-	if hostAddress == nil {
+func normalizeConnectionAddress(address netip.Addr) (netip.Addr, bool) {
+	if !address.IsValid() {
+		return netip.Addr{}, false
+	}
+	address = address.Unmap()
+	if address.IsUnspecified() || address.IsMulticast() {
+		return netip.Addr{}, false
+	}
+	if address.Is6() && address.IsLinkLocalUnicast() {
+		if address.Zone() == "" {
+			return netip.Addr{}, false
+		}
+		return address, true
+	}
+	if address.Zone() != "" {
+		address = address.WithZone("")
+	}
+	return address, true
+}
+
+func hostMatchesConnectionAddress(host string, addresses []netip.Addr) bool {
+	host, valid := validatedOutgoingAttemptHost(host)
+	if !valid {
+		return false
+	}
+	hostAddress, err := netip.ParseAddr(host)
+	if err != nil {
 		return false
 	}
 	for _, address := range addresses {
-		if address.Equal(hostAddress) {
+		if address == hostAddress {
 			return true
 		}
 	}
@@ -1234,14 +1283,14 @@ func trustedRemoteRetryHost(entry *api.MdnsEntry) (string, bool) {
 	if entry == nil {
 		return "", false
 	}
-	if address, ok := pairingCandidateAddress(entry.Addresses); ok {
+	if address, ok := pairingCandidateAddress(entry.ScopedAddresses, entry.Addresses); ok {
 		return address, true
 	}
-	host := normalizeOutgoingAttemptHost(entry.Host)
-	if address := net.ParseIP(host); address != nil && (address.IsUnspecified() || address.IsMulticast()) {
+	host, valid := validatedOutgoingAttemptHost(entry.Host)
+	if !valid {
 		return "", false
 	}
-	return host, host != ""
+	return host, true
 }
 
 func (h *Hub) finishTrustedRemoteRetry(ski string, active *activeTrustedRemoteRetry) {

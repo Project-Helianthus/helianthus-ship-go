@@ -90,8 +90,8 @@ func (s *PinSuite) Test_Init() {
 	s.sut.setState(model.SmePinStateCheckInit, nil)
 	s.sut.handleState(false, nil)
 
-	assert.Equal(s.T(), false, s.sut.handshakeTimerRunning)
-	assert.Equal(s.T(), model.SmePinStateCheckListen, s.sut.getState())
+	assert.Equal(s.T(), true, s.sut.handshakeTimerRunning)
+	assert.Equal(s.T(), model.SmePinStateAskInit, s.sut.getState())
 	assert.NotNil(s.T(), s.lastMessage())
 }
 
@@ -185,9 +185,9 @@ func (s *PinSuite) Test_CheckListen_Ok() {
 
 	s.sut.handleState(false, msg)
 
-	assert.Equal(s.T(), false, s.sut.handshakeTimerRunning)
-	assert.Equal(s.T(), model.SmeStateError, s.sut.getState())
-	assert.Nil(s.T(), s.lastMessage())
+	assert.Equal(s.T(), true, s.sut.handshakeTimerRunning)
+	assert.Equal(s.T(), model.SmeAccessMethodsRequest, s.sut.getState())
+	assert.NotNil(s.T(), s.lastMessage())
 }
 
 func (s *PinSuite) Test_CheckListen_Invalid() {

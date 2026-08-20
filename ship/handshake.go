@@ -65,6 +65,12 @@ func (c *ShipConnection) setState(newState model.ShipMessageExchangeState, err e
 		c.setHandshakeTimer(timeoutTimerTypeWaitForReady, cmiTimeout)
 	case model.SmeProtHStateClientOk:
 		c.stopHandshakeTimer()
+	case model.SmePinStateAskInit:
+		c.setHandshakeTimer(timeoutTimerTypeWaitForReady, cmiTimeout)
+	case model.SmePinStateAskProcess:
+		c.setHandshakeTimer(timeoutTimerTypeWaitForReady, pinResponseTimeout)
+	case model.SmePinStateCheckOk, model.SmePinStateAskRestricted, model.SmePinStateAskOk:
+		c.stopHandshakeTimer()
 	}
 
 	c.smeError = nil
@@ -190,10 +196,14 @@ func (c *ShipConnection) handleState(timeout bool, message []byte) {
 	case model.SmePinStateCheckInit:
 		c.handshakePin_Init()
 
-	case model.SmePinStateCheckListen:
+	case model.SmePinStateCheckListen, model.SmePinStateAskInit, model.SmePinStateAskProcess:
+		if timeout {
+			c.endHandshakeWithError(api.ErrPINProtocol)
+			return
+		}
 		c.handshakePin_smePinStateCheckListen(message)
 
-	case model.SmePinStateCheckOk:
+	case model.SmePinStateCheckOk, model.SmePinStateAskRestricted, model.SmePinStateAskOk:
 		c.handshakeAccessMethods_Init()
 
 	// smeAccessMethods
@@ -289,6 +299,7 @@ func (c *ShipConnection) approveHandshake() {
 // end the handshake process because of an error
 func (c *ShipConnection) endHandshakeWithError(err error) {
 	c.stopHandshakeTimer()
+	c.discardTransientPIN()
 
 	if c.testHooks != nil && c.testHooks.beforeHandshakeErrorState != nil {
 		c.testHooks.beforeHandshakeErrorState()
