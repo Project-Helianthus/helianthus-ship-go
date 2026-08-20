@@ -335,6 +335,122 @@ func TestIssue35SameSHIPPublicationRetainsAllInterfaceRoutesWithoutCandidateRota
 	}
 }
 
+func TestIssue35ZeroconfRemovalDistinguishesUnannounceFromInterfaceExpiry(t *testing.T) {
+	interfaces := []net.Interface{
+		{Index: 7, Name: "en7", Flags: net.FlagUp | net.FlagMulticast},
+		{Index: 8, Name: "en8", Flags: net.FlagUp | net.FlagMulticast},
+	}
+	wantRemaining := []netip.Addr{
+		netip.MustParseAddr("fe80::35").WithZone("en8"),
+	}
+
+	for _, providerCase := range []struct {
+		name string
+		new  func() *ZeroconfProvider
+	}{
+		{name: "default_interfaces", new: func() *ZeroconfProvider { return NewZeroconfProvider(nil) }},
+		{name: "configured_multi_interface", new: func() *ZeroconfProvider {
+			return NewZeroconfProvider(interfaces)
+		}},
+	} {
+		for _, removalCase := range []struct {
+			name             string
+			expiry           time.Time
+			wantRemove       bool
+			wantAddresses    []netip.Addr
+			wantCandidateLen int
+		}{
+			{
+				name:             "definitive_unannounce_retires_every_scope",
+				expiry:           time.Now().Add(time.Hour),
+				wantRemove:       true,
+				wantCandidateLen: 0,
+			},
+			{
+				name:             "one_interface_expiry_retains_other_scope",
+				expiry:           time.Now().Add(-time.Hour),
+				wantAddresses:    wantRemaining,
+				wantCandidateLen: 1,
+			},
+		} {
+			t.Run(providerCase.name+"/"+removalCase.name, func(t *testing.T) {
+				provider := providerCase.new()
+				manager := NewMDNS(
+					"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+					"Helianthus",
+					"Gateway",
+					"HEMS",
+					"local-ship-id",
+					"helianthus",
+					4712,
+					nil,
+					MdnsProviderSelectionGoZeroConfOnly,
+				)
+				service := &zeroconf.ServiceEntry{
+					ServiceRecord: zeroconf.ServiceRecord{Instance: "VR940"},
+					HostName:      "vr940.local",
+					Port:          12480,
+					Text: []string{
+						"txtvers=1",
+						"id=vr940-ship-id",
+						"path=/ship/",
+						"ski=3535353535353535353535353535353535353535",
+						"register=true",
+					},
+					Expiry:   removalCase.expiry,
+					AddrIPv6: []net.IP{net.ParseIP("fe80::35")},
+				}
+
+				var callbackCount int
+				var callbackRemove bool
+				var callbackAddresses []netip.Addr
+				record := false
+				callback := func(
+					elements map[string]string,
+					name,
+					host string,
+					addresses []netip.Addr,
+					port int,
+					remove bool,
+				) {
+					if record {
+						callbackCount++
+						callbackRemove = remove
+						callbackAddresses = append([]netip.Addr(nil), addresses...)
+					}
+					manager.processScopedMdnsEntry(elements, name, host, addresses, port, remove)
+				}
+
+				for _, iface := range interfaces {
+					provider.processScopedServiceForInterface(iface, service, false, callback)
+				}
+				record = true
+
+				// enbility/zeroconf forwards the cached, still-live entry for a
+				// TTL=0 goodbye, whereas its cleanup path forwards an entry whose
+				// Expiry has elapsed. The provider must preserve that distinction.
+				provider.processScopedServiceForInterface(interfaces[0], service, true, callback)
+
+				if callbackCount != 1 || callbackRemove != removalCase.wantRemove ||
+					!reflect.DeepEqual(callbackAddresses, removalCase.wantAddresses) {
+					t.Fatalf(
+						"removal callback = count:%d remove:%t addresses:%v, want count:1 remove:%t addresses:%v",
+						callbackCount,
+						callbackRemove,
+						callbackAddresses,
+						removalCase.wantRemove,
+						removalCase.wantAddresses,
+					)
+				}
+				_, candidates, _ := manager.copyMdnsSnapshot()
+				if len(candidates) != removalCase.wantCandidateLen {
+					t.Fatalf("candidates after removal = %#v, want len %d", candidates, removalCase.wantCandidateLen)
+				}
+			})
+		}
+	}
+}
+
 func TestScopedZeroconfReannounceShutsDownPreviousServer(t *testing.T) {
 	iface, address := localMulticastAddress(t)
 	provider := newScopedZeroconfProvider([]net.Interface{iface}, "repeat-test-host", address)
