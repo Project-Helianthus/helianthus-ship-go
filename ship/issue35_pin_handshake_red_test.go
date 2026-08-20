@@ -3,9 +3,11 @@ package ship
 import (
 	"bytes"
 	"errors"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
 	"github.com/Project-Helianthus/helianthus-ship-go/model"
@@ -53,6 +55,8 @@ type issue35PINWriter struct {
 	retainedSecret []byte
 	normalMessages [][]byte
 	closeReasons   []string
+	sensitiveErr   error
+	onSensitive    func()
 }
 
 var _ api.WebsocketDataWriterInterface = (*issue35PINWriter)(nil)
@@ -69,13 +73,18 @@ func (writer *issue35PINWriter) WriteMessageToWebsocketConnection(message []byte
 
 func (writer *issue35PINWriter) WriteSensitiveMessageToWebsocketConnection(message []byte) error {
 	writer.mux.Lock()
-	defer writer.mux.Unlock()
 	writer.sensitiveCalls++
 	writer.sensitiveMatch = bytes.Contains(message, writer.expectedPIN)
 	// Deliberately retain the caller-owned slice. The production sender must
 	// zero its transient wire buffer after this synchronous method returns.
 	writer.retainedSecret = message
-	return nil
+	err := writer.sensitiveErr
+	onSensitive := writer.onSensitive
+	writer.mux.Unlock()
+	if onSensitive != nil {
+		onSensitive()
+	}
+	return err
 }
 
 func (writer *issue35PINWriter) CloseDataConnection(_ int, reason string) {
@@ -154,13 +163,76 @@ func TestIssue35BusyPINPermissionWaitsWithoutConsumingSecret(t *testing.T) {
 	if calls, _, _, _, _ := writer.snapshot(); calls != 0 {
 		t.Fatalf("sensitive writes while peer is busy = %d, want 0", calls)
 	}
+	busyDuration := issue35HandshakeTimerDuration(t, connection)
+	if busyDuration < 60*time.Second || busyDuration > 90*time.Second {
+		t.Fatalf("pre-input busy timer = %s, want SHIP-compliant 60–90s", busyDuration)
+	}
 
 	issue35FakePeerPINState(t, connection, model.PinStateTypeRequired, pinPermission(model.PinInputPermissionTypeOk))
+	if responseDuration := issue35HandshakeTimerDuration(t, connection); responseDuration != pinResponseTimeout {
+		t.Fatalf("post-send PIN response timer = %s, want %s", responseDuration, pinResponseTimeout)
+	}
 	assertIssue35SensitiveWrite(t, provider, writer)
 	issue35FakePeerPINState(t, connection, model.PinStateTypePinOk, nil)
 	issue35FakePeerAccessComplete(t, connection)
 	if state := connection.getState(); state != model.SmeStateComplete {
 		t.Fatalf("state after busy-to-ok PIN flow = %v, want complete", state)
+	}
+}
+
+func TestIssue35FastWrongPINAfterWireVisibilityIsRejectedCategorically(t *testing.T) {
+	connection, _, writer := newIssue35PINConnection([]byte(issue35TestPIN), true)
+	defer connection.stopHandshakeTimerAndWait()
+	wrongPIN, err := connection.shipMessage(model.MsgTypeControl, model.ConnectionPinError{
+		ConnectionPinError: model.ConnectionPinErrorType{
+			Error: model.ConnectionPinErrorErrorTypeWrongPIN,
+		},
+	})
+	if err != nil {
+		t.Fatalf("create wrong-PIN message: %v", err)
+	}
+	done := make(chan struct{})
+	writer.onSensitive = func() {
+		go func() {
+			connection.handleShipMessage(false, wrongPIN)
+			close(done)
+		}()
+		deadline := time.Now().Add(time.Second)
+		for time.Now().Before(deadline) {
+			if state, _ := connection.ShipHandshakeState(); state == model.SmeStateError {
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+		t.Fatal("fast wrong-PIN response was not observed while sensitive write was visible")
+	}
+
+	issue35FakePeerPINState(t, connection, model.PinStateTypeRequired, pinPermission(model.PinInputPermissionTypeOk))
+	state, stateErr := connection.ShipHandshakeState()
+	if state != model.SmeStateError || !errors.Is(stateErr, api.ErrPINRejected) {
+		t.Fatalf("fast wrong-PIN state/error = %v/%v, want error/%v",
+			state, stateErr, api.ErrPINRejected)
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("fast wrong-PIN handler did not finish")
+	}
+}
+
+func TestIssue35SensitiveWriteFailureRollsBackPINInFlight(t *testing.T) {
+	connection, _, writer := newIssue35PINConnection([]byte(issue35TestPIN), true)
+	defer connection.stopHandshakeTimerAndWait()
+	writer.sensitiveErr = errors.New("synthetic write failure")
+
+	issue35FakePeerPINState(t, connection, model.PinStateTypeRequired, pinPermission(model.PinInputPermissionTypeOk))
+	if connection.wasPINInputSent() {
+		t.Fatal("failed sensitive write left PIN marked in flight")
+	}
+	state, stateErr := connection.ShipHandshakeState()
+	if state != model.SmeStateError || !errors.Is(stateErr, api.ErrPINUnavailable) {
+		t.Fatalf("failed sensitive write state/error = %v/%v, want error/%v",
+			state, stateErr, api.ErrPINUnavailable)
 	}
 }
 
@@ -310,6 +382,15 @@ func issue35FakePeerControl(t *testing.T, connection *ShipConnection, value any)
 
 func pinPermission(value model.PinInputPermissionType) *model.PinInputPermissionType {
 	return &value
+}
+
+func issue35HandshakeTimerDuration(t *testing.T, connection *ShipConnection) time.Duration {
+	t.Helper()
+	value := reflect.ValueOf(connection).Elem().FieldByName("handshakeTimerDuration")
+	if !value.IsValid() {
+		t.Fatal("ShipConnection does not expose the active handshake timer duration for deterministic protocol tests")
+	}
+	return time.Duration(value.Int())
 }
 
 func assertIssue35SensitiveWrite(
