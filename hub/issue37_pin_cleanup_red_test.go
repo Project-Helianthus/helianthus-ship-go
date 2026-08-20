@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Project-Helianthus/helianthus-ship-go/api"
 )
@@ -110,6 +111,68 @@ func issue37InstallTerminalClose(
 func issue37WaitDone(t *testing.T, done <-chan struct{}, operation string) {
 	t.Helper()
 	waitForPairingCandidateSignal(t, done, operation)
+}
+
+type issue37CleanupCase struct {
+	name    string
+	cleanup func(*testing.T, *Hub, string, *outboundAttemptAuthority) func()
+}
+
+func issue37RemainingCleanupCases() []issue37CleanupCase {
+	return []issue37CleanupCase{
+		{
+			name: "pairing candidate retire",
+			cleanup: func(
+				_ *testing.T,
+				hub *Hub,
+				ski string,
+				authority *outboundAttemptAuthority,
+			) func() {
+				service := hub.ServiceForSKI(ski)
+				candidate := &activePairingCandidate{service: service, authority: authority}
+				hub.muxReg.Lock()
+				hub.activePairingCandidates[ski] = candidate
+				hub.muxReg.Unlock()
+				return func() { hub.retirePairingCandidate(ski, candidate, authority) }
+			},
+		},
+		{
+			name: "unregister remote",
+			cleanup: func(
+				_ *testing.T,
+				hub *Hub,
+				ski string,
+				_ *outboundAttemptAuthority,
+			) func() {
+				return func() { hub.UnregisterRemoteSKI(ski) }
+			},
+		},
+		{
+			name: "cancel pairing",
+			cleanup: func(
+				_ *testing.T,
+				hub *Hub,
+				ski string,
+				_ *outboundAttemptAuthority,
+			) func() {
+				return func() { hub.CancelPairingWithSKI(ski) }
+			},
+		},
+		{
+			name: "begin shutdown",
+			cleanup: func(
+				_ *testing.T,
+				hub *Hub,
+				_ string,
+				_ *outboundAttemptAuthority,
+			) func() {
+				return func() {
+					_, cancellations, _ := hub.beginShutdown()
+					cancelOutboundAttemptRegistrations(cancellations)
+				}
+			},
+		},
+	}
 }
 
 func TestIssue37UnconsumedPINCleanupDiscardsInnerOwnerExactlyOnceOutsideLock(t *testing.T) {
@@ -281,5 +344,122 @@ func TestIssue37WrongAuthorityCannotDiscardAnotherPINRegistration(t *testing.T) 
 	)
 	if err != nil || !provided {
 		t.Fatalf("owner consume after wrong discard = provided:%t err:%v", provided, err)
+	}
+}
+
+func TestIssue37EveryRemainingNoConsumeExitDiscardsInnerOwnerExactlyOnce(t *testing.T) {
+	for _, cleanupCase := range issue37RemainingCleanupCases() {
+		t.Run(cleanupCase.name, func(t *testing.T) {
+			hub, _, _ := newPairingCandidateHub(t, nil)
+			authority := &outboundAttemptAuthority{epoch: 37}
+			probe := issue37InstallTransientPIN(hub, pairingCandidateTestSKI, authority)
+			cleanup := cleanupCase.cleanup(t, hub, pairingCandidateTestSKI, authority)
+
+			done := make(chan struct{})
+			go func() {
+				cleanup()
+				cleanup()
+				close(done)
+			}()
+			issue37WaitDone(t, done, cleanupCase.name+" repeated cleanup")
+
+			consumeCalls, discardCalls := probe.counts()
+			if consumeCalls != 0 || discardCalls != 1 {
+				t.Fatalf(
+					"repeated cleanup PIN outcomes = consume:%d discard:%d, want 0/1",
+					consumeCalls,
+					discardCalls,
+				)
+			}
+			if probe.sawRegistrationDuringDiscard() {
+				t.Fatal("remaining cleanup called inner discarder before registration removal")
+			}
+		})
+	}
+}
+
+func TestIssue37RemainingCleanupDoesNotDiscardConsumedRegistration(t *testing.T) {
+	for _, cleanupCase := range issue37RemainingCleanupCases() {
+		t.Run(cleanupCase.name, func(t *testing.T) {
+			hub, _, _ := newPairingCandidateHub(t, nil)
+			authority := &outboundAttemptAuthority{epoch: 37}
+			probe := issue37InstallTransientPIN(hub, pairingCandidateTestSKI, authority)
+			cleanup := cleanupCase.cleanup(t, hub, pairingCandidateTestSKI, authority)
+
+			provided, err := hub.withTransientPINForAuthority(
+				pairingCandidateTestSKI,
+				authority,
+				func([]byte) error { return nil },
+			)
+			if err != nil || !provided {
+				t.Fatalf("consume before cleanup = provided:%t err:%v", provided, err)
+			}
+			cleanup()
+
+			consumeCalls, discardCalls := probe.counts()
+			if consumeCalls != 1 || discardCalls != 0 {
+				t.Fatalf(
+					"consumed cleanup PIN outcomes = consume:%d discard:%d, want 1/0",
+					consumeCalls,
+					discardCalls,
+				)
+			}
+		})
+	}
+}
+
+func TestIssue37ShutdownAndTerminalCloseAvoidABBADedlockAndCleanExactlyOnce(t *testing.T) {
+	hub, _, _ := newPairingCandidateHub(t, nil)
+	authority := &outboundAttemptAuthority{epoch: 37}
+	probe := issue37InstallTransientPIN(hub, pairingCandidateTestSKI, authority)
+	closeAttempt := issue37InstallTerminalClose(t, hub, pairingCandidateTestSKI, authority)
+
+	closeEntered := make(chan struct{})
+	releaseClose := make(chan struct{})
+	var barrierOnce sync.Once
+	hub.testHooks.beforeOutboundAttemptRelease = func() {
+		barrierOnce.Do(func() { close(closeEntered) })
+		<-releaseClose
+	}
+	closeDone := make(chan struct{})
+	go func() {
+		closeAttempt()
+		close(closeDone)
+	}()
+	issue37WaitDone(t, closeEntered, "terminal close lock barrier")
+
+	shutdownDone := make(chan struct{})
+	go func() {
+		_, cancellations, _ := hub.beginShutdown()
+		cancelOutboundAttemptRegistrations(cancellations)
+		close(shutdownDone)
+	}()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		hub.muxCon.Lock()
+		shutdownClaimed := hub.hasShutdown
+		hub.muxCon.Unlock()
+		if shutdownClaimed {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("shutdown did not reach the ABBA barrier")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(releaseClose)
+	issue37WaitDone(t, closeDone, "terminal close after shutdown barrier")
+	issue37WaitDone(t, shutdownDone, "shutdown after terminal close barrier")
+
+	consumeCalls, discardCalls := probe.counts()
+	if consumeCalls != 0 || discardCalls != 1 {
+		t.Fatalf(
+			"shutdown/terminal PIN outcomes = consume:%d discard:%d, want 0/1",
+			consumeCalls,
+			discardCalls,
+		)
+	}
+	if probe.sawRegistrationDuringDiscard() {
+		t.Fatal("shutdown/terminal discarder observed a registered provider")
 	}
 }
