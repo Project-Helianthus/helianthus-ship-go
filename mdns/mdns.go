@@ -643,7 +643,7 @@ func (m *MdnsManager) processScopedMdnsEntry(elements map[string]string, name, h
 		return
 	}
 
-	addresses, legacyAddresses := normalizeMdnsAddresses(addresses)
+	addresses, legacyAddresses, unscopedLinkLocalObserved := normalizeMdnsAddresses(addresses)
 
 	var deviceType, model, brand string
 
@@ -670,9 +670,11 @@ func (m *MdnsManager) processScopedMdnsEntry(elements map[string]string, name, h
 	case exists && !remove:
 		if !sameIPList(entry.Addresses, legacyAddresses) ||
 			!sameScopedIPList(entry.ScopedAddresses, addresses) ||
+			entry.UnscopedLinkLocalObserved != unscopedLinkLocalObserved ||
 			entry.Register != (register == "true") || entry.Brand != brand || entry.Type != deviceType || entry.Model != model {
 			entry.Addresses = cloneIPs(legacyAddresses)
 			entry.ScopedAddresses = append([]netip.Addr(nil), addresses...)
+			entry.UnscopedLinkLocalObserved = unscopedLinkLocalObserved
 			entry.Register = register == "true"
 			entry.Brand = brand
 			entry.Type = deviceType
@@ -698,6 +700,7 @@ func (m *MdnsManager) processScopedMdnsEntry(elements map[string]string, name, h
 				[]netip.Addr(nil),
 				addresses...,
 			),
+			UnscopedLinkLocalObserved: unscopedLinkLocalObserved,
 		}
 		m.candidateRefs[observationKey] = m.nextCandidateRefLocked(observationKey)
 		updated = true
@@ -720,9 +723,10 @@ func (m *MdnsManager) processScopedMdnsEntry(elements map[string]string, name, h
 	}
 }
 
-func normalizeMdnsAddresses(addresses []netip.Addr) ([]netip.Addr, []net.IP) {
+func normalizeMdnsAddresses(addresses []netip.Addr) ([]netip.Addr, []net.IP, bool) {
 	scoped := make([]netip.Addr, 0, len(addresses))
 	legacy := make([]net.IP, 0, len(addresses))
+	unscopedLinkLocalObserved := false
 	seen := make(map[netip.Addr]struct{}, len(addresses))
 	for _, address := range addresses {
 		if !address.IsValid() {
@@ -732,6 +736,7 @@ func normalizeMdnsAddresses(addresses []netip.Addr) ([]netip.Addr, []net.IP) {
 		linkLocalIPv6 := address.Is6() && address.IsLinkLocalUnicast()
 		if linkLocalIPv6 {
 			if address.Zone() == "" {
+				unscopedLinkLocalObserved = true
 				continue
 			}
 		} else if address.Zone() != "" {
@@ -746,7 +751,7 @@ func normalizeMdnsAddresses(addresses []netip.Addr) ([]netip.Addr, []net.IP) {
 			legacy = append(legacy, append(net.IP(nil), address.AsSlice()...))
 		}
 	}
-	return scoped, legacy
+	return scoped, legacy, unscopedLinkLocalObserved
 }
 
 func (m *MdnsManager) RequestMdnsEntries() {

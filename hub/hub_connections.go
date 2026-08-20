@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"reflect"
 	"sort"
 	"strconv"
@@ -572,7 +573,11 @@ func (h *Hub) gatedDialContextWithExpectedSKI(
 		return nil, nil, nil, outgoingAttemptDeniedError{}
 	}
 	permit := api.OutgoingAttemptPermit{Context: context.Background()}
-	address := "wss://" + net.JoinHostPort(host, port) + path
+	address := (&url.URL{
+		Scheme: "wss",
+		Host:   net.JoinHostPort(host, port),
+		Path:   path,
+	}).String()
 	defer func() {
 		if recovered := recover(); recovered != nil {
 			if attempt == nil {
@@ -947,6 +952,7 @@ func (h *Hub) initateConnectionWithError(remoteService *api.ServiceDetails, entr
 	}
 
 	addresses := orderedConnectionAddresses(entry.ScopedAddresses, entry.Addresses)
+	hadObservedAddresses := len(entry.ScopedAddresses) > 0 || len(entry.Addresses) > 0
 	for _, address := range addresses {
 		logging.Log().Debug("trying to connect to", remoteService.SKI(), "at", address)
 		addressValue := address.String()
@@ -969,7 +975,10 @@ func (h *Hub) initateConnectionWithError(remoteService *api.ServiceDetails, entr
 		}
 	}
 
-	if entry.Host != "" && !hostMatchesConnectionAddress(entry.Host, addresses) {
+	if entry.Host != "" &&
+		!entry.UnscopedLinkLocalObserved &&
+		(!hadObservedAddresses || len(addresses) > 0) &&
+		!hostMatchesConnectionAddress(entry.Host, addresses) {
 		logging.Log().Debug("trying to connect to", remoteService.SKI(), "at", entry.Host)
 		if err = h.connectFoundService(
 			remoteService,
@@ -1285,6 +1294,12 @@ func trustedRemoteRetryHost(entry *api.MdnsEntry) (string, bool) {
 	}
 	if address, ok := pairingCandidateAddress(entry.ScopedAddresses, entry.Addresses); ok {
 		return address, true
+	}
+	if entry.UnscopedLinkLocalObserved {
+		return "", false
+	}
+	if len(entry.ScopedAddresses) > 0 || len(entry.Addresses) > 0 {
+		return "", false
 	}
 	host, valid := validatedOutgoingAttemptHost(entry.Host)
 	if !valid {

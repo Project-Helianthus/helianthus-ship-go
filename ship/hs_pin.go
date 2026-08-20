@@ -92,7 +92,14 @@ func (c *ShipConnection) processRemotePINRequest(requirement model.PinStateType)
 	}
 
 	provided, providerErr := c.withTransientPIN(func(pin []byte) error {
-		return c.sendTransientPIN(pin)
+		if !c.beginPINInput() {
+			return api.ErrPINUnavailable
+		}
+		if err := c.sendTransientPIN(pin); err != nil {
+			c.rollbackPINInput()
+			return err
+		}
+		return nil
 	})
 	if providerErr != nil {
 		if errors.Is(providerErr, api.ErrPINInvalid) {
@@ -110,7 +117,9 @@ func (c *ShipConnection) processRemotePINRequest(requirement model.PinStateType)
 		c.endHandshakeWithError(api.ErrPINUnavailable)
 		return
 	}
-	c.markPINInputSent()
+	if c.getState() == model.SmePinStateAskProcess {
+		c.setHandshakeTimer(timeoutTimerTypeWaitForReady, pinResponseTimeout)
+	}
 }
 
 func (c *ShipConnection) withTransientPIN(consume func([]byte) error) (bool, error) {

@@ -24,6 +24,10 @@ type MdnsEntry struct {
 	// so new consumers can use one canonical address surface. Unscoped
 	// link-local addresses are never admitted.
 	ScopedAddresses []netip.Addr
+	// UnscopedLinkLocalObserved records that discovery supplied a link-local
+	// IPv6 address without an interface zone. Consumers use it to suppress DNS
+	// hostname fallback without retaining or dialing the unusable address.
+	UnscopedLinkLocalObserved bool
 }
 
 // implemented by Hub, used by mdns

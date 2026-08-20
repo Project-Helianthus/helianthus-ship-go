@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"reflect"
 	"testing"
 	"time"
@@ -274,7 +275,11 @@ func assertIssue20EndpointSweep(t *testing.T, entry *api.MdnsEntry, expectedHost
 	for endpointIndex, expectedHost := range expectedHosts {
 		for fallbackIndex, expectedPath := range []string{entry.Path, ""} {
 			index := endpointIndex*2 + fallbackIndex
-			expectedURL := "wss://" + net.JoinHostPort(expectedHost, fmt.Sprint(entry.Port)) + expectedPath
+			expectedURL := (&url.URL{
+				Scheme: "wss",
+				Host:   net.JoinHostPort(expectedHost, fmt.Sprint(entry.Port)),
+				Path:   expectedPath,
+			}).String()
 			if calls[index].url != expectedURL {
 				t.Fatalf("dial[%d] = %q, want %q", index, calls[index].url, expectedURL)
 			}

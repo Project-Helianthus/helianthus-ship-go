@@ -146,7 +146,10 @@ type issue35ZeroconfInterfaceRouter interface {
 }
 
 func TestIssue35DefaultAndMultiInterfaceZeroconfRouteReceiveScopeToCandidate(t *testing.T) {
-	available := []net.Interface{{Index: 7, Name: "en7"}, {Index: 8, Name: "en8"}}
+	available := []net.Interface{
+		{Index: 7, Name: "en7", Flags: net.FlagUp | net.FlagMulticast},
+		{Index: 8, Name: "en8", Flags: net.FlagUp | net.FlagMulticast},
+	}
 	for _, test := range []struct {
 		name     string
 		provider *ZeroconfProvider

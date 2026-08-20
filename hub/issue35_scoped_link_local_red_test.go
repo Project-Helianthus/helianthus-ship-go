@@ -91,6 +91,16 @@ func TestIssue35UnscopedLinkLocalNeverReachesAttemptGateOrDialer(t *testing.T) {
 			},
 		},
 		{
+			name: "normalized observation marker suppresses host fallback",
+			entry: &api.MdnsEntry{
+				Ski:                       "1111111111111111111111111111111111111111",
+				Host:                      "must-not-fallback.local",
+				Port:                      12480,
+				Path:                      "/ship/",
+				UnscopedLinkLocalObserved: true,
+			},
+		},
+		{
 			name: "legacy address cannot carry zone",
 			entry: &api.MdnsEntry{
 				Ski:       "1111111111111111111111111111111111111111",
@@ -111,8 +121,8 @@ func TestIssue35UnscopedLinkLocalNeverReachesAttemptGateOrDialer(t *testing.T) {
 
 func TestIssue35TrustedRetrySuppressesHostFallbackForUnscopedLinkLocal(t *testing.T) {
 	entry := &api.MdnsEntry{
-		Host:            "must-not-fallback.local",
-		ScopedAddresses: []netip.Addr{netip.MustParseAddr("fe80::35")},
+		Host:                      "must-not-fallback.local",
+		UnscopedLinkLocalObserved: true,
 	}
 	if host, ok := trustedRemoteRetryHost(entry); ok {
 		t.Fatalf("trusted retry admitted hostname %q after unscoped link-local observation", host)

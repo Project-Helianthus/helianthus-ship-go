@@ -68,7 +68,11 @@ func (c *ShipConnection) setState(newState model.ShipMessageExchangeState, err e
 	case model.SmePinStateAskInit:
 		c.setHandshakeTimer(timeoutTimerTypeWaitForReady, cmiTimeout)
 	case model.SmePinStateAskProcess:
-		c.setHandshakeTimer(timeoutTimerTypeWaitForReady, pinResponseTimeout)
+		if c.pinInputSent {
+			c.setHandshakeTimer(timeoutTimerTypeWaitForReady, pinResponseTimeout)
+		} else if oldState != model.SmePinStateAskProcess {
+			c.setHandshakeTimer(timeoutTimerTypeWaitForReady, pinBusyTimeout)
+		}
 	case model.SmePinStateCheckOk, model.SmePinStateAskRestricted, model.SmePinStateAskOk:
 		c.stopHandshakeTimer()
 	}
@@ -326,6 +330,7 @@ func (c *ShipConnection) setHandshakeTimer(timerType timeoutTimerType, duration 
 	}
 	c.handshakeTimerRunning = true
 	c.handshakeTimerType = timerType
+	c.handshakeTimerDuration = duration
 	c.handshakeTimerStopChan = stopChan
 	c.handshakeTimerDoneChan = doneChan
 	c.handshakeTimerActive++

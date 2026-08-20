@@ -80,6 +80,9 @@ func TestIssue35UnscopedLinkLocalObservationFailsClosed(t *testing.T) {
 		t.Fatalf("unscoped link-local escaped fail-closed filtering: legacy=%v scoped=%v",
 			entry.Addresses, entry.ScopedAddresses)
 	}
+	if !entry.UnscopedLinkLocalObserved {
+		t.Fatal("normalized mDNS entry lost fail-closed unscoped link-local evidence")
+	}
 	if len(candidates) != 1 || len(candidates[0].ScopedAddresses) != 0 {
 		t.Fatalf("candidate retained an unscoped link-local address: %#v", candidates)
 	}

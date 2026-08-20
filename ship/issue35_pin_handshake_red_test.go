@@ -386,6 +386,8 @@ func pinPermission(value model.PinInputPermissionType) *model.PinInputPermission
 
 func issue35HandshakeTimerDuration(t *testing.T, connection *ShipConnection) time.Duration {
 	t.Helper()
+	connection.handshakeTimerMux.Lock()
+	defer connection.handshakeTimerMux.Unlock()
 	value := reflect.ValueOf(connection).Elem().FieldByName("handshakeTimerDuration")
 	if !value.IsValid() {
 		t.Fatal("ShipConnection does not expose the active handshake timer duration for deterministic protocol tests")

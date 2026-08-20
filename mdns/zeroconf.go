@@ -157,6 +157,48 @@ func (z *ZeroconfProvider) Unannounce() {
 
 func (z *ZeroconfProvider) chanListener(ctx context.Context, cb api.MdnsScopedResolveCB) {
 	defer z.wait.Done()
+	available, err := net.Interfaces()
+	if err != nil {
+		logging.Log().Debug("mdns: zeroconf - list interfaces:", err)
+		return
+	}
+	ifaces := z.browseInterfaces(available)
+	if len(ifaces) == 0 {
+		logging.Log().Debug("mdns: zeroconf - no interface available for scoped browse")
+		return
+	}
+
+	var browsers sync.WaitGroup
+	browsers.Add(len(ifaces))
+	for _, iface := range ifaces {
+		iface := iface
+		go func() {
+			defer browsers.Done()
+			z.chanListenerForInterface(ctx, iface, cb)
+		}()
+	}
+	browsers.Wait()
+}
+
+func (z *ZeroconfProvider) browseInterfaces(available []net.Interface) []net.Interface {
+	if len(z.ifaces) > 0 {
+		return append([]net.Interface(nil), z.ifaces...)
+	}
+	ifaces := make([]net.Interface, 0, len(available))
+	for _, iface := range available {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 {
+			continue
+		}
+		ifaces = append(ifaces, iface)
+	}
+	return ifaces
+}
+
+func (z *ZeroconfProvider) chanListenerForInterface(
+	ctx context.Context,
+	iface net.Interface,
+	cb api.MdnsScopedResolveCB,
+) {
 	zcEntries := make(chan *zeroconf.ServiceEntry)
 	zcRemoved := make(chan *zeroconf.ServiceEntry)
 	browseDone := make(chan struct{})
@@ -168,7 +210,7 @@ func (z *ZeroconfProvider) chanListener(ctx context.Context, cb api.MdnsScopedRe
 			shipZeroConfDomain,
 			zcEntries,
 			zcRemoved,
-			zeroconf.SelectIfaces(z.ifaces),
+			zeroconf.SelectIfaces([]net.Interface{iface}),
 		)
 	}()
 
@@ -179,29 +221,45 @@ func (z *ZeroconfProvider) chanListener(ctx context.Context, cb api.MdnsScopedRe
 			return
 		case <-browseDone:
 			return
-		case service := <-zcRemoved:
+		case service, ok := <-zcRemoved:
+			if !ok {
+				zcRemoved = nil
+				continue
+			}
 			// Zeroconf has issues with merging mDNS data and sometimes reports incomplete records
 			if service == nil || len(service.Text) == 0 {
 				continue
 			}
 
-			elements := parseTxt(service.Text)
+			z.processScopedServiceForInterface(iface, service, true, cb)
 
-			addresses := z.scopedServiceAddresses(service)
-			cb(elements, service.Instance, service.HostName, addresses, service.Port, true)
-
-		case service := <-zcEntries:
+		case service, ok := <-zcEntries:
+			if !ok {
+				zcEntries = nil
+				continue
+			}
 			// Zeroconf has issues with merging mDNS data and sometimes reports incomplete records
 			if service == nil || len(service.Text) == 0 {
 				continue
 			}
 
-			elements := parseTxt(service.Text)
-
-			addresses := z.scopedServiceAddresses(service)
-			cb(elements, service.Instance, service.HostName, addresses, service.Port, false)
+			z.processScopedServiceForInterface(iface, service, false, cb)
 		}
 	}
+}
+
+func (z *ZeroconfProvider) processScopedServiceForInterface(
+	iface net.Interface,
+	service *zeroconf.ServiceEntry,
+	remove bool,
+	cb api.MdnsScopedResolveCB,
+) {
+	if service == nil || cb == nil {
+		return
+	}
+	elements := parseTxt(service.Text)
+	addresses := scopedServiceAddressesForZone(service, iface.Name)
+	cb(elements, service.Instance, service.HostName, addresses, service.Port, remove)
 }
 
 func (z *ZeroconfProvider) scopedServiceAddresses(service *zeroconf.ServiceEntry) []netip.Addr {
@@ -211,6 +269,13 @@ func (z *ZeroconfProvider) scopedServiceAddresses(service *zeroconf.ServiceEntry
 	zone := ""
 	if len(z.ifaces) == 1 {
 		zone = z.ifaces[0].Name
+	}
+	return scopedServiceAddressesForZone(service, zone)
+}
+
+func scopedServiceAddressesForZone(service *zeroconf.ServiceEntry, zone string) []netip.Addr {
+	if service == nil {
+		return nil
 	}
 	addresses := make([]netip.Addr, 0, len(service.AddrIPv4)+len(service.AddrIPv6))
 	for _, value := range append(append([]net.IP(nil), service.AddrIPv4...), service.AddrIPv6...) {
