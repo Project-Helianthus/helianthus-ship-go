@@ -196,12 +196,14 @@ func (h *Hub) HandleShipHandshakeStateUpdate(ski string, state model.ShipState) 
 	}
 
 	pairingDetail := api.NewConnectionStateDetail(pairingState, state.Error)
+	pairingDetail.SetPINHandshakeDetail(state.PIN)
 
 	service := h.ServiceForSKI(ski)
 
 	existingDetails := service.ConnectionStateDetail()
 	existingState := existingDetails.State()
-	if existingState != pairingState || !errors.Is(existingDetails.Error(), state.Error) {
+	if existingState != pairingState || !errors.Is(existingDetails.Error(), state.Error) ||
+		!existingDetails.PINHandshakeDetail().Equal(pairingDetail.PINHandshakeDetail()) {
 		service.SetConnectionStateDetail(pairingDetail)
 
 		// always send a delayed update, as the processing of the new state has to be done
@@ -238,6 +240,7 @@ func (h *Hub) handleInternalShipHandshakeStateUpdate(
 		pairingState = api.ConnectionStateError
 	}
 	pairingDetail := api.NewConnectionStateDetail(pairingState, state.Error)
+	pairingDetail.SetPINHandshakeDetail(state.PIN)
 
 	h.muxReg.Lock()
 	h.muxAttemptGate.RLock()
@@ -248,7 +251,8 @@ func (h *Hub) handleInternalShipHandshakeStateUpdate(
 	}
 	service := h.remoteServices[ski]
 	existingDetails := service.ConnectionStateDetail()
-	changed := existingDetails.State() != pairingState || !errors.Is(existingDetails.Error(), state.Error)
+	changed := existingDetails.State() != pairingState || !errors.Is(existingDetails.Error(), state.Error) ||
+		!existingDetails.PINHandshakeDetail().Equal(pairingDetail.PINHandshakeDetail())
 	if changed {
 		service.SetConnectionStateDetail(pairingDetail)
 	}
@@ -300,14 +304,17 @@ func pairingDetailsEqual(left, right *api.ConnectionStateDetail) bool {
 	if left == nil || right == nil {
 		return left == right
 	}
-	return left.State() == right.State() && errors.Is(left.Error(), right.Error())
+	return left.State() == right.State() && errors.Is(left.Error(), right.Error()) &&
+		left.PINHandshakeDetail().Equal(right.PINHandshakeDetail())
 }
 
 func snapshotPairingDetail(detail *api.ConnectionStateDetail) *api.ConnectionStateDetail {
 	if detail == nil {
 		return nil
 	}
-	return api.NewConnectionStateDetail(detail.State(), detail.Error())
+	copy := api.NewConnectionStateDetail(detail.State(), detail.Error())
+	copy.SetPINHandshakeDetail(detail.PINHandshakeDetail())
+	return copy
 }
 
 func (h *Hub) publishPairingDetail(ski string, detail *api.ConnectionStateDetail) {

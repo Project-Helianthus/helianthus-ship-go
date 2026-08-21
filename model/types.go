@@ -3,6 +3,81 @@ package model
 type ShipState struct {
 	State ShipMessageExchangeState
 	Error error
+	// PIN contains a closed, secret-free summary of an authentic PIN handshake
+	// observation. It deliberately contains neither supplied PIN bytes nor peer
+	// identity, endpoint, or transport error text.
+	PIN *PINHandshakeDetail
+}
+
+type PINRequirement string
+
+const (
+	PINRequirementUnknown  PINRequirement = "unknown"
+	PINRequirementNone     PINRequirement = "none"
+	PINRequirementRequired PINRequirement = "required"
+	PINRequirementOptional PINRequirement = "optional"
+)
+
+type PINPhase string
+
+const (
+	PINPhaseNotRequired PINPhase = "not_required"
+	PINPhaseWaitingPeer PINPhase = "waiting_peer"
+	PINPhaseSubmitted   PINPhase = "submitted"
+	PINPhaseAccepted    PINPhase = "accepted"
+	PINPhaseRestricted  PINPhase = "restricted"
+	PINPhaseFailed      PINPhase = "failed"
+)
+
+type PINCategory string
+
+const (
+	PINCategoryRequired    PINCategory = "required"
+	PINCategoryOptional    PINCategory = "optional"
+	PINCategoryBusy        PINCategory = "busy"
+	PINCategoryRejected    PINCategory = "rejected"
+	PINCategoryUnavailable PINCategory = "unavailable"
+	PINCategoryProtocol    PINCategory = "protocol"
+)
+
+// PINHandshakeDetail is intentionally a closed value: callers can act on the
+// outcome but cannot recover credentials, peer identity, transport locations,
+// or arbitrary error text from it. Category is nil when no categorical reason
+// applies (for example PIN not required or accepted).
+type PINHandshakeDetail struct {
+	Requirement PINRequirement
+	Phase       PINPhase
+	Category    *PINCategory
+	Retryable   bool
+}
+
+func PINCategoryPointer(value PINCategory) *PINCategory {
+	return &value
+}
+
+func (detail *PINHandshakeDetail) Clone() *PINHandshakeDetail {
+	if detail == nil {
+		return nil
+	}
+	copy := *detail
+	if detail.Category != nil {
+		category := *detail.Category
+		copy.Category = &category
+	}
+	return &copy
+}
+
+func (detail *PINHandshakeDetail) Equal(other *PINHandshakeDetail) bool {
+	if detail == nil || other == nil {
+		return detail == other
+	}
+	if detail.Requirement != other.Requirement || detail.Phase != other.Phase || detail.Retryable != other.Retryable {
+		return false
+	}
+	if detail.Category == nil || other.Category == nil {
+		return detail.Category == nil && other.Category == nil
+	}
+	return *detail.Category == *other.Category
 }
 
 type ShipMessageExchangeState uint

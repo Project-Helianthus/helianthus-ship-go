@@ -15,7 +15,7 @@ func TestIssue39HubCopiesTypedPINOutcomeIntoCurrentPairingDetail(t *testing.T) {
 		PIN: &model.PINHandshakeDetail{
 			Requirement: model.PINRequirementRequired,
 			Phase:       model.PINPhaseWaitingPeer,
-			Category:    model.PINCategoryBusy,
+			Category:    model.PINCategoryPointer(model.PINCategoryBusy),
 			Retryable:   true,
 		},
 	})
@@ -25,13 +25,13 @@ func TestIssue39HubCopiesTypedPINOutcomeIntoCurrentPairingDetail(t *testing.T) {
 		t.Fatalf("legacy pairing state = %v, want PIN", detail.State())
 	}
 	if got := detail.PINHandshakeDetail(); got == nil || got.Requirement != model.PINRequirementRequired ||
-		got.Phase != model.PINPhaseWaitingPeer || got.Category != model.PINCategoryBusy || !got.Retryable {
+		got.Phase != model.PINPhaseWaitingPeer || got.Category == nil || *got.Category != model.PINCategoryBusy || !got.Retryable {
 		t.Fatalf("stored typed PIN outcome = %#v, want required busy retryable", got)
 	}
 
 	copy := snapshotPairingDetail(detail)
-	copy.PINHandshakeDetail().Category = model.PINCategoryRejected
-	if got := detail.PINHandshakeDetail().Category; got != model.PINCategoryBusy {
+	*copy.PINHandshakeDetail().Category = model.PINCategoryRejected
+	if got := *detail.PINHandshakeDetail().Category; got != model.PINCategoryBusy {
 		t.Fatalf("queued pairing snapshot mutated current detail: %v", got)
 	}
 }
@@ -41,7 +41,7 @@ func TestIssue39PairingDetailEqualityIncludesTypedPINOutcome(t *testing.T) {
 	left.SetPINHandshakeDetail(&model.PINHandshakeDetail{
 		Requirement: model.PINRequirementRequired,
 		Phase:       model.PINPhaseWaitingPeer,
-		Category:    model.PINCategoryBusy,
+		Category:    model.PINCategoryPointer(model.PINCategoryBusy),
 		Retryable:   true,
 	})
 	right := snapshotPairingDetail(left)
@@ -51,7 +51,7 @@ func TestIssue39PairingDetailEqualityIncludesTypedPINOutcome(t *testing.T) {
 	right.SetPINHandshakeDetail(&model.PINHandshakeDetail{
 		Requirement: model.PINRequirementRequired,
 		Phase:       model.PINPhaseFailed,
-		Category:    model.PINCategoryUnavailable,
+		Category:    model.PINCategoryPointer(model.PINCategoryUnavailable),
 		Retryable:   true,
 	})
 	if pairingDetailsEqual(left, right) {

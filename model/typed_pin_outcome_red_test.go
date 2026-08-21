@@ -10,17 +10,17 @@ func TestIssue39PINHandshakeDetailIsClosedAndCopySafe(t *testing.T) {
 	detail := &PINHandshakeDetail{
 		Requirement: PINRequirementRequired,
 		Phase:       PINPhaseWaitingPeer,
-		Category:    PINCategoryRequired,
+		Category:    PINCategoryPointer(PINCategoryRequired),
 		Retryable:   true,
 	}
 	state := ShipState{State: SmePinStateAskProcess, PIN: detail}
 
 	copy := state.PIN.Clone()
-	if copy == state.PIN || *copy != *state.PIN {
+	if copy == state.PIN || !copy.Equal(state.PIN) {
 		t.Fatalf("PIN detail copy = %#v, want an equal independent value", copy)
 	}
-	copy.Category = PINCategoryRejected
-	if state.PIN.Category != PINCategoryRequired {
+	*copy.Category = PINCategoryRejected
+	if *state.PIN.Category != PINCategoryRequired {
 		t.Fatalf("mutating a copied PIN detail changed the published state: %#v", state.PIN)
 	}
 
@@ -33,7 +33,7 @@ func TestIssue39PINHandshakeDetailConcurrentCopiesAreIndependent(t *testing.T) {
 	detail := &PINHandshakeDetail{
 		Requirement: PINRequirementOptional,
 		Phase:       PINPhaseRestricted,
-		Category:    PINCategoryOptional,
+		Category:    PINCategoryPointer(PINCategoryOptional),
 		Retryable:   false,
 	}
 	var wg sync.WaitGroup
@@ -42,7 +42,7 @@ func TestIssue39PINHandshakeDetailConcurrentCopiesAreIndependent(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			copy := detail.Clone()
-			if copy == nil || *copy != *detail {
+			if copy == nil || !copy.Equal(detail) {
 				t.Errorf("concurrent PIN detail copy = %#v, want %#v", copy, detail)
 			}
 		}()

@@ -14,7 +14,7 @@ func TestIssue39ConnectionStateDetailCarriesIndependentTypedPINOutcome(t *testin
 	detail.SetPINHandshakeDetail(&model.PINHandshakeDetail{
 		Requirement: model.PINRequirementRequired,
 		Phase:       model.PINPhaseSubmitted,
-		Category:    model.PINCategoryRequired,
+		Category:    model.PINCategoryPointer(model.PINCategoryRequired),
 		Retryable:   true,
 	})
 
@@ -22,8 +22,8 @@ func TestIssue39ConnectionStateDetailCarriesIndependentTypedPINOutcome(t *testin
 		t.Fatal("typed PIN detail changed legacy state/error compatibility")
 	}
 	copy := detail.PINHandshakeDetail()
-	copy.Category = model.PINCategoryRejected
-	if got := detail.PINHandshakeDetail().Category; got != model.PINCategoryRequired {
+	*copy.Category = model.PINCategoryRejected
+	if got := *detail.PINHandshakeDetail().Category; got != model.PINCategoryRequired {
 		t.Fatalf("mutated returned detail leaked into published state: %v", got)
 	}
 }
@@ -33,7 +33,7 @@ func TestIssue39ConnectionStateDetailConcurrentPINReads(t *testing.T) {
 	detail.SetPINHandshakeDetail(&model.PINHandshakeDetail{
 		Requirement: model.PINRequirementOptional,
 		Phase:       model.PINPhaseRestricted,
-		Category:    model.PINCategoryOptional,
+		Category:    model.PINCategoryPointer(model.PINCategoryOptional),
 	})
 	var wg sync.WaitGroup
 	for range 32 {
