@@ -195,12 +195,10 @@ func (h *Hub) HandleShipHandshakeStateUpdate(ski string, state model.ShipState) 
 		pairingState = api.ConnectionStateError
 	}
 
-	pairingDetail := api.NewConnectionStateDetail(pairingState, state.Error)
-	pairingDetail.SetPINHandshakeDetail(state.PIN)
-
 	service := h.ServiceForSKI(ski)
-
 	existingDetails := service.ConnectionStateDetail()
+	pairingDetail := api.NewConnectionStateDetail(pairingState, state.Error)
+	pairingDetail.SetPINHandshakeDetail(pinDetailForShipState(state, existingDetails))
 	existingState := existingDetails.State()
 	if existingState != pairingState || !errors.Is(existingDetails.Error(), state.Error) ||
 		!existingDetails.PINHandshakeDetail().Equal(pairingDetail.PINHandshakeDetail()) {
@@ -239,9 +237,6 @@ func (h *Hub) handleInternalShipHandshakeStateUpdate(
 	if state.Error != nil && !errors.Is(state.Error, api.ErrConnectionNotFound) {
 		pairingState = api.ConnectionStateError
 	}
-	pairingDetail := api.NewConnectionStateDetail(pairingState, state.Error)
-	pairingDetail.SetPINHandshakeDetail(state.PIN)
-
 	h.muxReg.Lock()
 	h.muxAttemptGate.RLock()
 	if !h.internalOutboundAttemptActiveLocked(ski, metadata) {
@@ -251,6 +246,8 @@ func (h *Hub) handleInternalShipHandshakeStateUpdate(
 	}
 	service := h.remoteServices[ski]
 	existingDetails := service.ConnectionStateDetail()
+	pairingDetail := api.NewConnectionStateDetail(pairingState, state.Error)
+	pairingDetail.SetPINHandshakeDetail(pinDetailForShipState(state, existingDetails))
 	changed := existingDetails.State() != pairingState || !errors.Is(existingDetails.Error(), state.Error) ||
 		!existingDetails.PINHandshakeDetail().Equal(pairingDetail.PINHandshakeDetail())
 	if changed {
@@ -262,6 +259,20 @@ func (h *Hub) handleInternalShipHandshakeStateUpdate(
 	if changed {
 		go h.publishCurrentPairingDetailAfterDelay(ski, pairingDetail, metadata, true)
 	}
+}
+
+// pinDetailForShipState preserves a typed PIN outcome only when SHIP emits a
+// duplicate terminal state without repeating immutable detail. Any nonterminal
+// state without PIN detail is a new/in-progress handshake observation and
+// clears prior detail so it cannot cross into a later connection attempt.
+func pinDetailForShipState(state model.ShipState, existing *api.ConnectionStateDetail) *model.PINHandshakeDetail {
+	if state.PIN != nil {
+		return state.PIN.Clone()
+	}
+	if existing == nil || (state.State != model.SmeStateComplete && state.State != model.SmeStateError) {
+		return nil
+	}
+	return existing.PINHandshakeDetail()
 }
 
 func (h *Hub) publishCurrentPairingDetailAfterDelay(

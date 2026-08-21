@@ -186,3 +186,23 @@ func TestIssue39DuplicateConnectionErrorRetainsTypedPINFailure(t *testing.T) {
 		})
 	}
 }
+
+func TestIssue39NewHandshakeClearsPriorTerminalPINDetail(t *testing.T) {
+	reader := newIssue39TerminalPairingReader()
+	hub := issue39TerminalHub(reader)
+	hub.HandleShipHandshakeStateUpdate(issue39TerminalRemoteSKI, model.ShipState{
+		State: model.SmeStateComplete,
+		PIN: issue39PINDetail(
+			model.PINRequirementRequired, model.PINPhaseAccepted, nil, false),
+	})
+	hub.HandleShipHandshakeStateUpdate(issue39TerminalRemoteSKI, model.ShipState{State: model.CmiStateInitStart})
+	hub.HandleShipHandshakeStateUpdate(issue39TerminalRemoteSKI, model.ShipState{
+		State: model.SmeStateError,
+		Error: api.ErrPINProtocol,
+	})
+
+	terminal := reader.waitForTerminal(t)
+	if got := terminal.PINHandshakeDetail(); got != nil {
+		t.Fatalf("new attempt terminal retained stale PIN detail: %#v", got)
+	}
+}
