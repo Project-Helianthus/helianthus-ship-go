@@ -60,6 +60,10 @@ type ShipConnection struct {
 	// the current error value if SHIP state is in error
 	smeError error
 
+	// The current secret-free PIN handshake outcome. Protected by mux together
+	// with smeState so a reported ShipState is a coherent immutable snapshot.
+	pinHandshakeDetail *model.PINHandshakeDetail
+
 	// handles timeouts for the various states
 	//
 	// WaitForReady SHIP 13.4.4.1.3: The communication partner must send its "READY" state (or request for prolongation") before the timer expires.
@@ -277,6 +281,73 @@ func (c *ShipConnection) reportShipHandshakeStateUpdate(state model.ShipState) {
 		}
 	}
 	c.infoProvider.HandleShipHandshakeStateUpdate(c.remoteSKI, state)
+}
+
+func (c *ShipConnection) setPINHandshakeDetail(detail *model.PINHandshakeDetail, publish bool) {
+	c.mux.Lock()
+	changed := !c.pinHandshakeDetail.Equal(detail)
+	c.pinHandshakeDetail = detail.Clone()
+	state := model.ShipState{
+		State: c.smeState,
+		Error: c.smeError,
+		PIN:   c.pinHandshakeDetail.Clone(),
+	}
+	c.mux.Unlock()
+	if !changed || !publish {
+		return
+	}
+	_, shouldDrain := c.enqueuePairingEffect(func() {
+		c.reportShipHandshakeStateUpdate(state)
+	})
+	if shouldDrain {
+		c.drainPairingEffects()
+	}
+}
+
+func (c *ShipConnection) setPINFailureFor(err error) {
+	c.mux.Lock()
+	inPINHandshake := c.pinHandshakeDetail != nil ||
+		(c.smeState >= model.SmePinStateCheckInit && c.smeState <= model.SmePinStateAskOk)
+	if !inPINHandshake {
+		c.mux.Unlock()
+		return
+	}
+	if c.pinHandshakeDetail != nil && c.pinHandshakeDetail.Phase == model.PINPhaseFailed {
+		c.mux.Unlock()
+		return
+	}
+	requirement := model.PINRequirementUnknown
+	if c.pinHandshakeDetail != nil {
+		requirement = c.pinHandshakeDetail.Requirement
+	}
+	category := model.PINCategoryUnavailable
+	retryable := true
+	switch {
+	case errors.Is(err, api.ErrPINRejected):
+		category = model.PINCategoryRejected
+		retryable = false
+	case errors.Is(err, api.ErrPINProtocol):
+		category = model.PINCategoryProtocol
+		retryable = false
+	case errors.Is(err, api.ErrPINInvalid):
+		retryable = false
+	}
+	c.pinHandshakeDetail = (&model.PINHandshakeDetail{
+		Requirement: requirement,
+		Phase:       model.PINPhaseFailed,
+		Category:    model.PINCategoryPointer(category),
+		Retryable:   retryable,
+	}).Clone()
+	c.mux.Unlock()
+}
+
+func (c *ShipConnection) currentPINRequirement() model.PINRequirement {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+	if c.pinHandshakeDetail == nil {
+		return model.PINRequirementUnknown
+	}
+	return c.pinHandshakeDetail.Requirement
 }
 
 // start SHIP communication

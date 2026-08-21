@@ -83,6 +83,7 @@ func (c *ShipConnection) setState(newState model.ShipMessageExchangeState, err e
 		state := model.ShipState{
 			State: newState,
 			Error: err,
+			PIN:   c.pinHandshakeDetail.Clone(),
 		}
 		_, shouldDrain := c.enqueuePairingEffect(func() {
 			c.reportShipHandshakeStateUpdate(state)
@@ -304,6 +305,7 @@ func (c *ShipConnection) approveHandshake() {
 func (c *ShipConnection) endHandshakeWithError(err error) {
 	c.stopHandshakeTimer()
 	c.discardTransientPIN()
+	c.setPINFailureFor(err)
 
 	if c.testHooks != nil && c.testHooks.beforeHandshakeErrorState != nil {
 		c.testHooks.beforeHandshakeErrorState()

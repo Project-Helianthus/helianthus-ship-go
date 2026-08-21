@@ -11,6 +11,12 @@ import (
 // Handshake Pin covers the states smePin...
 
 func (c *ShipConnection) handshakePin_Init() {
+	c.setPINHandshakeDetail(pinHandshakeDetail(
+		model.PINRequirementNone,
+		model.PINPhaseNotRequired,
+		nil,
+		false,
+	), false)
 	c.setState(model.SmePinStateCheckInit, nil)
 
 	pinState := model.ConnectionPinState{
@@ -54,11 +60,30 @@ func (c *ShipConnection) handshakePin_smePinStateCheckListen(message []byte) {
 
 func (c *ShipConnection) processRemotePINState(pinState model.ConnectionPinStateType) {
 	switch pinState.PinState {
-	case model.PinStateTypeNone, model.PinStateTypePinOk:
+	case model.PinStateTypeNone:
 		if pinState.InputPermission != nil {
 			c.endHandshakeWithError(api.ErrPINProtocol)
 			return
 		}
+		c.setPINHandshakeDetail(pinHandshakeDetail(
+			model.PINRequirementNone,
+			model.PINPhaseNotRequired,
+			nil,
+			false,
+		), false)
+		c.discardTransientPIN()
+		c.setAndHandleState(model.SmePinStateCheckOk)
+	case model.PinStateTypePinOk:
+		if pinState.InputPermission != nil {
+			c.endHandshakeWithError(api.ErrPINProtocol)
+			return
+		}
+		c.setPINHandshakeDetail(pinHandshakeDetail(
+			c.currentPINRequirement(),
+			model.PINPhaseAccepted,
+			nil,
+			false,
+		), false)
 		c.discardTransientPIN()
 		c.setAndHandleState(model.SmePinStateCheckOk)
 	case model.PinStateTypeRequired, model.PinStateTypeOptional:
@@ -68,6 +93,12 @@ func (c *ShipConnection) processRemotePINState(pinState model.ConnectionPinState
 		}
 		switch *pinState.InputPermission {
 		case model.PinInputPermissionTypeBusy:
+			c.setPINHandshakeDetail(pinHandshakeDetail(
+				pinRequirement(pinState.PinState),
+				model.PINPhaseWaitingPeer,
+				model.PINCategoryPointer(model.PINCategoryBusy),
+				true,
+			), false)
 			c.setState(model.SmePinStateAskProcess, nil)
 		case model.PinInputPermissionTypeOk:
 			c.processRemotePINRequest(pinState.PinState)
@@ -87,6 +118,12 @@ func (c *ShipConnection) processRemotePINRequest(requirement model.PinStateType)
 	// Move to the SHIP-defined PIN response window before invoking the provider:
 	// an interactive provider may legitimately take longer than the generic CMI
 	// timeout, and a concurrent close must prevent any later sensitive write.
+	c.setPINHandshakeDetail(pinHandshakeDetail(
+		pinRequirement(requirement),
+		model.PINPhaseWaitingPeer,
+		model.PINCategoryPointer(pinCategory(requirement)),
+		true,
+	), false)
 	if !c.setState(model.SmePinStateAskProcess, nil) {
 		return
 	}
@@ -111,14 +148,60 @@ func (c *ShipConnection) processRemotePINRequest(requirement model.PinStateType)
 	}
 	if !provided {
 		if requirement == model.PinStateTypeOptional {
+			c.setPINHandshakeDetail(pinHandshakeDetail(
+				model.PINRequirementOptional,
+				model.PINPhaseRestricted,
+				model.PINCategoryPointer(model.PINCategoryOptional),
+				false,
+			), false)
 			c.setAndHandleState(model.SmePinStateAskRestricted)
 			return
 		}
+		c.setPINHandshakeDetail(pinHandshakeDetail(
+			model.PINRequirementRequired,
+			model.PINPhaseFailed,
+			model.PINCategoryPointer(model.PINCategoryUnavailable),
+			false,
+		), false)
 		c.endHandshakeWithError(api.ErrPINUnavailable)
 		return
 	}
+	c.setPINHandshakeDetail(pinHandshakeDetail(
+		pinRequirement(requirement),
+		model.PINPhaseSubmitted,
+		model.PINCategoryPointer(pinCategory(requirement)),
+		true,
+	), true)
 	if c.getState() == model.SmePinStateAskProcess {
 		c.setHandshakeTimer(timeoutTimerTypeWaitForReady, pinResponseTimeout)
+	}
+}
+
+func pinRequirement(value model.PinStateType) model.PINRequirement {
+	if value == model.PinStateTypeOptional {
+		return model.PINRequirementOptional
+	}
+	return model.PINRequirementRequired
+}
+
+func pinCategory(value model.PinStateType) model.PINCategory {
+	if value == model.PinStateTypeOptional {
+		return model.PINCategoryOptional
+	}
+	return model.PINCategoryRequired
+}
+
+func pinHandshakeDetail(
+	requirement model.PINRequirement,
+	phase model.PINPhase,
+	category *model.PINCategory,
+	retryable bool,
+) *model.PINHandshakeDetail {
+	return &model.PINHandshakeDetail{
+		Requirement: requirement,
+		Phase:       phase,
+		Category:    category,
+		Retryable:   retryable,
 	}
 }
 

@@ -3,6 +3,8 @@ package api
 import (
 	"errors"
 	"sync"
+
+	"github.com/Project-Helianthus/helianthus-ship-go/model"
 )
 
 // connection state for global usage, e.g. UI
@@ -23,8 +25,9 @@ const (
 
 // the connection state of a service and error if applicable
 type ConnectionStateDetail struct {
-	state ConnectionState
-	error error
+	state              ConnectionState
+	error              error
+	pinHandshakeDetail *model.PINHandshakeDetail
 
 	mux sync.Mutex
 }
@@ -62,6 +65,24 @@ func (c *ConnectionStateDetail) SetError(err error) {
 	defer c.mux.Unlock()
 
 	c.error = err
+}
+
+// PINHandshakeDetail returns an independent, secret-free typed PIN outcome.
+// The legacy State and Error accessors remain unchanged for existing callers.
+func (c *ConnectionStateDetail) PINHandshakeDetail() *model.PINHandshakeDetail {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+
+	return c.pinHandshakeDetail.Clone()
+}
+
+// SetPINHandshakeDetail stores an independent copy so a callback caller cannot
+// mutate the current connection state after publication.
+func (c *ConnectionStateDetail) SetPINHandshakeDetail(detail *model.PINHandshakeDetail) {
+	c.mux.Lock()
+	defer c.mux.Unlock()
+
+	c.pinHandshakeDetail = detail.Clone()
 }
 
 // ErrServiceNotPaired if the given SKI is not paired yet
