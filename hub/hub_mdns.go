@@ -87,10 +87,16 @@ func clonePairingCandidateObservations(
 }
 
 func cloneScopedIPAddresses(addresses []netip.Addr) []netip.Addr {
+	if addresses == nil {
+		return nil
+	}
 	return append([]netip.Addr(nil), addresses...)
 }
 
 func cloneIPAddresses(addresses []net.IP) []net.IP {
+	if addresses == nil {
+		return nil
+	}
 	cloned := make([]net.IP, len(addresses))
 	for index, address := range addresses {
 		cloned[index] = append(net.IP(nil), address...)
@@ -132,7 +138,7 @@ func (h *Hub) unlockPairingCandidateAdmission() {
 
 func (h *Hub) reportMdnsSnapshot(
 	entries map[string]*api.MdnsEntry,
-	_ bool,
+	newEntries bool,
 	candidates []api.PairingCandidateObservation,
 	revision uint64,
 	admission uint64,
@@ -264,6 +270,34 @@ func (h *Hub) reportMdnsSnapshot(
 	})
 	if reader, ok := h.hubReader.(api.PairingCandidateHubReaderInterface); ok {
 		reader.VisiblePairingCandidatesUpdated(candidateRefs)
+	}
+	if reader, ok := h.hubReader.(api.PairingCandidateDiscoverySnapshotHubReaderInterface); ok {
+		observations := make([]api.PairingCandidateDiscoveryObservationV1, 0, len(candidates))
+		for _, candidate := range candidates {
+			if candidate.CandidateRef == "" || candidate.SKI == "" {
+				continue
+			}
+			observations = append(observations, api.PairingCandidateDiscoveryObservationV1{
+				CandidateRef: candidate.CandidateRef, Name: candidate.Name, SKI: candidate.SKI,
+				Identifier: candidate.Identifier, Brand: candidate.Brand, Type: candidate.Type,
+				Model: candidate.Model, Path: candidate.Path, Host: candidate.Host,
+				Port: candidate.Port, Register: candidate.Register,
+				Addresses:                 cloneIPAddresses(candidate.Addresses),
+				ScopedAddresses:           cloneScopedIPAddresses(candidate.ScopedAddresses),
+				UnscopedLinkLocalObserved: candidate.UnscopedLinkLocalObserved,
+			})
+		}
+		sort.Slice(observations, func(left, right int) bool {
+			if observations[left].SKI != observations[right].SKI {
+				return observations[left].SKI < observations[right].SKI
+			}
+			return observations[left].CandidateRef < observations[right].CandidateRef
+		})
+		reader.VisiblePairingCandidateDiscoverySnapshotUpdated(api.PairingCandidateDiscoverySnapshotV1{
+			ObservationRevision: revision,
+			NewEntries:          newEntries,
+			Candidates:          observations,
+		})
 	}
 }
 

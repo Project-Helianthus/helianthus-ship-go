@@ -518,12 +518,15 @@ func (m *MdnsManager) copyPairingCandidatesLocked() []api.PairingCandidateObserv
 			Type:         entry.Type,
 			Model:        entry.Model,
 			Path:         entry.Path,
+			Host:         entry.Host,
 			Port:         entry.Port,
-			Addresses:    append([]net.IP(nil), entry.Addresses...),
+			Register:     entry.Register,
+			Addresses:    cloneIPs(entry.Addresses),
 			ScopedAddresses: append(
 				[]netip.Addr(nil),
 				entry.ScopedAddresses...,
 			),
+			UnscopedLinkLocalObserved: entry.UnscopedLinkLocalObserved,
 		})
 	}
 	sort.Slice(candidates, func(left, right int) bool {
@@ -584,6 +587,9 @@ func sameScopedIPList(left, right []netip.Addr) bool {
 }
 
 func cloneIPs(addresses []net.IP) []net.IP {
+	if addresses == nil {
+		return nil
+	}
 	cloned := make([]net.IP, len(addresses))
 	for index, address := range addresses {
 		cloned[index] = append(net.IP(nil), address...)

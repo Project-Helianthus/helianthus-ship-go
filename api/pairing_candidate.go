@@ -93,11 +93,16 @@ type PairingCandidateObservation struct {
 	Type         string
 	Model        string
 	Path         string
+	Host         string
 	Port         int
+	Register     bool
 	Addresses    []net.IP
 	// ScopedAddresses retains zones only inside the process-local candidate
 	// pipeline. It is intentionally absent from PairingCandidateRef.
 	ScopedAddresses []netip.Addr
+	// UnscopedLinkLocalObserved retains the native fail-closed observation
+	// without exposing an unusable address.
+	UnscopedLinkLocalObserved bool
 }
 
 // PairingCandidateMdnsReportInterface atomically reports stable discovery and
@@ -127,4 +132,44 @@ type PairingCandidateRef struct {
 // dependency consumers that own the local candidate admin surface.
 type PairingCandidateHubReaderInterface interface {
 	VisiblePairingCandidatesUpdated([]PairingCandidateRef)
+}
+
+// PairingCandidateDiscoveryObservationV1 is a detached, read-only view of one
+// native SHIP discovery observation. Zero values mean the provider did not
+// supply that field; no endpoint or metadata is synthesized.
+type PairingCandidateDiscoveryObservationV1 struct {
+	CandidateRef string
+	Name         string
+	SKI          string
+	Identifier   string
+	Brand        string
+	Type         string
+	Model        string
+	Path         string
+	Host         string
+	Port         int
+	Register     bool
+	Addresses    []net.IP
+	// ScopedAddresses preserves an IPv6 link-local interface zone when one
+	// was observed. Unscoped link-local addresses are never included.
+	ScopedAddresses []netip.Addr
+	// UnscopedLinkLocalObserved records that discovery supplied a link-local
+	// IPv6 address without the zone required to use it.
+	UnscopedLinkLocalObserved bool
+}
+
+// PairingCandidateDiscoverySnapshotV1 atomically carries discovery context and
+// its complete candidate set. An empty Candidates slice is an authoritative
+// clear for ObservationRevision.
+type PairingCandidateDiscoverySnapshotV1 struct {
+	ObservationRevision uint64
+	NewEntries          bool
+	Candidates          []PairingCandidateDiscoveryObservationV1
+}
+
+// PairingCandidateDiscoverySnapshotHubReaderInterface is an optional additive
+// reader capability. Reading a snapshot does not select, connect, approve,
+// reject, or otherwise mutate pairing and trust state.
+type PairingCandidateDiscoverySnapshotHubReaderInterface interface {
+	VisiblePairingCandidateDiscoverySnapshotUpdated(PairingCandidateDiscoverySnapshotV1)
 }
