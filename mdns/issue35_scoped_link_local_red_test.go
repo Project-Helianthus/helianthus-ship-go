@@ -45,6 +45,9 @@ func TestIssue35ScopedLinkLocalObservationPreservesZone(t *testing.T) {
 	if len(candidates) != 1 {
 		t.Fatalf("pairing candidates = %d, want 1", len(candidates))
 	}
+	if candidates[0].Host != "vr940.local" || candidates[0].Port != 12480 || !candidates[0].Register {
+		t.Fatalf("candidate native endpoint context = %#v", candidates[0])
+	}
 	assertIssue35ScopedAddresses(t, candidates[0].ScopedAddresses, []netip.Addr{linkLocal, ipv4, globalIPv6})
 }
 
@@ -85,6 +88,9 @@ func TestIssue35UnscopedLinkLocalObservationFailsClosed(t *testing.T) {
 	}
 	if len(candidates) != 1 || len(candidates[0].ScopedAddresses) != 0 {
 		t.Fatalf("candidate retained an unscoped link-local address: %#v", candidates)
+	}
+	if !candidates[0].UnscopedLinkLocalObserved {
+		t.Fatal("candidate lost fail-closed unscoped link-local evidence")
 	}
 }
 
